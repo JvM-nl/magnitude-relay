@@ -1,0 +1,15 @@
+[package]
+name = "relay-proto"
+description = "Nostr wire protocol: JSON, canonical events, filters, compact records"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+secp256k1.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+secp256k1 = { workspace = true }

@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/relay-proto",
+    "crates/relay-store",
+    "crates/relay-net",
+    "crates/relay-server",
+    "crates/relay-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+# The whole runtime dependency list. Anything not here is ours.
+[workspace.dependencies]
+relay-proto = { path = "crates/relay-proto" }
+relay-store = { path = "crates/relay-store" }
+relay-net = { path = "crates/relay-net" }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "signal", "io-util"] }
+secp256k1 = { version = "0.33", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", features = ["asm"] }
+libc = "0.2"
+# Dev-only: reference implementations our own code is cross-checked against.
+serde_json = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[profile.bench]
+inherits = "release"
+debug = 1
