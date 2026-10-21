@@ -12,6 +12,7 @@ use crate::metrics::{self, Metrics};
 use crate::session::{self, Ctx, Outbox, Session, SessionCfg, SigQueue};
 use crate::sock::{Incoming, Sock, Stream, TlsConfig};
 use crate::subs::{ConnId, FxMap, SubIndex};
+use crate::verify::Job;
 use relay_net::conn::{server_handshake_with, Handshake, OwnedRequest};
 use relay_net::http::{write_response, ExtensionPolicy};
 use relay_net::ws::{self, Compressor, DeflateParams, Decoder, Event, Role};
@@ -27,7 +28,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// A client silent this long gets a ping; silent twice as long, it is dropped.
 const IDLE_PING: Duration = Duration::from_secs(60);
@@ -54,6 +55,8 @@ pub struct Shared {
     pub metrics: Metrics,
     /// One per `[[sync]]` entry.
     pub sync: Vec<Arc<crate::sync::live::Stats>>,
+    /// Checks reads' signatures in batches across connections.
+    pub verify: crate::verify::Pool,
 }
 
 struct IpState {
@@ -79,6 +82,7 @@ impl Shared {
             ips: Mutex::new(FxMap::default()),
             metrics: Metrics::new(reactors),
             sync,
+            verify: crate::verify::Pool::new(reactors),
         }
     }
 
@@ -642,6 +646,9 @@ struct Pass {
     closing: bool,
     /// Stopped on the time budget with whole frames still unprocessed.
     more: bool,
+    /// The read's EVENTs went to the verifier threads: finish them when their
+    /// verdicts come back, before anything else from this connection.
+    wait: Option<oneshot::Receiver<Job>>,
 }
 
 /// Runs `f` with this reactor's context for a session, its replies going to `out`.
@@ -678,9 +685,28 @@ fn with_cx(st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr, conn: ConnId, out
 /// together once the frames are done (or before any other kind of frame).
 fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> Pass {
     let conn = session.conn;
-    let p = process_frames(data, dec, session, out, st, shared, ip);
-    with_cx(st, shared, ip, conn, out, |cx, w| session.flush_events(cx, w));
+    let mut p = process_frames(data, dec, session, out, st, shared, ip);
+    let n = st.borrow().sigs.len();
+    if n > 0 && session.batches() && shared.verify.wants(n) {
+        let job = std::mem::take(&mut st.borrow_mut().sigs.job);
+        p.wait = Some(shared.verify.submit(job));
+    } else {
+        with_cx(st, shared, ip, conn, out, |cx, w| session.flush_events(cx, w));
+    }
     p
+}
+
+/// Finishes a read's EVENTs once the verifier threads have checked them, and
+/// gives the job's buffers back to the reactor for the next read.
+async fn finish(rx: oneshot::Receiver<Job>, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> io::Result<()> {
+    let mut job = rx.await.map_err(|_| io::Error::other("the signature verifiers stopped"))?;
+    with_cx(st, shared, ip, session.conn, out, |cx, w| session.finish_job(&job, cx, w));
+    job.clear();
+    let mut r = st.borrow_mut();
+    if r.sigs.job.recs.capacity() == 0 {
+        r.sigs.job = job;
+    }
+    Ok(())
 }
 
 fn process_frames(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> Pass {
@@ -688,15 +714,16 @@ fn process_frames(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out
     let started = Instant::now();
     let mut off = 0;
     loop {
-        if off > 0 && started.elapsed() >= TURN_BUDGET {
-            return Pass { used: off, closing: false, more: true };
+        // Out of time, or a full queue of EVENTs to check before reading on.
+        if off > 0 && (started.elapsed() >= TURN_BUDGET || st.borrow().sigs.len() >= session.queue_cap()) {
+            return Pass { used: off, closing: false, more: true, wait: None };
         }
         let d = match dec.decode(&mut data[off..]) {
             Ok(d) => d,
             Err(e) => {
                 with_cx(st, shared, ip, conn, out, |cx, w| session.flush_events(cx, w));
                 ws::write_close(&mut out.buf.borrow_mut(), e.close_code(), e.reason());
-                return Pass { used: off, closing: true, more: false };
+                return Pass { used: off, closing: true, more: false, wait: None };
             }
         };
         off += d.consumed;
@@ -721,9 +748,9 @@ fn process_frames(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out
                     Some((code, _)) => ws::write_close(&mut b, code, ""),
                     None => ws::write_close_empty(&mut b),
                 }
-                return Pass { used: off, closing: true, more: false };
+                return Pass { used: off, closing: true, more: false, wait: None };
             }
-            None => return Pass { used: off, closing: false, more: false },
+            None => return Pass { used: off, closing: false, more: false, wait: None },
         }
     }
 }
@@ -758,8 +785,12 @@ async fn serve(
     let p = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
     buf.drain(..p.used);
     *buf = buf.to_vec();
-    let (mut closing, mut more) = (p.closing, p.more);
+    let (mut closing, mut more, mut waiting) = (p.closing, p.more, p.wait);
     loop {
+        // A read's EVENTs are answered before anything after them is read.
+        if let Some(rx) = waiting.take() {
+            finish(rx, &mut session, out, st, shared, ip).await?;
+        }
         // Flush (taking the buffer, so fan-out keeps appending to a fresh one).
         if out.overflow.get() {
             ws::write_close(&mut out.buf.borrow_mut(), 1008, "too slow: messages were piling up");
@@ -791,7 +822,7 @@ async fn serve(
             tokio::task::yield_now().await;
             let p = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
             buf.drain(..p.used);
-            (closing, more) = (p.closing, p.more);
+            (closing, more, waiting) = (p.closing, p.more, p.wait);
             if buf.is_empty() && buf.capacity() > 0 {
                 *buf = Vec::new();
             }
@@ -819,12 +850,12 @@ async fn serve(
                             // The common case: decode straight from the scratch buffer.
                             let p = process(&mut scratch[..n], &mut dec, &mut session, out, st, shared, ip);
                             buf.extend_from_slice(&scratch[p.used..n]);
-                            (closing, more) = (p.closing, p.more);
+                            (closing, more, waiting) = (p.closing, p.more, p.wait);
                         } else {
                             buf.extend_from_slice(&scratch[..n]);
                             let p = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
                             buf.drain(..p.used);
-                            (closing, more) = (p.closing, p.more);
+                            (closing, more, waiting) = (p.closing, p.more, p.wait);
                         }
                         if buf.is_empty() && buf.capacity() > 0 {
                             *buf = Vec::new();

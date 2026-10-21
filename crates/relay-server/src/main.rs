@@ -17,6 +17,7 @@ mod stats;
 mod subs;
 mod sync;
 mod toml;
+mod verify;
 
 use config::{store_options, Config};
 use relay_store::{Options, Store};
