@@ -9,10 +9,10 @@
 //! A live REQ alone misses things: relays cap what a REQ returns from storage
 //! (strfry at 500), so after a gap only the newest events come back, and gift
 //! wraps are backdated up to two days, so a wrap that arrived during the gap can
-//! be older than all of those. strfry's live feed also skips some events outright
-//! (measured: about 80 in an hour, mostly backdated). So on every (re)connect,
-//! and every ten minutes after, the window is copied page by page on
-//! connections of its own, beside the live feed.
+//! be older than all of those. So on every (re)connect the window is also copied
+//! page by page, on connections of its own, beside the live feed. Ephemeral
+//! events (kinds 20000-29999) are skipped: strfry keeps them for a few minutes,
+//! but a relay only passes them on, so re-sending them stores nothing.
 
 use relay_bench::net::{connect, recv_text, resolve, RecvError};
 use relay_bench::wire::{parse_relay_msg, RelayMsg};
@@ -23,8 +23,13 @@ use std::time::{Duration, Instant};
 const PAGE: usize = 500;
 /// Gift wraps are backdated up to this much (NIP-59).
 const BACKDATE: u64 = 2 * 86400;
-/// How often the window is copied again while connected.
-const REFILL_EVERY: Duration = Duration::from_secs(600);
+
+/// The `kind` of an event's JSON, read without parsing the rest.
+fn event_kind(ev: &str) -> Option<u64> {
+    let at = ev.find("\"kind\":")? + 7;
+    let digits: String = ev[at..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
 
 /// The raw event object inside `["EVENT","sub",{...}]`.
 fn event_json(msg: &str) -> Option<&str> {
@@ -70,6 +75,10 @@ async fn backfill(from: &str, to: &str, since: u64) -> Result<BTreeMap<String, u
                     oldest = oldest.min(created_at);
                     if sent.insert(id) {
                         if let Some(ev) = event_json(&text) {
+                            if event_kind(ev).is_some_and(|k| (20000..30000).contains(&k)) {
+                                *tally.entry("ephemeral skipped".into()).or_default() += 1;
+                                continue;
+                            }
                             dst.send_text(&format!("[\"EVENT\",{ev}]")).await.map_err(|e| e.to_string())?;
                             *tally.entry("sent".into()).or_default() += 1;
                         }
@@ -131,17 +140,13 @@ fn main() {
         let mut tally: BTreeMap<String, u64> = BTreeMap::new();
         let mut last = Instant::now();
         loop {
+            let window_start = since.saturating_sub(BACKDATE);
             let fill = async {
-                let mut window_start = since.saturating_sub(BACKDATE);
-                loop {
-                    let started = now();
-                    match backfill(&from, &to, window_start).await {
-                        Ok(t) => println!("{} backfill since {window_start} done: {:?}", now(), t),
-                        Err(e) => println!("{} backfill since {window_start} failed: {e}", now()),
-                    }
-                    tokio::time::sleep(REFILL_EVERY).await;
-                    window_start = started.saturating_sub(BACKDATE);
+                match backfill(&from, &to, window_start).await {
+                    Ok(t) => println!("{} backfill since {window_start} done: {:?}", now(), t),
+                    Err(e) => println!("{} backfill since {window_start} failed: {e}", now()),
                 }
+                std::future::pending::<()>().await
             };
             let run = async {
                 let mut src = connect(&resolve(&from).await?, None).await.map_err(|e| e.to_string())?;
