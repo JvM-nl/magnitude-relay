@@ -15,10 +15,13 @@
 //! A field is `varint header` then its payload: header `1` is a 32-byte value
 //! that was 64 lowercase hex on the wire; header `len << 1` is a string of `len`
 //! bytes. Strings (and content) are kept in the escaped form the id commits to,
-//! so turning a record back into JSON is copying plus hex.
+//! so turning a record back into JSON is copying plus hex. The exception is
+//! content that is exactly the base64 of some bytes (a NIP-44 payload: most of
+//! what Vector stores), which the store keeps as those bytes, a quarter
+//! smaller, under [`FLAG_BASE64`]; JSON gets the encoding back.
 
 use crate::hex;
-use crate::varint;
+use crate::{base64, varint};
 
 pub const OFF_ID: usize = 0;
 pub const OFF_PUBKEY: usize = 32;
@@ -39,6 +42,14 @@ pub const FLAG_RAW_FORM: u8 = 1 << 2;
 /// (not from another relay, an import or a backup's source). Trusted peers
 /// may skip the check for these (see PLAN.md, trusted peers).
 pub const FLAG_FIRST_HAND: u8 = 1 << 3;
+/// Content is the bytes the event's content decodes to as base64; the event's
+/// content is their padded standard encoding (see [`compact_into`]). Records
+/// from before this flag never have it, so they read as they always did.
+pub const FLAG_BASE64: u8 = 1 << 4;
+
+/// Shorter content is left as text: a few bytes saved would not pay for the
+/// encoding every read does. The smallest NIP-44 payload is 132 characters.
+pub const MIN_BASE64_CONTENT: usize = 64;
 
 /// Marks a record [`FLAG_FIRST_HAND`].
 pub fn mark_first_hand(rec: &mut [u8]) {
@@ -109,7 +120,12 @@ impl<'a> Record<'a> {
         }
     }
 
-    /// Content in its stored (escaped) form, and the offset where tags begin.
+    #[inline]
+    pub fn is_base64(&self) -> bool {
+        self.flags() & FLAG_BASE64 != 0
+    }
+
+    /// Content as stored, and the offset where tags begin.
     #[inline]
     fn content_and_tags_pos(&self) -> (&'a [u8], usize) {
         let mut p = self.body_start();
@@ -117,9 +133,17 @@ impl<'a> Record<'a> {
         (&self.0[p..p + len], p + len)
     }
 
+    /// Content as stored: the escaped JSON string, or with [`FLAG_BASE64`] the
+    /// bytes it encodes. [`write_content`](Self::write_content) gives the JSON form.
     #[inline]
-    pub fn content(&self) -> &'a [u8] {
+    pub fn stored_content(&self) -> &'a [u8] {
         self.content_and_tags_pos().0
+    }
+
+    /// The content as it appears between the quotes in JSON.
+    #[inline]
+    pub fn write_content(&self, out: &mut Vec<u8>) {
+        push_content(self.flags(), self.stored_content(), out);
     }
 
     pub fn tags(&self) -> Tags<'a> {
@@ -146,7 +170,7 @@ impl<'a> Record<'a> {
         let (content, _) = self.content_and_tags_pos();
         out.reserve(self.0.len() * 2 + 64);
         out.extend_from_slice(b"{\"content\":\"");
-        out.extend_from_slice(content);
+        push_content(self.flags(), content, out);
         out.extend_from_slice(b"\",\"created_at\":");
         push_u64(out, self.created_at());
         out.extend_from_slice(b",\"id\":\"");
@@ -168,7 +192,8 @@ impl<'a> Record<'a> {
         let (content, _) = self.content_and_tags_pos();
         let digits = |v: u64| if v == 0 { 1 } else { v.ilog10() as usize + 1 };
         let mut n = r#"{"content":"","created_at":,"id":"","kind":,"pubkey":"","sig":"","tags":[]}"#.len();
-        n += content.len() + digits(self.created_at()) + digits(self.kind()) + 64 + 64 + 128;
+        n += if self.is_base64() { base64::encoded_len(content.len()) } else { content.len() };
+        n += digits(self.created_at()) + digits(self.kind()) + 64 + 64 + 128;
         for (i, tag) in self.tags().enumerate() {
             n += usize::from(i > 0) + 2;
             for (j, f) in tag.fields().enumerate() {
@@ -237,9 +262,44 @@ impl<'a> Record<'a> {
         out.push(b',');
         self.write_tags_json(out);
         out.extend_from_slice(b",\"");
-        out.extend_from_slice(content);
+        push_content(self.flags(), content, out);
         out.extend_from_slice(b"\"]");
     }
+}
+
+/// Appends a record's content in its JSON form.
+#[inline]
+fn push_content(flags: u8, stored: &[u8], out: &mut Vec<u8>) {
+    if flags & FLAG_BASE64 != 0 {
+        base64::encode_into(stored, out);
+    } else {
+        out.extend_from_slice(stored);
+    }
+}
+
+/// Appends `rec` to `out` in the form the store keeps. Content that is exactly
+/// the padded standard base64 of some bytes (decoding and encoding again gives
+/// the same text) and at least [`MIN_BASE64_CONTENT`] long is replaced by
+/// those bytes under [`FLAG_BASE64`]; anything else is copied as it is.
+pub fn compact_into(rec: &[u8], out: &mut Vec<u8>) {
+    let r = Record(rec);
+    let body = r.body_start();
+    let (content, tags) = r.content_and_tags_pos();
+    if !r.is_base64() && content.len() >= MIN_BASE64_CONTENT {
+        if let Some(len) = base64::decoded_len(content) {
+            let start = out.len();
+            out.reserve(rec.len());
+            out.extend_from_slice(&rec[..body]);
+            varint::put(out, len as u64);
+            if base64::decode_canonical_into(content, out) {
+                out[start + OFF_FLAGS] |= FLAG_BASE64;
+                out.extend_from_slice(&rec[tags..]);
+                return;
+            }
+            out.truncate(start);
+        }
+    }
+    out.extend_from_slice(rec);
 }
 
 pub struct Tags<'a> {

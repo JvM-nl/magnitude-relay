@@ -503,7 +503,11 @@ impl Writer {
         }
 
         let seq = self.next_seq + b.new.len() as u64;
-        b.new.push(raw.to_vec());
+        // Stored with base64 content decoded (a gift wrap's NIP-44 payload):
+        // the copy we make anyway, a quarter smaller.
+        let mut stored = Vec::new();
+        relay_proto::record::compact_into(raw, &mut stored);
+        b.new.push(stored);
         b.ids.insert(*id, seq);
         let first = b.keys.len();
         index_keys(r, seq, &mut b.keys, &mut self.scratch, &self.vanish);

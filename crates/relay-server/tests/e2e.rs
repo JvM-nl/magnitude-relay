@@ -1081,3 +1081,109 @@ async fn bursts_of_events_are_verified_together() {
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The next text message, as sent.
+async fn recv_text<S: AsyncRead + AsyncWrite + Unpin>(c: &mut ClientConn<S>) -> String {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), c.recv()).await.expect("timed out waiting for a message").unwrap() {
+            Message::Text(t) => return t.to_string(),
+            _ => continue,
+        }
+    }
+}
+
+#[tokio::test]
+async fn gift_wraps_come_back_byte_for_byte() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let dir = std::env::temp_dir().join(format!("relay-e2e-b64-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start(dir.clone(), port);
+    let host = format!("127.0.0.1:{port}");
+    let (me, author) = (Signer::new(21), Signer::new(22));
+
+    // Payloads of every padding case (stored decoded), and text that only
+    // looks like base64 (stored as it came).
+    let bytes = |n: usize| -> Vec<u8> { (0..n).map(|i| (i * 131 + n) as u8).collect() };
+    let good = STANDARD.encode(bytes(100));
+    let mut contents: Vec<String> = [99, 100, 101, 1400, 1401, 1402, 20_000].iter().map(|&n| STANDARD.encode(bytes(n))).collect();
+    contents.extend([
+        good.trim_end_matches('=').to_string(),
+        format!("{}BB==", &good[..good.len() - 4]),
+        format!("{}\n{}", &good[..64], &good[64..]),
+        good.replace('+', "-").replace('/', "_"),
+        "dGVzdA==".to_string(),
+        String::new(),
+    ]);
+    let mut events: Vec<(String, String)> = Vec::new(); // (what is sent, what must come back)
+    for (i, content) in contents.iter().enumerate() {
+        let ev = author.event(now() - 100 + i as u64, 1059, json!([["p", me.pk()]]), content);
+        // serde_json writes keys sorted and escapes canonically: strfry's form, and ours.
+        events.push((json!(["EVENT", ev]).to_string(), ev.to_string()));
+    }
+    // Signed over "\/": kept exactly as received.
+    let escaped = STANDARD.encode([0xFFu8; 120]).replace('/', "\\/");
+    let (pk, at) = (author.pk(), now() - 50);
+    let pre = format!(r#"[0,"{pk}",{at},1059,[["p","{}"]],"{escaped}"]"#, me.pk());
+    let id: [u8; 32] = Sha256::digest(pre.as_bytes()).into();
+    let sig = hex::encode_string(&schnorr::sign_no_aux_rand(&id, &author.0).to_byte_array());
+    let id = hex::encode_string(&id);
+    let raw = format!(r#"{{"content":"{escaped}","created_at":{at},"id":"{id}","kind":1059,"pubkey":"{pk}","sig":"{sig}","tags":[["p","{}"]]}}"#, me.pk());
+    events.push((format!(r#"["EVENT",{raw}]"#), raw));
+
+    // Live, as each is stored.
+    let mut sub = client_connect(relay.addr, &host, "/").await.unwrap();
+    send(&mut sub, json!(["REQ", "live", {"kinds": [1059], "#p": [me.pk()], "limit": 0}])).await;
+    collect(&mut sub, "live").await;
+    let mut publisher = client_connect(relay.addr, &host, "/").await.unwrap();
+    for (sent, want) in &events {
+        publisher.send_text(sent).await.unwrap();
+        assert_eq!(ok_of(&mut publisher).await, (true, String::new()));
+        assert_eq!(recv_text(&mut sub).await, format!(r#"["EVENT","live",{want}]"#));
+    }
+    let mut want: Vec<&str> = events.iter().map(|(_, w)| w.as_str()).collect();
+    want.sort();
+
+    // Stored: REQ, the operator's query, and after a restart, export and REQ again.
+    let req = |c: &'static str| json!(["REQ", c, {"kinds": [1059], "#p": [me.pk()]}]);
+    let stored = |frames: Vec<String>, sub: &str| -> Vec<String> {
+        let prefix = format!(r#"["EVENT","{sub}","#);
+        let mut v: Vec<String> = frames.iter().map(|f| f.strip_prefix(&prefix).and_then(|e| e.strip_suffix(']')).unwrap_or_else(|| panic!("{f}")).to_string()).collect();
+        v.sort();
+        v
+    };
+    async fn frames<S: AsyncRead + AsyncWrite + Unpin>(c: &mut ClientConn<S>, n: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        while out.len() < n {
+            let t = recv_text(c).await;
+            if t.starts_with(r#"["EVENT""#) {
+                out.push(t);
+            }
+        }
+        out
+    }
+    send(&mut sub, req("hist")).await;
+    assert_eq!(stored(frames(&mut sub, events.len()).await, "hist"), want);
+    let mut q: Vec<String> = run_ok(&dir, &["query", "--filter", r#"{"kinds":[1059]}"#]).lines().map(String::from).collect();
+    q.sort();
+    assert_eq!(q, want);
+    drop((sub, publisher));
+    let dir = relay.stop();
+    let mut exported: Vec<String> = run_ok(&dir, &["export"]).lines().map(String::from).collect();
+    exported.sort();
+    assert_eq!(exported, want);
+    let relay = Relay::start(dir, port);
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    send(&mut c, req("again")).await;
+    assert_eq!(stored(frames(&mut c, events.len()).await, "again"), want);
+
+    // A quarter of a payload's size stays off the disk.
+    let log = log_bytes(&relay.dir);
+    assert!(!log.windows(64).any(|w| w == &contents[3].as_bytes()[..64]), "the 1400-byte payload is not stored as text");
+    assert!(log.windows(64).any(|w| w == &bytes(1400)[..64]), "it is stored as its bytes");
+    assert!(log.windows(good.len() - 2).any(|w| w == good.trim_end_matches('=').as_bytes()), "the unpadded one is stored as text");
+    drop(c);
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
