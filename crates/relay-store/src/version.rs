@@ -171,6 +171,11 @@ impl Version {
         Some(self.record_unchecked(seq))
     }
 
+    /// Whether a live event's stored bytes still match their checksum.
+    pub fn intact(&self, seq: u64) -> bool {
+        self.is_live(seq) && log::frame_intact(&self.segs, self.seg_size, locs::get(&self.locs, seq))
+    }
+
     #[inline]
     pub(crate) fn record_unchecked(&self, seq: u64) -> Record<'_> {
         let off = locs::get(&self.locs, seq);

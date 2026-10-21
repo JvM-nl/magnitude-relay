@@ -37,15 +37,28 @@ pub enum Control {
     Kill { seqs: Vec<u64>, reply: Sender<io::Result<usize>> },
     /// Record the kills so far in a checkpoint, so they survive a restart.
     Checkpoint { reply: Sender<io::Result<()>> },
+    /// Start an online backup: the plan pins what it copies.
+    BeginBackup { reply: Sender<io::Result<relay_store::backup::Plan>> },
+    /// The backup is over (finished or not): log compaction may go on.
+    EndBackup { reply: Sender<io::Result<()>> },
 }
 
-fn control(w: &mut Writer, c: Control) {
+pub(crate) fn control(w: &mut Writer, c: Control) {
     match c {
         Control::Kill { seqs, reply } => {
             let _ = reply.send(w.kill_live(&seqs));
         }
         Control::Checkpoint { reply } => {
             let _ = reply.send(w.write_checkpoint());
+        }
+        Control::BeginBackup { reply } => {
+            if let Err(std::sync::mpsc::SendError(Ok(_plan))) = reply.send(w.begin_backup()) {
+                // No one is waiting for it: the backup never starts.
+                let _ = w.end_backup();
+            }
+        }
+        Control::EndBackup { reply } => {
+            let _ = reply.send(w.end_backup());
         }
     }
 }

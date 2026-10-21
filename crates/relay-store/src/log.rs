@@ -68,6 +68,14 @@ pub fn record_at(segs: &Segs, seg_size: u64, off: u64) -> &[u8] {
     seg.slice(o + FRAME_HEADER, len)
 }
 
+/// Whether the frame at `off` still matches the checksum it was written with.
+pub fn frame_intact(segs: &Segs, seg_size: u64, off: u64) -> bool {
+    let Some(seg) = segs.file(off / seg_size) else { return false };
+    let o = (off % seg_size) as usize;
+    let len = seg.read_u32(o) as usize;
+    len <= MAX_RECORD && o + FRAME_HEADER + len <= seg_size as usize && crc32c(seg.slice(o + FRAME_HEADER, len)) == seg.read_u32(o + 16)
+}
+
 /// One frame found while replaying.
 pub struct Frame<'a> {
     pub off: u64,

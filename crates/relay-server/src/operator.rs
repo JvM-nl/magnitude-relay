@@ -13,7 +13,8 @@ use relay_proto::json::Scanner;
 use relay_proto::{hex, Filter, Record};
 use relay_store::{Store, Version, Writer};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Events a dry run shows.
 const SAMPLES: usize = 10;
@@ -241,6 +242,86 @@ pub fn run_delete(cfg: &Config, filters: Vec<Filter>, age: Option<u64>, all: boo
         println!("deleted {} ({} matched; the rest changed while the delete ran)", events(d.deleted), d.matched);
     }
     Ok(())
+}
+
+/// `backup`: a copy of the store at this moment, taken while the relay serves
+/// if it is running. With `verify`, the copy is then opened as a store and a
+/// spread of its events read back.
+pub fn run_backup(cfg: &Config, dest: &Path, verify: bool) -> Result<(), String> {
+    // The relay runs elsewhere (another directory, another user's view of
+    // relative paths): it gets the path whole.
+    let dest = std::path::absolute(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let t = Instant::now();
+    let mut meter = Meter::new();
+    let (n, c) = match Backend::open(cfg)? {
+        Backend::Local(_store, mut w) => {
+            let plan = w.begin_backup().map_err(|e| e.to_string())?;
+            let n = plan.events();
+            let copied = relay_store::backup::copy(&plan, &dest, &mut |done, total| {
+                meter.show(done, total);
+                true
+            });
+            drop(plan);
+            let ended = w.end_backup();
+            let c = copied.map_err(|e| e.to_string())?;
+            ended.map_err(|e| e.to_string())?;
+            (n, c)
+        }
+        Backend::Remote(r) => {
+            let path = dest.to_str().ok_or("the destination's path is not UTF-8, which the admin socket cannot carry")?;
+            let req = Request { dest: Some(path.to_string()), ..Request::new(Op::Backup, Vec::new()) };
+            r.connect()?.backup(&req, &mut |done, total| meter.show(done, total)).map_err(|e| e.to_string())?
+        }
+    };
+    meter.finish();
+    println!(
+        "backed up {} to {} in {:.1}s ({:.2} GB read, {:.2} GB written)",
+        events(n),
+        dest.display(),
+        t.elapsed().as_secs_f64(),
+        c.bytes as f64 / 1e9,
+        c.written as f64 / 1e9
+    );
+    if verify {
+        let v = relay_store::backup::verify(&dest, store_options(cfg), n).map_err(|e| format!("the backup in {} did not verify: {e}", dest.display()))?;
+        println!("verified: it opens as a store of {}; {} read back and matched their checksums", events(v.events), v.checked);
+    }
+    Ok(())
+}
+
+/// A long copy's progress on stderr: one updating line on a terminal, a line
+/// per tenth otherwise.
+struct Meter {
+    tty: bool,
+    shown: Option<u64>,
+}
+
+impl Meter {
+    fn new() -> Meter {
+        use std::io::IsTerminal;
+        Meter { tty: io::stderr().is_terminal(), shown: None }
+    }
+
+    fn show(&mut self, done: u64, total: u64) {
+        let pct = (done * 100).checked_div(total).unwrap_or(100).min(100);
+        let step = if self.tty { pct } else { pct / 10 * 10 };
+        if self.shown == Some(step) {
+            return;
+        }
+        self.shown = Some(step);
+        let line = format!("copying: {step}% ({:.2} of {:.2} GB)", done as f64 / 1e9, total as f64 / 1e9);
+        if self.tty {
+            eprint!("\r{line}");
+        } else {
+            eprintln!("{line}");
+        }
+    }
+
+    fn finish(&self) {
+        if self.tty && self.shown.is_some() {
+            eprintln!();
+        }
+    }
 }
 
 fn events(n: u64) -> String {

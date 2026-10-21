@@ -1126,3 +1126,115 @@ fn matching_skips_expired_and_dead() {
     assert!(walk("{}", Some(100), 500).is_empty(), "created at 100 is not older than 100");
     assert_eq!(walk("{}", Some(101), 500), vec![id_of(2)]);
 }
+
+/// Online backup: copied on another thread while the store keeps writing,
+/// deleting, compacting and merging; restored, it is the store at the start
+/// minus what was deleted during the copy, and holds nothing written after.
+#[test]
+fn online_backup_is_the_store_at_its_start() {
+    for (compact_after, kills_during) in [(0usize, true), (2, true), (2, false)] {
+        let dir = tmpdir("backup-src");
+        let dest = tmpdir("backup-dst");
+        let mut wl = Workload::new();
+        let (store, mut w) = Store::open(&dir, log_opts(compact_after)).unwrap();
+        for _ in 0..80 {
+            let b = wl.batch(12);
+            write(&mut w, &b);
+        }
+        let at_start = wl.live.clone();
+        let plan = w.begin_backup().unwrap();
+        let events = plan.events();
+        let copier = {
+            let dest = dest.clone();
+            std::thread::spawn(move || {
+                let mut ticks = 0;
+                let c = relay_store::backup::copy(&plan, &dest, &mut |_, _| {
+                    ticks += 1;
+                    true
+                });
+                (c, plan)
+            })
+        };
+        // Meanwhile: more writes, deletions of events that exist at the start,
+        // and (with compaction on) log compactions and merges.
+        let mut killed = Vec::new();
+        for round in 0..40 {
+            let b = wl.batch(12);
+            write(&mut w, &b);
+            if kills_during && round % 4 == 0 {
+                if let Some((&n, _)) = at_start.iter().find(|(n, r)| !killed.contains(*n) && Record(r).kind() == 14) {
+                    let by = Record(&at_start[&n]).pubkey()[0];
+                    let del = ev(1_000_000 + n, by, 50_000 + n, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, n)), "");
+                    write(&mut w, std::slice::from_ref(&del));
+                    killed.push(n);
+                    wl.live.remove(&n);
+                    wl.live.insert(1_000_000 + n, del);
+                }
+            }
+            w.maintain().unwrap();
+        }
+        let (copied, plan) = copier.join().unwrap();
+        copied.unwrap();
+        // The plan pins a snapshot: let it go before compaction has to wait for it.
+        drop(plan);
+        w.end_backup().unwrap();
+        // The live store carries on, compactions included.
+        w.compact_log_all().unwrap();
+        wl.check(&store, "live store after the backup");
+        drop((store, w));
+
+        let ok = relay_store::backup::verify(&dest, log_opts(0), events).unwrap();
+        assert!(ok.checked > 100, "{ok:?}");
+        // The backup as a store: exactly what existed at the start. The
+        // deletions since are not in it, so neither are their deaths.
+        let mut want = Workload::new();
+        want.live = at_start.clone();
+        let (bstore, mut bw) = Store::open(&dest, log_opts(compact_after)).unwrap();
+        assert_eq!(bw.next_seq(), events);
+        want.check(&bstore, &format!("backup (compaction {compact_after}, kills {kills_during})"));
+        // Compaction keeps a frame by its dead flag: a flag set during the copy
+        // would lose the event here.
+        bw.compact_log_all().unwrap();
+        want.check(&bstore, &format!("backup compacted (compaction {compact_after}, kills {kills_during})"));
+        // New events in the restored store are live: no death leaked from
+        // events newer than the backup.
+        let fresh: Vec<_> = (0..70u64).map(|i| ev(9_000_000 + i, 1, 90_000 + i, 14, "[]", "after restore")).collect();
+        assert!(write(&mut bw, &fresh).iter().all(|o| matches!(o, Outcome::Stored(_))));
+        assert_eq!(bstore.snapshot().count(&filter(r#"{"kinds":[14],"since":90000}"#), 0), 70);
+        drop((bstore, bw));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+}
+
+#[test]
+fn abandoned_or_misdirected_backups_leave_nothing() {
+    let dir = tmpdir("backup-abandon");
+    let dest = tmpdir("backup-abandon-dst");
+    let (_s, mut w) = Store::open(&dir, opts()).unwrap();
+    for i in 0..500u64 {
+        write(&mut w, &[ev(i, 1, 100 + i, 14, "[]", &"z".repeat(2000))]);
+    }
+    let plan = w.begin_backup().unwrap();
+    let err = relay_store::backup::copy(&plan, &dest, &mut |_, _| false).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    assert!(!dest.exists());
+    let mut partial = dest.as_os_str().to_owned();
+    partial.push(".partial");
+    assert!(!std::path::Path::new(&partial).exists(), "partial copy removed");
+    // A destination that exists is refused, and left alone.
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("keep"), b"x").unwrap();
+    assert_eq!(relay_store::backup::copy(&plan, &dest, &mut |_, _| true).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(dest.join("keep").exists());
+    // Into the data directory itself, even by a path that does not exist yet.
+    let inside = dir.join("backups").join("today");
+    assert_eq!(relay_store::backup::copy(&plan, &inside, &mut |_, _| true).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!dir.join("backups").exists());
+    // One backup at a time.
+    assert_eq!(w.begin_backup().err().map(|e| e.kind()), Some(std::io::ErrorKind::ResourceBusy));
+    drop(plan);
+    w.end_backup().unwrap();
+    drop(w.begin_backup().unwrap());
+    w.end_backup().unwrap();
+}

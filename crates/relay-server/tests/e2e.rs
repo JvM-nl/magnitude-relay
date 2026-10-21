@@ -774,3 +774,77 @@ async fn counts_are_exact_and_big_ones_leave_the_reactors() {
 fn relay_stop_quietly(r: Relay) {
     let _ = r.stop();
 }
+
+#[tokio::test]
+async fn a_backup_runs_beside_live_writes_and_restores() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("relay-e2e-backup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(Relay::start(dir.clone(), free_port()).stop());
+    let n = 60_000u64;
+    let file = dir.join("in.jsonl");
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&file).unwrap());
+    for i in 0..n {
+        let (id, pk) = (format!("{:064x}", i + 1), format!("{:064x}", i % 7 + 1));
+        let (at, sig) = (1_700_000_000 + i, "00".repeat(64));
+        writeln!(f, r#"{{"content":"x","created_at":{at},"id":"{id}","kind":14,"pubkey":"{pk}","sig":"{sig}","tags":[]}}"#).unwrap();
+    }
+    drop(f);
+    run_ok(&dir, &["import", "--no-verify", file.to_str().unwrap()]);
+
+    let port = free_port();
+    let relay = Relay::start(dir.clone(), port);
+    let host = format!("127.0.0.1:{port}");
+    let dest = dir.join("backup");
+    let backup = Command::new(env!("CARGO_BIN_EXE_magnitude-relay"))
+        .arg("--config")
+        .arg(dir.join("relay.toml"))
+        .args(["backup", dest.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Writes made while it runs are all accepted.
+    let me = Signer::new(31);
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    for i in 0..40 {
+        send(&mut c, json!(["EVENT", me.event(now(), 30078, json!([["d", format!("note-{i}")]]), "live")])).await;
+        assert!(ok_of(&mut c).await.0);
+    }
+    let out = backup.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let held = said.lines().next().unwrap().strip_prefix("backed up ").unwrap().split(' ').next().unwrap().parse::<u64>().unwrap();
+    assert!((n..=n + 40).contains(&held), "{said}");
+    assert!(said.contains("verified: it opens as a store of"), "{said}");
+
+    // The relay carries on; a second backup to the same place, or one into the
+    // data directory, is refused and changes nothing.
+    assert_eq!(run_ok(&dir, &["count", "--filter", "{}"]), format!("{}\n", n + 40));
+    run_refused(&dir, &["backup", dest.to_str().unwrap()], "already exists");
+    run_refused(&dir, &["backup", dir.join("data").join("copies").join("one").to_str().unwrap()], "inside the data directory");
+    assert!(!dir.join("data").join("copies").exists());
+    run_refused(&dir, &["backup"], "needs a destination");
+    drop(c);
+    let dir = relay.stop();
+
+    // Offline too: the stopped relay's directory is opened directly.
+    let offline = run_ok(&dir, &["backup", dir.join("backup-offline").to_str().unwrap(), "--no-verify"]);
+    assert!(offline.starts_with(&format!("backed up {} events", n + 40)), "{offline}");
+
+    // Restore: a relay started on the backup serves what it held, and takes new events.
+    let restored = dir.join("restored");
+    std::fs::create_dir_all(&restored).unwrap();
+    std::fs::rename(&dest, restored.join("data")).unwrap();
+    let port = free_port();
+    let relay = Relay::start(restored.clone(), port);
+    assert_eq!(run_ok(&restored, &["count", "--filter", r#"{"kinds":[14]}"#]), format!("{n}\n"));
+    assert_eq!(run_ok(&restored, &["count", "--filter", "{}"]), format!("{held}\n"));
+    let mut c = client_connect(relay.addr, &format!("127.0.0.1:{port}"), "/").await.unwrap();
+    send(&mut c, json!(["EVENT", me.event(now(), 30078, json!([["d", "after"]]), "after restore")])).await;
+    assert!(ok_of(&mut c).await.0);
+    assert_eq!(run_ok(&restored, &["count", "--filter", "{}"]), format!("{}\n", held + 1));
+    drop(c);
+    relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -156,6 +156,11 @@ pub struct Writer {
     /// from registration until the relink is done: every checkpoint in between
     /// records it, so a restart finishes the exchange.
     intent: (Vec<u64>, Vec<u64>),
+    /// A backup is copying files: no log compaction starts, and one that
+    /// finishes writing is not registered (its relink would point `locs` at
+    /// files the backup lacks) until the backup ends.
+    backup_hold: bool,
+    held_done: Vec<Done>,
     scratch: Vec<u8>,
 }
 
@@ -335,6 +340,8 @@ impl Writer {
             retired: log_lists.2,
             log_state: LogState::Idle,
             intent: (Vec::new(), Vec::new()),
+            backup_hold: false,
+            held_done: Vec::new(),
             scratch: Vec::new(),
         })
     }
@@ -712,7 +719,7 @@ impl Writer {
         match &self.log_state {
             LogState::Idle => {
                 let min = self.opts.log_compact_segments;
-                if min == 0 {
+                if min == 0 || self.backup_hold {
                     return;
                 }
                 let sealed = self.log.sealed(self.replay_from);
@@ -824,6 +831,46 @@ impl Writer {
         Ok(())
     }
 
+    /// Starts an online backup (see [`crate::backup`]): a fresh checkpoint, and
+    /// a snapshot that pins every file it names until the plan is dropped. Log
+    /// compaction holds still until [`end_backup`](Self::end_backup). Cheap: a
+    /// flush of queued frames and one checkpoint.
+    pub fn begin_backup(&mut self) -> io::Result<crate::backup::Plan> {
+        if self.backup_hold {
+            return Err(io::Error::new(io::ErrorKind::ResourceBusy, "a backup is already running"));
+        }
+        self.maintain()?;
+        self.log.flush()?;
+        self.backup_hold = true;
+        if let Err(e) = self.write_checkpoint() {
+            self.backup_hold = false;
+            return Err(e);
+        }
+        let checkpoint = match crate::checkpoint::read(&self.dir) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                self.backup_hold = false;
+                return Err(io::Error::other("no checkpoint after writing one"));
+            }
+            Err(e) => {
+                self.backup_hold = false;
+                return Err(e);
+            }
+        };
+        Ok(crate::backup::Plan::new(self.current(), checkpoint, self.log.head(), self.next_seq, self.log.seg_size(), self.dir.clone()))
+    }
+
+    /// Ends a backup: log compaction resumes, and a compaction that finished
+    /// meanwhile is registered now.
+    pub fn end_backup(&mut self) -> io::Result<()> {
+        self.backup_hold = false;
+        for d in std::mem::take(&mut self.held_done) {
+            self.finish_job(d)?;
+        }
+        self.step_log_compaction();
+        Ok(())
+    }
+
     /// Cold runs, as the checkpoint records them.
     pub fn cold_runs(&self) -> usize {
         self.cold_runs.len()
@@ -865,6 +912,10 @@ impl Writer {
     }
 
     fn finish_job(&mut self, d: Done) -> io::Result<()> {
+        if self.backup_hold && matches!(d, Done::LogCompacted { .. }) {
+            self.held_done.push(d);
+            return Ok(());
+        }
         match d {
             Done::Flushed { seg, frozen, covered, replay_from } => {
                 self.mem.drain(..frozen);

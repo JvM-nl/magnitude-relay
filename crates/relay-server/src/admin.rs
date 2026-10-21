@@ -15,12 +15,16 @@
 //!     {"matched":N,"deleted":0,"sample":[{"id":..,"kind":..,"created_at":..,"pubkey":..}]}
 //! {"op":"delete",...} without "dry_run"
 //!     {"progress":N} after each batch, then {"matched":N,"deleted":M,"sample":[]}
+//! {"op":"backup","filters":[],"dest":"/absolute/path"}
+//!     {"progress":BYTES,"total":BYTES} now and then, then
+//!     {"backup":true,"events":N,"files":F,"bytes":B,"written":W}
 //! ```
 //!
 //! Any failure is `{"error":"..."}`. Reads run on a snapshot in the
 //! connection's own thread, off the reactors and the writer. A delete finds its
 //! events there too, but only the writer thread may kill them: the kills go to
-//! it a batch at a time (see `ingest::Control`), between its own work.
+//! it a batch at a time (see `ingest::Control`), between its own work. A backup
+//! is copied here as well; the writer only starts it, and hears when it is over.
 
 use crate::ingest::{self, Control};
 use crate::operator::{self, Deleted, Sample};
@@ -28,6 +32,7 @@ use relay_proto::filter::FilterError;
 use relay_proto::json::{self, RawStr, Scanner};
 use relay_proto::record::push_u64;
 use relay_proto::{hex, Filter};
+use relay_store::backup::Copied;
 use relay_store::writer::DELETE_BATCH;
 use relay_store::{Store, Version};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -59,6 +64,7 @@ pub enum Op {
     Query,
     Count,
     Delete,
+    Backup,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -73,6 +79,8 @@ pub struct Request {
     pub all: bool,
     /// delete: change nothing, say what would go.
     pub dry_run: bool,
+    /// backup: where to, as an absolute path.
+    pub dest: Option<String>,
 }
 
 /// Why a request or reply could not be read.
@@ -106,7 +114,7 @@ fn boolean(s: &mut Scanner<'_>) -> Result<bool, Bad> {
 
 impl Request {
     pub fn new(op: Op, filters: Vec<Filter>) -> Request {
-        Request { op, filters, limit: None, age: None, all: false, dry_run: false }
+        Request { op, filters, limit: None, age: None, all: false, dry_run: false, dest: None }
     }
 
     fn to_line(&self) -> String {
@@ -115,6 +123,7 @@ impl Request {
             Op::Query => b"{\"op\":\"query\",\"filters\":[",
             Op::Count => b"{\"op\":\"count\",\"filters\":[",
             Op::Delete => b"{\"op\":\"delete\",\"filters\":[",
+            Op::Backup => b"{\"op\":\"backup\",\"filters\":[",
         });
         for (i, f) in self.filters.iter().enumerate() {
             if i > 0 {
@@ -134,6 +143,11 @@ impl Request {
                 out.extend_from_slice(format!(",\"{key}\":true").as_bytes());
             }
         }
+        if let Some(dest) = &self.dest {
+            out.extend_from_slice(b",\"dest\":\"");
+            json::escape_str(dest, &mut out);
+            out.push(b'"');
+        }
         out.push(b'}');
         String::from_utf8(out).expect("request JSON is UTF-8")
     }
@@ -150,6 +164,7 @@ impl Request {
                         (false, b"query") => Op::Query,
                         (false, b"count") => Op::Count,
                         (false, b"delete") => Op::Delete,
+                        (false, b"backup") => Op::Backup,
                         _ => return Err("unknown op".into()),
                     });
                 }
@@ -161,6 +176,7 @@ impl Request {
                 b"age" => r.age = Some(s.u64()?),
                 b"all" => r.all = boolean(s)?,
                 b"dry_run" => r.dry_run = boolean(s)?,
+                b"dest" => r.dest = Some(unescape(s.string()?)),
                 _ => return Err("unknown key".into()),
             }
             Ok(())
@@ -305,6 +321,9 @@ fn serve(stream: &UnixStream, store: &Store, ctl: &Sender<Control>) {
 
 fn handle(line: &str, out: &mut impl Write, store: &Store, ctl: &Sender<Control>) -> Result<(), String> {
     let req = Request::parse(line)?;
+    if req.op == Op::Backup {
+        return backup(&req, out, ctl);
+    }
     operator::check_filters(&req.filters)?;
     let now = ingest::now();
     match req.op {
@@ -326,6 +345,53 @@ fn handle(line: &str, out: &mut impl Write, store: &Store, ctl: &Sender<Control>
             writeln!(out, "{{\"count\":{n}}}").map_err(|e| e.to_string())
         }
         Op::Delete => delete(&req, out, store, ctl, now),
+        Op::Backup => unreachable!("answered above"),
+    }
+}
+
+/// Copies the store to `dest` while the relay serves (see `relay_store::backup`).
+/// The writer only starts the backup; the copy runs on this thread, and the
+/// writer hears that it is over however it ends.
+fn backup(req: &Request, out: &mut impl Write, ctl: &Sender<Control>) -> Result<(), String> {
+    let dest = Path::new(req.dest.as_deref().ok_or("a backup needs \"dest\"")?);
+    if !dest.is_absolute() {
+        return Err("a backup's destination must be an absolute path".into());
+    }
+    let (reply, answer) = mpsc::channel();
+    ctl.send(Control::BeginBackup { reply }).map_err(|_| STOPPING.to_string())?;
+    let plan = answer.recv().map_err(|_| STOPPING.to_string())?.map_err(|e| e.to_string())?;
+    let held = Held(Some(ctl.clone()));
+    let events = plan.events();
+    let copied = relay_store::backup::copy(&plan, dest, &mut |done, total| {
+        // The client going away (Ctrl-C), or the relay stopping, abandons the copy.
+        !ingest::SHUTDOWN.load(Ordering::Acquire) && writeln!(out, "{{\"progress\":{done},\"total\":{total}}}").and_then(|()| out.flush()).is_ok()
+    });
+    drop(plan);
+    let ended = held.end();
+    let c = copied.map_err(|e| e.to_string())?;
+    ended?;
+    writeln!(out, "{{\"backup\":true,\"events\":{events},\"files\":{},\"bytes\":{},\"written\":{}}}", c.files, c.bytes, c.written).map_err(|e| e.to_string())
+}
+
+/// A backup the writer holds still for. Ended once, or on the way out of a
+/// panic, so log compaction never stays held.
+struct Held(Option<Sender<Control>>);
+
+impl Held {
+    fn end(mut self) -> Result<(), String> {
+        let ctl = self.0.take().expect("ended once");
+        let (reply, answer) = mpsc::channel();
+        ctl.send(Control::EndBackup { reply }).map_err(|_| STOPPING.to_string())?;
+        answer.recv().map_err(|_| STOPPING.to_string())?.map_err(|e| e.to_string())
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(ctl) = self.0.take() {
+            let (reply, _) = mpsc::channel();
+            let _ = ctl.send(Control::EndBackup { reply });
+        }
     }
 }
 
@@ -437,10 +503,12 @@ pub struct Client(UnixStream);
 
 enum Reply<'a> {
     Event(&'a str),
-    Progress,
+    /// Done so far, and of how much when the relay says.
+    Progress(u64, Option<u64>),
     Done(u64),
     Count(u64),
     Deleted(Deleted),
+    BackedUp(u64, Copied),
 }
 
 impl Client {
@@ -486,8 +554,22 @@ impl Client {
         let mut line = String::new();
         loop {
             match next_reply(&mut r, &mut line)? {
-                Reply::Progress => {}
+                Reply::Progress(..) => {}
                 Reply::Deleted(d) => return Ok(d),
+                _ => return Err(io::Error::other("the relay's reply was not what was asked for")),
+            }
+        }
+    }
+
+    /// Has the relay copy itself to `req.dest`. `progress` hears (bytes done,
+    /// bytes in all). Returns the events in the backup, and what was copied.
+    pub fn backup(self, req: &Request, progress: &mut dyn FnMut(u64, u64)) -> io::Result<(u64, Copied)> {
+        let mut r = self.ask(req)?;
+        let mut line = String::new();
+        loop {
+            match next_reply(&mut r, &mut line)? {
+                Reply::Progress(done, Some(total)) => progress(done, total),
+                Reply::BackedUp(events, c) => return Ok((events, c)),
                 _ => return Err(io::Error::other("the relay's reply was not what was asked for")),
             }
         }
@@ -508,8 +590,9 @@ fn parse_reply(line: &str) -> Result<Result<Reply<'_>, String>, String> {
     if let Some(ev) = line.strip_prefix("{\"event\":").and_then(|l| l.trim_end().strip_suffix('}')) {
         return Ok(Ok(Reply::Event(ev)));
     }
-    let (mut error, mut done, mut progress) = (None, false, false);
+    let (mut error, mut done, mut progress, mut total) = (None, false, None, None);
     let (mut count, mut matched, mut deleted) = (None, None, None);
+    let (mut backed_up, mut events, mut files, mut bytes, mut written) = (false, None, None, None, None);
     let mut sample = Vec::new();
     let mut s = Scanner::new(line);
     s.object(|s, key| -> Result<(), Bad> {
@@ -519,10 +602,16 @@ fn parse_reply(line: &str) -> Result<Result<Reply<'_>, String>, String> {
                 s.skip()?;
                 done = true;
             }
-            b"progress" => {
-                s.u64()?;
-                progress = true;
+            b"progress" => progress = Some(s.u64()?),
+            b"total" => total = Some(s.u64()?),
+            b"backup" => {
+                s.skip()?;
+                backed_up = true;
             }
+            b"events" => events = Some(s.u64()?),
+            b"files" => files = Some(s.u64()?),
+            b"bytes" => bytes = Some(s.u64()?),
+            b"written" => written = Some(s.u64()?),
             b"count" => count = Some(s.u64()?),
             b"matched" => matched = Some(s.u64()?),
             b"deleted" => deleted = Some(s.u64()?),
@@ -540,8 +629,10 @@ fn parse_reply(line: &str) -> Result<Result<Reply<'_>, String>, String> {
         Err(msg)
     } else if done {
         Ok(Reply::Done(count.unwrap_or(0)))
-    } else if progress {
-        Ok(Reply::Progress)
+    } else if let Some(n) = progress {
+        Ok(Reply::Progress(n, total))
+    } else if let (true, Some(events), Some(files), Some(bytes), Some(written)) = (backed_up, events, files, bytes, written) {
+        Ok(Reply::BackedUp(events, Copied { files: files as usize, bytes, written }))
     } else if let (Some(matched), Some(deleted)) = (matched, deleted) {
         Ok(Reply::Deleted(Deleted { matched, deleted, sample }))
     } else if let Some(n) = count {
@@ -617,6 +708,7 @@ mod tests {
             Request::new(Op::Count, fs.clone()),
             Request { age: Some(86_400), all: true, dry_run: true, ..Request::new(Op::Delete, fs.clone()) },
             Request { age: Some(0), ..Request::new(Op::Delete, fs) },
+            Request { dest: Some("/srv/backups/a \"quoted\" \\ name\ttab".into()), ..Request::new(Op::Backup, Vec::new()) },
         ] {
             let line = req.to_line();
             assert!(!line.contains('\n'), "one line: {line}");
@@ -646,7 +738,11 @@ mod tests {
         assert!(matches!(parse_reply(ev), Ok(Ok(Reply::Event(e))) if e == r#"{"content":"a","id":"x"}"#));
         assert!(matches!(parse_reply(r#"{"done":true,"count":3}"#), Ok(Ok(Reply::Done(3)))));
         assert!(matches!(parse_reply(r#"{"count":9}"#), Ok(Ok(Reply::Count(9)))));
-        assert!(matches!(parse_reply(r#"{"progress":4096}"#), Ok(Ok(Reply::Progress))));
+        assert!(matches!(parse_reply(r#"{"progress":4096}"#), Ok(Ok(Reply::Progress(4096, None)))));
+        assert!(matches!(parse_reply(r#"{"progress":4096,"total":8192}"#), Ok(Ok(Reply::Progress(4096, Some(8192))))));
+        let backed = r#"{"backup":true,"events":60000,"files":9,"bytes":123,"written":45}"#;
+        let Ok(Ok(Reply::BackedUp(events, c))) = parse_reply(backed) else { panic!("not a backup reply") };
+        assert_eq!((events, c.files, c.bytes, c.written), (60_000, 9, 123, 45));
         let id = "cd".repeat(32);
         let line = format!(r#"{{"matched":5,"deleted":0,"sample":[{{"id":"{id}","kind":14,"created_at":77,"pubkey":"{id}"}}]}}"#);
         let Ok(Ok(Reply::Deleted(d))) = parse_reply(&line) else { panic!("not a delete reply") };
@@ -688,10 +784,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             for c in rx {
-                match c {
-                    Control::Kill { seqs, reply } => reply.send(w.kill_live(&seqs)).unwrap(),
-                    Control::Checkpoint { reply } => reply.send(w.write_checkpoint()).unwrap(),
-                }
+                ingest::control(&mut w, c);
             }
         });
         (store, tx, thread)

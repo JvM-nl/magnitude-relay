@@ -10,6 +10,7 @@
 //! runs flush to segment files in the background, and a checkpoint records which
 //! segments cover which part of the log, so a restart replays only the tail.
 
+pub mod backup;
 pub mod bg;
 pub mod checkpoint;
 pub mod crc32c;

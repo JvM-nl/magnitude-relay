@@ -36,6 +36,11 @@ commands:
                        write every live event as JSONL to stdout
   stats                print store statistics
   cert                 print the HTTPS certificate's names and when it expires
+  backup <DIR> [--no-verify]
+                       copy the store into DIR (which must not exist) as it is
+                       at this moment, while the relay keeps serving; then open
+                       the copy and check a spread of its events. The copy is a
+                       data directory: to restore or move, start a relay on it
   query --filter JSON [--limit N]
                        print matching events as JSONL, newest first
   count --filter JSON  print how many events match
@@ -50,8 +55,9 @@ commands:
 
   --filter takes one NIP-01 filter or a JSON array of them (their union); a
   limit inside a filter is refused (query has --limit). While the relay runs,
-  query, count and delete reach it through <data>/admin.sock, which only the
-  user running the relay can open; otherwise they open the data directory.
+  query, count, delete and backup reach it through <data>/admin.sock, which
+  only the user running the relay can open; otherwise they open the data
+  directory.
 
   --config FILE        settings file (default: ./relay.toml if it exists; every
                        setting is optional, see `{bin} init`)
@@ -228,6 +234,15 @@ fn run() -> Result<(), String> {
             let (all, dry_run, yes) = (flag(&mut args, "--all"), flag(&mut args, "--dry-run"), flag(&mut args, "--yes"));
             no_more(&args)?;
             operator::run_delete(&load()?, fs, age, all, dry_run, yes)
+        }
+        "backup" => {
+            let no_verify = flag(&mut args, "--no-verify");
+            let dest = match args.as_slice() {
+                [d] => PathBuf::from(d),
+                [] => return Err("backup needs a destination directory".into()),
+                _ => return Err(format!("unexpected arguments: {}", args[1..].join(" "))),
+            };
+            operator::run_backup(&load()?, &dest, !no_verify)
         }
         "cert" => cert(&load()?),
         "help" | "--help" | "-h" => {
