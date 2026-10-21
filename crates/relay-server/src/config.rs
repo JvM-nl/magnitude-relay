@@ -77,9 +77,11 @@ pub const VECTOR_KINDS: &[u64] = &[
     33302,
 ];
 
-/// NIPs the relay speaks, as published in NIP-11. Not 42: this relay never
-/// authenticates anyone (PLAN.md, Decisions).
-pub const SUPPORTED_NIPS: &[u32] = &[1, 9, 11, 40, 45, 59, 62, 70, 77];
+/// NIPs the relay speaks, as published in NIP-11. 17 and 65: it takes and
+/// serves gift-wrapped DMs with their inbox relay lists (10050), and relay
+/// lists (10002), so clients choosing DM relays find it. Not 42: this relay
+/// never authenticates anyone (PLAN.md, Decisions).
+pub const SUPPORTED_NIPS: &[u32] = &[1, 9, 11, 17, 40, 45, 59, 62, 65, 70, 77];
 
 /// Every section and its keys. The single source for "did you mean" hints and
 /// for the test that keeps the documented default file complete.
@@ -2207,7 +2209,7 @@ segment_mb = 64
         assert_eq!(j["description"], "A relay for Vector.");
         assert_eq!(j["software"], brand::SOFTWARE_URL);
         assert_eq!(j["version"], brand::VERSION);
-        assert_eq!(j["supported_nips"], serde_json::json!([1, 9, 11, 40, 45, 59, 62, 70, 77]));
+        assert_eq!(j["supported_nips"], serde_json::json!([1, 9, 11, 17, 40, 45, 59, 62, 65, 70, 77]));
         assert!(!j["supported_nips"].as_array().unwrap().contains(&serde_json::json!(42)));
         let l = &j["limitation"];
         assert_eq!(l["max_message_length"], 262_144);
