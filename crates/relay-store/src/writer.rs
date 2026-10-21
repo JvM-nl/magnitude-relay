@@ -35,6 +35,13 @@ pub enum Outcome {
     Rejected(&'static str),
 }
 
+/// A batch written to the log but not yet synced or published (see `Writer::stage`).
+pub struct Staged {
+    b: Batch,
+    offs: Vec<u64>,
+    base_count: u64,
+}
+
 /// A segment tier: segments within a factor of 4 in size share a level, and a
 /// level holding this many is merged into one.
 const COMPACT_FANIN: usize = 4;
@@ -247,11 +254,27 @@ impl Writer {
     /// Applies, persists and publishes a batch of verified records. Outcomes are
     /// in input order. Nothing is visible to readers until it is durable.
     pub fn write(&mut self, records: &[&[u8]]) -> io::Result<Vec<Outcome>> {
+        let (outcomes, staged) = self.stage(records)?;
+        self.finish(staged)?;
+        Ok(outcomes)
+    }
+
+    /// First half of a write: applies the rules and writes the batch to the log,
+    /// but does not sync or publish it. The caller may already relay the stored
+    /// events live (they passed every rule and are in the log), then calls
+    /// [`finish`](Self::finish), which makes them durable and publishes version
+    /// [`next_gen`](Self::next_gen). Acknowledgements must wait for `finish`.
+    pub fn stage(&mut self, records: &[&[u8]]) -> io::Result<(Vec<Outcome>, Staged)> {
         self.maintain()?;
         let mut b = Batch::new(self.current());
         let outcomes = records.iter().map(|rec| self.apply(&mut b, rec)).collect();
-        self.commit(b)?;
-        Ok(outcomes)
+        let staged = self.append(b)?;
+        Ok((outcomes, staged))
+    }
+
+    /// The generation `finish` will publish for the batch staged last.
+    pub fn next_gen(&self) -> u64 {
+        self.shared.gen.load(Ordering::Relaxed) + 1
     }
 
     fn apply(&mut self, b: &mut Batch, raw: &[u8]) -> Outcome {
@@ -349,9 +372,12 @@ impl Writer {
     }
 
     fn commit(&mut self, b: Batch) -> io::Result<()> {
-        if b.new.is_empty() && b.kills.is_empty() {
-            return Ok(());
-        }
+        let staged = self.append(b)?;
+        self.finish(staged)
+    }
+
+    /// Writes a batch's new records to the log (not yet synced).
+    fn append(&mut self, b: Batch) -> io::Result<Staged> {
         let base_count = self.next_seq;
         let mut offs = Vec::with_capacity(b.new.len());
         for (i, rec) in b.new.iter().enumerate() {
@@ -362,7 +388,15 @@ impl Writer {
             self.locs.set(base_count + i as u64, off)?;
         }
         self.next_seq += b.new.len() as u64;
+        Ok(Staged { b, offs, base_count })
+    }
 
+    /// Second half of a write: applies kills, syncs, and publishes.
+    pub fn finish(&mut self, s: Staged) -> io::Result<()> {
+        let Staged { b, offs, base_count } = s;
+        if b.new.is_empty() && b.kills.is_empty() {
+            return Ok(());
+        }
         let mut zero = Vec::with_capacity(b.kills.len());
         for &seq in &b.kills {
             let off = if seq >= base_count { offs[(seq - base_count) as usize] } else { locs::get(&b.base.locs, seq) };

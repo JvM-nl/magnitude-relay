@@ -24,7 +24,7 @@ pub mod version;
 pub mod writer;
 
 pub use version::{Hit, Plan, Version};
-pub use writer::{Outcome, Writer};
+pub use writer::{Outcome, Staged, Writer};
 
 use crate::dead::DeadSet;
 use crate::keys::KeyBuf;

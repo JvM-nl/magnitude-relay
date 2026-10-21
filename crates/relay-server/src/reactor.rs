@@ -138,6 +138,8 @@ struct Reactor {
     rec: Vec<u8>,
     /// Read buffer shared by every connection on this reactor.
     scratch: Vec<u8>,
+    /// Live batches relayed but not yet published, oldest first.
+    pending: std::collections::VecDeque<Arc<crate::ingest::LiveBatch>>,
 }
 
 /// Frames each reply as a WebSocket text message, built in place.
@@ -210,6 +212,7 @@ pub fn run(
             parser: EventParser::new(),
             rec: Vec::new(),
             scratch: vec![0; READ_CHUNK],
+            pending: std::collections::VecDeque::new(),
         }));
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
         while let Some((s, peer)) = conns.recv().await {
@@ -232,7 +235,16 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
         let mut guard = st.borrow_mut();
         let r = &mut *guard;
         let (events, gen): (&[Arc<[u8]>], u64) = match &msg {
-            ReactorMsg::Committed(c) => {
+            ReactorMsg::Live(b) => {
+                // Kept until published: a REQ answered from an older snapshot in
+                // the meantime replays it (see Session::on_req).
+                r.pending.push_back(b.clone());
+                (&b.events, b.gen)
+            }
+            ReactorMsg::Replies(c) => {
+                while r.pending.front().is_some_and(|p| p.gen <= c.gen) {
+                    r.pending.pop_front();
+                }
                 let m = shared.metrics.of(r.idx);
                 for reply in &c.replies[r.idx] {
                     match reply.outcome {
@@ -245,7 +257,7 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                         o.notify.notify_one();
                     }
                 }
-                (&c.events, c.gen)
+                (&[], 0)
             }
             ReactorMsg::Ephemeral(e) => (std::slice::from_ref(e), u64::MAX),
         };
@@ -361,6 +373,7 @@ fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &Conn
                     rec: &mut r.rec,
                     now: crate::ingest::now(),
                     m,
+                    pending: &r.pending,
                 };
                 session.on_text(t, &mut cx, &mut WsOut { buf: &mut out.buf.borrow_mut() });
             }

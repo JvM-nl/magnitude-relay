@@ -40,20 +40,26 @@ pub struct Reply {
     pub outcome: Option<Outcome>,
 }
 
-/// One committed batch, shared by every reactor.
-pub struct Committed {
-    /// The store generation that made these events visible. A subscription
-    /// opened against a snapshot at or after this generation already has them.
+/// Events that passed every rule and are in the log, relayed live while their
+/// sync is still in flight (live delivery does not wait for the disk; only the
+/// OK does). `gen` is the version that will publish them.
+pub struct LiveBatch {
     pub gen: u64,
     /// Newly stored records, in seq order.
     pub events: Vec<Arc<[u8]>>,
-    /// Replies, indexed by reactor.
+}
+
+/// The OKs for a batch that is now durable and published as version `gen`.
+pub struct Replies {
+    pub gen: u64,
+    /// Indexed by reactor.
     pub replies: Vec<Vec<Reply>>,
 }
 
 #[derive(Clone)]
 pub enum ReactorMsg {
-    Committed(Arc<Committed>),
+    Live(Arc<LiveBatch>),
+    Replies(Arc<Replies>),
     /// An ephemeral event: delivered live, never stored.
     Ephemeral(Arc<[u8]>),
 }
@@ -99,25 +105,40 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
         }
 
         let refs: Vec<&[u8]> = reqs.iter().map(|r| r.rec.as_slice()).collect();
-        let outcomes = match w.write(&refs) {
-            Ok(o) => o.into_iter().map(Some).collect(),
+        let staged = w.stage(&refs);
+        let gen = w.next_gen();
+        let outcomes: Vec<Option<Outcome>> = match staged {
+            Ok((outcomes, staged)) => {
+                // Relay what was stored now; the sync below only gates the OKs.
+                let events: Vec<Arc<[u8]>> =
+                    reqs.iter().zip(&outcomes).filter(|(_, o)| matches!(o, Outcome::Stored(_))).map(|(r, _)| Arc::<[u8]>::from(r.rec.as_slice())).collect();
+                if !events.is_empty() {
+                    let live = Arc::new(LiveBatch { gen, events });
+                    for s in &sinks {
+                        s(ReactorMsg::Live(live.clone()));
+                    }
+                }
+                match w.finish(staged) {
+                    Ok(()) => outcomes.into_iter().map(Some).collect(),
+                    Err(e) => {
+                        eprintln!("write failed: {e}");
+                        vec![None; reqs.len()]
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("write failed: {e}");
                 vec![None; reqs.len()]
             }
         };
         let mut replies: Vec<Vec<Reply>> = (0..sinks.len()).map(|_| Vec::new()).collect();
-        let mut events = Vec::new();
         for (r, outcome) in reqs.drain(..).zip(outcomes) {
             let id: [u8; 32] = r.rec[..32].try_into().unwrap();
-            if let Some(Outcome::Stored(_)) = outcome {
-                events.push(Arc::<[u8]>::from(r.rec));
-            }
             replies[r.reactor].push(Reply { conn: r.conn, id, outcome });
         }
-        let msg = Arc::new(Committed { gen: store.generation(), events, replies });
+        let msg = Arc::new(Replies { gen: store.generation(), replies });
         for s in &sinks {
-            s(ReactorMsg::Committed(msg.clone()));
+            s(ReactorMsg::Replies(msg.clone()));
         }
         if last_sweep.elapsed() >= SWEEP_EVERY {
             sweep(&mut w, &mut last_sweep);

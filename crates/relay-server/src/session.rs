@@ -50,6 +50,8 @@ pub struct Ctx<'a> {
     pub now: u64,
     /// This reactor's counters.
     pub m: &'a Block,
+    /// Live batches this reactor relayed that are not yet published.
+    pub pending: &'a std::collections::VecDeque<Arc<crate::ingest::LiveBatch>>,
 }
 
 /// Open negentropy sessions per connection (Vector runs one per relay at a time).
@@ -211,6 +213,18 @@ impl Session {
             }
         }
         eose(out, sub_id);
+        // Batches relayed live before this subscription existed but published
+        // after the snapshot above: in neither the results nor the live stream
+        // so far, so they go out now (exactly once).
+        for batch in cx.pending.iter().filter(|b| b.gen > snap.gen) {
+            for rec in &batch.events {
+                let rec = Record(rec);
+                if filters.iter().any(|f| f.matches(rec)) && !hides_wrap(&filters, rec) {
+                    event_msg(out, sub_id, rec);
+                    metrics::inc(&cx.m.events_live);
+                }
+            }
+        }
         metrics::add(&cx.m.req_micros, started.elapsed().as_micros() as u64);
     }
 
