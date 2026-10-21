@@ -1,0 +1,19 @@
+[package]
+name = "relay-tls"
+description = "HTTPS for the relay: rustls glue, an ACME (RFC 8555) client, and the DER, JWS and PEM it needs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# An in-process ACME server for tests, here and in relay-server.
+testing = []
+
+[dependencies]
+relay-net.workspace = true
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+ring.workspace = true

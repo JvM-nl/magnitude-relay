@@ -15,9 +15,14 @@ path = "src/main.rs"
 relay-proto.workspace = true
 relay-store.workspace = true
 relay-net.workspace = true
+relay-tls.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# The in-process ACME server and a TLS client, for the end-to-end HTTPS tests.
+relay-tls = { workspace = true, features = ["testing"] }
+rustls.workspace = true
+tokio-rustls.workspace = true
 negentropy = { version = "0.5", default-features = false, features = ["std"] }
 secp256k1.workspace = true
 sha2.workspace = true

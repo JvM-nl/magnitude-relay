@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::ingest::{ReactorMsg, WriteReq};
 use crate::metrics::{self, Metrics};
 use crate::session::{self, Ctx, Outbox, Session, SessionCfg};
+use crate::sock::{Incoming, Sock, TlsConfig};
 use crate::subs::{ConnId, FxMap, SubIndex};
 use relay_net::conn::{server_handshake_with, Handshake, OwnedRequest};
 use relay_net::http::{write_response, ExtensionPolicy};
@@ -139,11 +140,15 @@ struct ConnOut {
     overflow: Cell<bool>,
     /// permessage-deflate, when the client asked for it.
     deflate: RefCell<Option<Compressor>>,
+    /// Large live events may be shared rather than copied: a plain socket that
+    /// does not compress (TLS and compression each need their own bytes).
+    share: bool,
 }
 
 impl ConnOut {
-    fn new(deflate: Option<Compressor>) -> ConnOut {
+    fn new(deflate: Option<Compressor>, plain: bool) -> ConnOut {
         ConnOut {
+            share: plain && deflate.is_none(),
             buf: RefCell::new(Vec::new()),
             spliced: RefCell::new(Vec::new()),
             spliced_bytes: Cell::new(0),
@@ -171,7 +176,7 @@ impl ConnOut {
     /// false when this connection needs its own bytes (it compresses).
     #[inline]
     fn event_shared(&self, sub: &str, body: &Rc<[u8]>) -> bool {
-        if self.deflate.borrow().is_some() {
+        if !self.share {
             return false;
         }
         let mut buf = self.buf.borrow_mut();
@@ -256,15 +261,16 @@ pub fn listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
 /// Accepts connections and deals them to reactors round-robin. SO_REUSEPORT
 /// hashing leaves reactors idle when connections are few (eight benchmark
 /// clients can land 3-3-1-1 or worse), and signature checks are per core, so an
-/// idle reactor is lost throughput; dealing in turn places them exactly.
-pub fn accept_loop(l: std::net::TcpListener, conns: Vec<mpsc::UnboundedSender<(std::net::TcpStream, SocketAddr)>>) {
+/// idle reactor is lost throughput; dealing in turn places them exactly. `tls` is
+/// set for the HTTPS listener: its connections do the TLS handshake on their reactor.
+pub fn accept_loop(l: std::net::TcpListener, conns: Vec<mpsc::UnboundedSender<Incoming>>, tls: Option<TlsConfig>) {
     let mut next = 0usize;
     loop {
         match l.accept() {
             Ok((s, peer)) => {
                 let _ = s.set_nodelay(true);
                 if s.set_nonblocking(true).is_ok() {
-                    let _ = conns[next % conns.len()].send((s, peer));
+                    let _ = conns[next % conns.len()].send((s, peer, tls.clone()));
                     next = next.wrapping_add(1);
                 }
             }
@@ -281,7 +287,7 @@ pub fn accept_loop(l: std::net::TcpListener, conns: Vec<mpsc::UnboundedSender<(s
 pub fn run(
     idx: usize,
     shared: Arc<Shared>,
-    mut conns: mpsc::UnboundedReceiver<(std::net::TcpStream, SocketAddr)>,
+    mut conns: mpsc::UnboundedReceiver<Incoming>,
     rx: mpsc::UnboundedReceiver<ReactorMsg>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
@@ -299,10 +305,10 @@ pub fn run(
         }));
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
         tokio::task::spawn_local(keep_fresh(st.clone(), shared.clone()));
-        while let Some((s, peer)) = conns.recv().await {
+        while let Some((s, peer, tls)) = conns.recv().await {
             match TcpStream::from_std(s) {
                 Ok(s) => {
-                    tokio::task::spawn_local(connection(s, peer, st.clone(), shared.clone()));
+                    tokio::task::spawn_local(connection(s, peer, tls, st.clone(), shared.clone()));
                 }
                 Err(e) => eprintln!("cannot adopt connection: {e}"),
             }
@@ -460,7 +466,11 @@ fn client_ip(req: &OwnedRequest, peer: SocketAddr, header: &str) -> IpAddr {
     std::str::from_utf8(last).ok().and_then(|s| s.trim().parse::<IpAddr>().ok()).map_or(fallback, |ip| ip.to_canonical())
 }
 
-async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
+async fn connection(s: TcpStream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
+    // Clients of the HTTPS listener connect to the relay directly, so a header
+    // naming "the real address" is theirs to forge: only the socket's peer counts.
+    let real_ip_header = if tls.is_some() { "" } else { shared.cfg.relay.real_ip_header.as_str() };
+    let Some(mut s) = Sock::open(s, tls).await else { return };
     let mut buf = Vec::with_capacity(4096);
     let policy = match shared.cfg.relay.deflate_policy() {
         Some(p) => ExtensionPolicy::with_deflate(p),
@@ -474,7 +484,7 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
         }
         _ => return,
     };
-    let ip = client_ip(&req, peer, &shared.cfg.relay.real_ip_header);
+    let ip = client_ip(&req, peer, real_ip_header);
     let idx = st.borrow().idx;
     if !shared.admit(ip) {
         metrics::inc(&shared.metrics.of(idx).connections_refused);
@@ -490,7 +500,7 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
     if z.is_some() {
         metrics::inc(&shared.metrics.of(idx).connections_deflate);
     }
-    let out = Rc::new(ConnOut::new(z));
+    let out = Rc::new(ConnOut::new(z, matches!(s, Sock::Plain(_))));
     st.borrow_mut().conns.insert(conn, out.clone());
 
     let _ = serve(&mut s, &mut buf, conn, ip, deflate, &out, &st, &shared).await;
@@ -505,7 +515,9 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
 }
 
 /// Writes `buf` with each shared body inserted at its offset, in vectored writes.
-async fn write_spliced(s: &mut TcpStream, buf: &[u8], spliced: &[(usize, Rc<[u8]>)]) -> io::Result<()> {
+async fn write_spliced(s: &mut Sock, buf: &[u8], spliced: &[(usize, Rc<[u8]>)]) -> io::Result<()> {
+    // Only plain connections share bodies (`ConnOut::share`).
+    let Sock::Plain(s) = s else { return Err(io::Error::other("spliced output on an encrypted connection")) };
     let mut parts: Vec<io::IoSlice<'_>> = Vec::with_capacity(spliced.len() * 2 + 1);
     let mut at = 0;
     for (off, body) in spliced {
@@ -613,7 +625,7 @@ fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &Conn
 /// so an idle connection costs almost nothing.
 #[allow(clippy::too_many_arguments)]
 async fn serve(
-    s: &mut TcpStream,
+    s: &mut Sock,
     buf: &mut Vec<u8>,
     conn: ConnId,
     ip: IpAddr,
@@ -730,7 +742,7 @@ async fn serve(
 
 /// Plain HTTP: the NIP-11 document for `Accept: application/nostr+json`, a short
 /// note otherwise.
-async fn plain_http(s: &mut TcpStream, req: &OwnedRequest, shared: &Shared) -> io::Result<()> {
+async fn plain_http(s: &mut Sock, req: &OwnedRequest, shared: &Shared) -> io::Result<()> {
     let mut out = Vec::new();
     let cors = [
         ("Access-Control-Allow-Origin", "*"),

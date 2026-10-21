@@ -11,6 +11,7 @@ mod operator;
 mod reactor;
 mod serve;
 mod session;
+mod sock;
 mod stats;
 mod subs;
 mod toml;
@@ -34,6 +35,7 @@ commands:
   export [--since T] [--until T]
                        write every live event as JSONL to stdout
   stats                print store statistics
+  cert                 print the HTTPS certificate's names and when it expires
   query --filter JSON [--limit N]
                        print matching events as JSONL, newest first
   count --filter JSON  print how many events match
@@ -227,6 +229,7 @@ fn run() -> Result<(), String> {
             no_more(&args)?;
             operator::run_delete(&load()?, fs, age, all, dry_run, yes)
         }
+        "cert" => cert(&load()?),
         "help" | "--help" | "-h" => {
             print!("{} {}\n\n{}", brand::NAME, brand::VERSION, USAGE.replace("{bin}", brand::SLUG));
             Ok(())
@@ -245,5 +248,31 @@ fn init(target: &Path) -> Result<(), String> {
     })?;
     f.write_all(config::default_config_text().as_bytes()).map_err(|e| format!("{}: {e}", target.display()))?;
     eprintln!("wrote {}: every setting is there, commented out at its default. Delete the \"# \" before a line to change it.", target.display());
+    Ok(())
+}
+
+/// `cert`: what the HTTPS certificate is for and how long it has. Reads the file the
+/// relay serves (its own `cert`, else the one it saved), so it works while the relay
+/// runs and never opens the store.
+fn cert(cfg: &Config) -> Result<(), String> {
+    let path = if cfg.tls.uses_files() { PathBuf::from(&cfg.tls.cert) } else { cfg.store.data.join("tls").join("cert.pem") };
+    let text = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound if !cfg.tls.enabled => format!("no certificate: HTTPS is off (see [tls] in the settings) and {} does not exist", path.display()),
+        std::io::ErrorKind::NotFound => format!("no certificate yet: {} does not exist (a relay that is starting up for the first time is still asking for one; its log says how that is going)", path.display()),
+        _ => format!("{}: {e}", path.display()),
+    })?;
+    let chain = relay_tls::pem::certificates(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let info = relay_tls::x509::parse_certificate(&chain[0]).map_err(|e| format!("{}: {e}", path.display()))?;
+    let now = relay_tls::time::now();
+    println!("certificate: {}", path.display());
+    println!("names: {}", info.names.join(", "));
+    println!("issuer: {}", info.issuer_cn.as_deref().unwrap_or("(unnamed)"));
+    println!("valid from: {}", relay_tls::time::format(info.not_before));
+    let left = info.not_after - now;
+    if left < 0 {
+        println!("expires: {} (EXPIRED {} days ago)", relay_tls::time::format(info.not_after), -left / 86_400);
+        return Err("the certificate has expired".to_string());
+    }
+    println!("expires: {} (in {} days)", relay_tls::time::format(info.not_after), left / 86_400);
     Ok(())
 }

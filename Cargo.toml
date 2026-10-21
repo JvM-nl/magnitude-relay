@@ -4,6 +4,7 @@ members = [
     "crates/relay-proto",
     "crates/relay-store",
     "crates/relay-net",
+    "crates/relay-tls",
     "crates/relay-server",
     "crates/relay-bench",
 ]
@@ -19,10 +20,18 @@ rust-version = "1.85"
 relay-proto = { path = "crates/relay-proto" }
 relay-store = { path = "crates/relay-store" }
 relay-net = { path = "crates/relay-net" }
+relay-tls = { path = "crates/relay-tls" }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "signal", "io-util"] }
 secp256k1 = { version = "0.33", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", features = ["asm"] }
 libc = "0.2"
+# TLS and cryptography are never written in-house: rustls (ring provider, no
+# aws-lc), its tokio glue, ring for the ACME account's signatures, and the CA
+# trust store our ACME client uses. Only relay-tls depends on them at run time.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+ring = "0.17"
 # Dev-only: reference implementations our own code is cross-checked against.
 serde_json = "1"
 
