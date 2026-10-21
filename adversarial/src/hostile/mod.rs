@@ -133,7 +133,7 @@ pub fn run(cfg: &Cfg) -> Result<Vec<Verdict>, String> {
     let mut relay = Relay::start_at(&cfg.bin, &cfg.dir, port, cfg.threads, &settings).map_err(|e| e.to_string())?;
     eprintln!("relay up at {} (pid {}, {} events imported, our fd limit {limit})", relay.addr, relay.pid(), cfg.prefill);
     let canary = canary::Canary::start(relay.addr, cfg.seed ^ 0xCA);
-    let load: Vec<canary::Canary> = (0..cfg.load).map(|i| canary::Canary::start(relay.addr, cfg.seed ^ 0x10AD ^ (i as u64 + 1))).collect();
+    let load: Vec<canary::Canary> = (0..cfg.load).map(|i| canary::Canary::start_from(relay.addr, cfg.seed ^ 0x10AD ^ (i as u64 + 1), format!("10.99.98.{}", i + 1))).collect();
     std::thread::sleep(Duration::from_secs(2));
     let base = canary.take();
     let mut verdicts = vec![Verdict { name: "baseline", ok: base.errors.is_empty(), lines: vec![format!("canary: {}", base.describe())] }];

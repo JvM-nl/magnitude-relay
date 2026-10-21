@@ -570,8 +570,12 @@ pub fn run(cfg: &Cfg) -> Result<Stats, String> {
                         for w in &worlds {
                             for (label, c, maybe) in candidates(&w.m, &op, w.admin.as_ref()) {
                                 let mut trailing = w.trailing.clone();
-                                if let Op::Batch(evs) = &op {
-                                    trailing.push((evs.clone(), w.m.next_seq()));
+                                match &op {
+                                    Op::Batch(evs) => trailing.push((evs.clone(), w.m.next_seq())),
+                                    // Any of its client batches may be the one whose
+                                    // frames were written when it failed.
+                                    Op::AdminDelete { between, .. } => trailing.extend(between.iter().map(|b| (b.clone(), c.next_seq()))),
+                                    _ => {}
                                 }
                                 forks.push((World { label: format!("op {i} failed: {label}"), m: c, admin: None, admin_op: None, trailing, unsure: w.unsure.clone() }, maybe));
                             }

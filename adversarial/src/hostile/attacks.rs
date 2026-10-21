@@ -778,6 +778,10 @@ pub fn bigreq(env: &mut Env) -> Outcome {
         loop {
             match c.recv_text() {
                 Ok(s) if s.starts_with("[\"EOSE\"") => break,
+                Ok(s) if s.starts_with("[\"CLOSED\"") => {
+                    out.note(format!("it ended with {}", s.chars().take(120).collect::<String>()));
+                    break;
+                }
                 Ok(s) => {
                     n += 1;
                     bytes += s.len() as u64;

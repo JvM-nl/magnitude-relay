@@ -86,10 +86,10 @@ struct Session {
     subc: Conn,
 }
 
-fn open(addr: SocketAddr, keys: &Keys, since: u64) -> Result<Session, String> {
-    let o = Opts { ip: Some(IP), ..Opts::default() };
+fn open(addr: SocketAddr, keys: &Keys, since: u64, ip: &str) -> Result<Session, String> {
+    let o = Opts { ip: Some(ip), ..Opts::default() };
     let pubc = Conn::connect(addr, &o).map_err(|e| format!("connect: {e}"))?;
-    let mut subc = Conn::connect(addr, &Opts { ip: Some(IP), deflate: true, ..Opts::default() }).map_err(|e| format!("connect: {e}"))?;
+    let mut subc = Conn::connect(addr, &Opts { ip: Some(ip), deflate: true, ..Opts::default() }).map_err(|e| format!("connect: {e}"))?;
     subc.send_text(&format!("[\"REQ\",\"live\",{{\"authors\":[\"{}\"],\"since\":{since}}}]", keys.pk_hex)).map_err(|e| e.to_string())?;
     wait_for(&mut subc, "EOSE of the live subscription", |v| v[0] == "EOSE" && v[1] == "live")?;
     Ok(Session { pubc, subc })
@@ -139,6 +139,12 @@ fn round(s: &mut Session, keys: &Keys, n: u64, published: &mut u64, w: &Arc<Mute
 
 impl Canary {
     pub fn start(addr: SocketAddr, seed: u64) -> Canary {
+        Self::start_from(addr, seed, IP.to_string())
+    }
+
+    /// A canary from its own address (more of them, as normal traffic, must
+    /// not share one: they would hit the per-address limits together).
+    pub fn start_from(addr: SocketAddr, seed: u64, ip: String) -> Canary {
         let stop = Arc::new(AtomicBool::new(false));
         let window = Arc::new(Mutex::new(Window::default()));
         let (st, w) = (stop.clone(), window.clone());
@@ -152,7 +158,7 @@ impl Canary {
                 let mut s: Option<Session> = None;
                 while !st.load(Ordering::Relaxed) {
                     if s.is_none() {
-                        match open(addr, &keys, since) {
+                        match open(addr, &keys, since, &ip) {
                             Ok(x) => s = Some(x),
                             Err(e) => {
                                 w.lock().unwrap().errors.push(e);
@@ -171,7 +177,7 @@ impl Canary {
                         published = u64::MAX;
                     }
                     if published == u64::MAX {
-                        published = recount(addr, &keys).unwrap_or(0);
+                        published = recount(addr, &keys, &ip).unwrap_or(0);
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -194,8 +200,8 @@ impl Canary {
     }
 }
 
-fn recount(addr: SocketAddr, keys: &Keys) -> Option<u64> {
-    let mut c = Conn::connect(addr, &Opts { ip: Some(IP), ..Opts::default() }).ok()?;
+fn recount(addr: SocketAddr, keys: &Keys, ip: &str) -> Option<u64> {
+    let mut c = Conn::connect(addr, &Opts { ip: Some(ip), ..Opts::default() }).ok()?;
     c.send_text(&format!("[\"COUNT\",\"r\",{{\"authors\":[\"{}\"]}}]", keys.pk_hex)).ok()?;
     let v = wait_for(&mut c, "COUNT", |v| v[0] == "COUNT").ok()?;
     v[2]["count"].as_u64()
