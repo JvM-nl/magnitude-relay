@@ -103,6 +103,8 @@ impl MappedFile {
     pub fn write_at(&self, off: u64, data: &[u8]) -> io::Result<()> {
         debug_assert!(off as usize + data.len() <= self.len);
         #[cfg(any(test, feature = "fault-injection"))]
+        let _unsynced = crate::fault::before_write(&self.path, &self.file, off, data.len() as u64);
+        #[cfg(any(test, feature = "fault-injection"))]
         {
             let n = crate::fault::allowance(&self.path, data.len());
             if n < data.len() {
@@ -116,6 +118,13 @@ impl MappedFile {
     /// Makes written data durable. `fdatasync` on Linux; plain `fsync` elsewhere
     /// (macOS is a development platform here, not a durability target).
     pub fn sync(&self) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        return crate::fault::sync(&self.path, || self.sync_now());
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        self.sync_now()
+    }
+
+    fn sync_now(&self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         // SAFETY: valid descriptor.
         let r = unsafe { libc::fdatasync(self.file.as_raw_fd()) };
@@ -150,6 +159,8 @@ impl MappedFile {
             if end <= off {
                 return true;
             }
+            #[cfg(any(test, feature = "fault-injection"))]
+            let _unsynced = crate::fault::before_write(&self.path, &self.file, off, end - off);
             // SAFETY: valid descriptor; the range lies within the file.
             let r = unsafe {
                 libc::fallocate(self.file.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, off as i64, (end - off) as i64)

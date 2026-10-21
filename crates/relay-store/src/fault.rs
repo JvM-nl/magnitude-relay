@@ -13,11 +13,22 @@
 //! **Write faults.** [`fail_writes`] makes writes to files under a directory
 //! fail with ENOSPC once a byte budget is spent, the way a full disk does: the
 //! write that crosses the budget lands partly, then fails.
+//!
+//! **Power cuts.** With `RELAY_POWER_CUT=<seed>` as well, a crash point is a
+//! power cut rather than a process crash: before dying, every page written
+//! through a [`MappedFile`](crate::mmap::MappedFile) (the log, `locs`) since
+//! that file was last synced is set back to one of the states it went through
+//! since, chosen at random, as a page cache writing pages back at arbitrary
+//! moments would leave it. What was synced stays. Files written whole, synced
+//! and renamed into place (segments, checkpoints, `dead.bits`) are left as
+//! they are. Writes and syncs are serialised in this mode.
 
+use std::collections::HashMap;
 use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// The crash point named by `RELAY_CRASH_AT`, and how many hits it waits for.
 fn target() -> &'static Option<(String, u64)> {
@@ -47,12 +58,91 @@ pub fn crash_point(name: &'static str) {
             let _ = f.sync_all();
         }
     }
+    if let Some(p) = power() {
+        cut(p);
+    }
     // SAFETY: signalling our own process.
     unsafe {
         libc::kill(libc::getpid(), libc::SIGKILL);
     }
     // SIGKILL cannot be caught; this is never reached.
     std::process::abort();
+}
+
+const PAGE: u64 = 4096;
+
+/// Pages written since their file's last sync: (file, page offset) -> the
+/// page's contents before each of those writes.
+pub struct Unsynced {
+    pages: HashMap<(PathBuf, u64), Vec<Vec<u8>>>,
+    rng: u64,
+}
+
+fn power() -> Option<&'static Mutex<Unsynced>> {
+    static P: OnceLock<Option<Mutex<Unsynced>>> = OnceLock::new();
+    P.get_or_init(|| {
+        let seed: u64 = std::env::var("RELAY_POWER_CUT").ok()?.parse().ok()?;
+        Some(Mutex::new(Unsynced { pages: HashMap::new(), rng: seed | 1 }))
+    })
+    .as_ref()
+}
+
+/// Called before `len` bytes at `off` of `file` (at `path`) change: in
+/// power-cut mode, remembers the pages as they were. The write must happen
+/// while the returned guard is held.
+pub fn before_write(path: &Path, file: &std::fs::File, off: u64, len: u64) -> Option<MutexGuard<'static, Unsynced>> {
+    let mut u = power()?.lock().unwrap_or_else(|e| e.into_inner());
+    let mut page = off / PAGE * PAGE;
+    while page < off + len {
+        let mut buf = vec![0u8; PAGE as usize];
+        let n = file.read_at(&mut buf, page).unwrap_or(0);
+        buf.truncate(n);
+        u.pages.entry((path.to_path_buf(), page)).or_default().push(buf);
+        page += PAGE;
+    }
+    Some(u)
+}
+
+/// Runs `sync` for the file at `path`; in power-cut mode, once it succeeds,
+/// the file's writes so far survive any cut.
+pub fn sync(path: &Path, sync: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    let Some(p) = power() else { return sync() };
+    let mut u = p.lock().unwrap_or_else(|e| e.into_inner());
+    sync()?;
+    u.pages.retain(|(f, _), _| f != path);
+    Ok(())
+}
+
+/// Set once a power cut has begun: the process is dead to the files from
+/// then on, and what its other threads see (pages going back) means nothing.
+static CUTTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a power cut is under way (a test's panic hook ignores panics then).
+pub fn cutting() -> bool {
+    CUTTING.load(Ordering::Acquire)
+}
+
+/// The cut: every unsynced page back to a random one of its states. The lock
+/// stays held, so nothing is written after it.
+fn cut(p: &'static Mutex<Unsynced>) {
+    CUTTING.store(true, Ordering::Release);
+    let mut u = p.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rng = u.rng;
+    let mut pages: Vec<_> = u.pages.drain().collect();
+    pages.sort_by(|a, b| a.0.cmp(&b.0));
+    for ((path, page), versions) in pages {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let pick = (rng % (versions.len() as u64 + 1)) as usize;
+        if pick == versions.len() {
+            continue;
+        }
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+            let _ = f.write_all_at(&versions[pick], page);
+        }
+    }
+    std::mem::forget(u);
 }
 
 /// Directories whose files fail writes, with the bytes each may still take.
