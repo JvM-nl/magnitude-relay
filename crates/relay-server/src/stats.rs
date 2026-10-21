@@ -1,6 +1,7 @@
 //! `/stats` (JSON) and `/metrics` (Prometheus text): the counters plus the
 //! store's shape, rendered by hand.
 
+use crate::config::json_str;
 use crate::reactor::Shared;
 use std::fmt::Write;
 use std::sync::atomic::Ordering;
@@ -66,13 +67,6 @@ pub fn json(shared: &Shared) -> String {
     }
     o.push_str("]}");
     o
-}
-
-fn json_str(s: &str) -> String {
-    let mut b = vec![b'"'];
-    relay_proto::json::escape_str(s, &mut b);
-    b.push(b'"');
-    String::from_utf8(b).expect("escaped UTF-8 is UTF-8")
 }
 
 pub fn prometheus(shared: &Shared) -> String {

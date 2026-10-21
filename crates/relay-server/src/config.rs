@@ -812,7 +812,8 @@ impl Obj {
     }
 }
 
-fn json_str(s: &str) -> String {
+/// `s` as a JSON string literal, quotes included.
+pub fn json_str(s: &str) -> String {
     let mut v = Vec::with_capacity(s.len() + 2);
     v.push(b'"');
     escape_str(s, &mut v);
