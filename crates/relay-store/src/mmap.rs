@@ -98,6 +98,18 @@ impl MappedFile {
         }
     }
 
+    /// Starts writing a range back to disk without waiting (Linux), so a later
+    /// sync finds it already clean.
+    pub fn start_writeback(&self, off: u64, len: u64) {
+        #[cfg(target_os = "linux")]
+        // SAFETY: valid descriptor; advisory.
+        unsafe {
+            libc::sync_file_range(self.file.as_raw_fd(), off as i64, len as i64, libc::SYNC_FILE_RANGE_WRITE);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (off, len);
+    }
+
     /// Discards everything from `off` to the end, leaving zeros (a hole) behind.
     pub fn zero_from(&self, off: u64) -> io::Result<()> {
         self.file.set_len(off)?;

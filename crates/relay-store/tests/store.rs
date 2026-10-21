@@ -474,3 +474,36 @@ fn negentropy_covering_set_matches_query() {
     }
     assert!(snap.neg_items(&filter(r#"{"kinds":[1059],"authors":["00"]}"#.replace("00", &pk(1)).as_str()), 0).is_none());
 }
+
+#[test]
+fn torn_tail_with_precreated_next_segment() {
+    let dir = tmpdir("torn2");
+    {
+        let (_s, mut w) = Store::open(&dir, opts()).unwrap();
+        write(&mut w, &[ev(1, 1, 100, 1059, "[]", "a"), ev(2, 1, 101, 1059, "[]", "b")]);
+        // Zero-filling ahead pre-creates the next segment files.
+        w.prepare().unwrap();
+        w.prepare().unwrap();
+    }
+    assert!(dir.join("log").join("00000001.log").exists(), "next segment pre-created");
+    let seg = dir.join("log").join("00000000.log");
+    let data = std::fs::read(&seg).unwrap();
+    let mut end = 0usize;
+    loop {
+        let len = u32::from_le_bytes(data[end..end + 4].try_into().unwrap()) as usize;
+        if len == 0 {
+            break;
+        }
+        end += 20 + len;
+    }
+    let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+    use std::os::unix::fs::FileExt;
+    f.write_all_at(&[200, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 9], end as u64).unwrap();
+    drop(f);
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(ids(&store, "{}", 10).len(), 2);
+    assert!(matches!(write(&mut w, &[ev(3, 1, 102, 1059, "[]", "c")])[0], Outcome::Stored(2)));
+    drop((store, w));
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(ids(&store, "{}", 10).len(), 3);
+}

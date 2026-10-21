@@ -81,6 +81,9 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
         let first = match rx.recv_timeout(IDLE_TICK) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
+                if let Err(e) = w.prepare() {
+                    eprintln!("log preparation failed: {e}");
+                }
                 if let Err(e) = w.maintain() {
                     eprintln!("index maintenance failed: {e}");
                 }
@@ -139,6 +142,10 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
         let msg = Arc::new(Replies { gen: store.generation(), replies });
         for s in &sinks {
             s(ReactorMsg::Replies(msg.clone()));
+        }
+        // With the OKs out, keep the log's next stretch pre-written.
+        if let Err(e) = w.prepare() {
+            eprintln!("log preparation failed: {e}");
         }
         if last_sweep.elapsed() >= SWEEP_EVERY {
             sweep(&mut w, &mut last_sweep);

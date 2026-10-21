@@ -725,6 +725,12 @@ impl Writer {
         Ok(n)
     }
 
+    /// Idle-time upkeep that must stay off the latency path: keeps the log's
+    /// next region pre-written so syncs overwrite rather than allocate.
+    pub fn prepare(&mut self) -> io::Result<()> {
+        self.log.prepare()
+    }
+
     /// Forces durability of everything written (for relaxed mode and shutdown).
     pub fn sync(&mut self) -> io::Result<()> {
         self.log.sync()?;
