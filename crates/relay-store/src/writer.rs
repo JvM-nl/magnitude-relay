@@ -14,7 +14,7 @@ use crate::version::{Run, Version};
 use crate::{Options, Shared, VanishCfg};
 use relay_proto::kind;
 use relay_proto::record::{Field, Record};
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -70,11 +70,15 @@ pub struct Writer {
 }
 
 /// Events accepted so far in the batch being applied, visible to the rules for
-/// the rest of the batch.
+/// the rest of the batch. Only what the rules look up is tracked per event (its
+/// id, and the address/tombstone keys); the full index keys go straight into
+/// the batch's memory run. A vanish request, which needs everything about an
+/// author, scans the batch's records instead.
 struct Batch {
     base: Arc<Version>,
     keys: KeyBuf,
-    key_set: BTreeSet<Vec<u8>>,
+    ids: HashMap<[u8; 32], u64>,
+    rules: BTreeSet<Vec<u8>>,
     new: Vec<Vec<u8>>,
     kills: Vec<u64>,
     killed: HashSet<u64>,
@@ -82,7 +86,20 @@ struct Batch {
 
 impl Batch {
     fn new(base: Arc<Version>) -> Batch {
-        Batch { base, keys: KeyBuf::default(), key_set: BTreeSet::new(), new: Vec::new(), kills: Vec::new(), killed: HashSet::new() }
+        Batch {
+            base,
+            keys: KeyBuf::default(),
+            ids: HashMap::new(),
+            rules: BTreeSet::new(),
+            new: Vec::new(),
+            kills: Vec::new(),
+            killed: HashSet::new(),
+        }
+    }
+
+    /// The seqs and records added by this batch so far.
+    fn added(&self) -> impl Iterator<Item = (u64, Record<'_>)> {
+        self.new.iter().enumerate().map(|(i, r)| (self.base.count + i as u64, Record(r)))
     }
 
     fn is_live(&self, seq: u64) -> bool {
@@ -105,13 +122,14 @@ impl Batch {
     }
 
     fn has_key(&self, key: &[u8]) -> bool {
-        self.key_set.contains(key) || self.base.has_key(key)
+        self.rules.contains(key) || self.base.has_key(key)
     }
 
-    /// Keys under a whole bloom prefix, from the store and this batch.
+    /// Keys under a whole bloom prefix, from the store and this batch's
+    /// rule-bearing keys (ADDR, DELETED, ADDR_DELETED, VANISH).
     fn for_prefix(&self, p: &[u8], mut f: impl FnMut(&[u8])) {
         self.base.for_prefix(p, &mut f);
-        for k in self.key_set.range(p.to_vec()..) {
+        for k in self.rules.range(p.to_vec()..) {
             if !k.starts_with(p) {
                 break;
             }
@@ -120,9 +138,13 @@ impl Batch {
     }
 
     fn lookup_id(&self, id: &[u8; 32]) -> Option<u64> {
-        let p = prefix(T_ID, &[id]);
+        if let Some(&s) = self.ids.get(id) {
+            if self.is_live(s) {
+                return Some(s);
+            }
+        }
         let mut found = None;
-        self.for_prefix(&p, |k| {
+        self.base.for_prefix(&prefix(T_ID, &[id]), |k| {
             let s = seq_of(k);
             if found.is_none() && self.is_live(s) {
                 found = Some(s);
@@ -304,8 +326,9 @@ impl Writer {
         if k == kind::VANISH && self.vanish.targets(r) {
             // A key that authored gift wraps is a Concord plane key (or a DM
             // throwaway): vanishing it would wipe a shared plane for everyone.
-            let wraps = b.live_under(&prefix(T_AUTHOR_KIND, &[pk, &kind::GIFT_WRAP.to_be_bytes()]));
-            if !wraps.is_empty() {
+            let wraps = !b.live_under(&prefix(T_AUTHOR_KIND, &[pk, &kind::GIFT_WRAP.to_be_bytes()])).is_empty()
+                || b.added().any(|(s, a)| a.pubkey() == pk && a.kind() == kind::GIFT_WRAP && b.is_live(s));
+            if wraps {
                 return Outcome::Rejected("blocked: a key that authored gift wraps cannot vanish");
             }
             vanish_kills(b, pk, ca);
@@ -313,10 +336,14 @@ impl Writer {
 
         let seq = self.next_seq + b.new.len() as u64;
         b.new.push(raw.to_vec());
+        b.ids.insert(*id, seq);
         let first = b.keys.len();
         index_keys(r, seq, &mut b.keys, &mut self.scratch, &self.vanish);
         for i in first..b.keys.len() {
-            b.key_set.insert(b.keys.key(i).to_vec());
+            let key = b.keys.key(i);
+            if matches!(key[0], T_ADDR | T_DELETED | T_ADDR_DELETED | T_VANISH) {
+                b.rules.insert(key.to_vec());
+            }
         }
         Outcome::Stored(seq)
     }
@@ -693,16 +720,31 @@ fn deletable_by(target: Record<'_>, deleter: &[u8; 32]) -> bool {
 /// NIP-62: everything `pk` published up to `upto` (but its vanish requests), and
 /// every gift wrap addressed to it up to `upto`.
 fn vanish_kills(b: &mut Batch, pk: &[u8; 32], upto: u64) {
+    let mut kills = Vec::new();
     for (ca, seq) in b.live_under(&prefix(T_AUTHOR, &[pk])) {
         if ca <= upto && b.record(seq).kind() != kind::VANISH {
-            b.kill(seq);
+            kills.push(seq);
         }
     }
     let mut field = vec![relay_proto::record::FIELD_HEX32 as u8];
     field.extend_from_slice(pk);
     for (ca, seq) in b.live_under(&prefix(T_TAG_KIND, &[b"p", &field, &kind::GIFT_WRAP.to_be_bytes()])) {
         if ca <= upto {
-            b.kill(seq);
+            kills.push(seq);
         }
+    }
+    // Earlier events of this same batch are not in the store yet.
+    for (seq, r) in b.added() {
+        if r.created_at() > upto || !b.is_live(seq) {
+            continue;
+        }
+        let by_them = r.pubkey() == pk && r.kind() != kind::VANISH;
+        let to_them = r.kind() == kind::GIFT_WRAP && p_tags(r).iter().any(|p| p == pk);
+        if by_them || to_them {
+            kills.push(seq);
+        }
+    }
+    for s in kills {
+        b.kill(s);
     }
 }
