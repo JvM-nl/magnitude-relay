@@ -170,6 +170,51 @@ async fn vector_flows_end_to_end() {
     let m = recv(&mut a).await;
     assert_eq!(m, json!(["COUNT", "c", {"count": 1}]));
 
+    // NIP-77: Vector's DM sync. The client holds the first wrap plus one the
+    // relay never saw; the relay holds three more. The reference client must
+    // learn exactly which three to fetch.
+    let mut more = Vec::new();
+    for i in 0..3 {
+        let w = sender.event(now() - 3600 * (i + 2), 1059, json!([["p", me.pk()]]), &format!("w{i}"));
+        send(&mut b, json!(["EVENT", w])).await;
+        assert!(ok_of(&mut b).await.0);
+        more.push(w["id"].as_str().unwrap().to_string());
+    }
+    {
+        use negentropy::{Id, Negentropy, NegentropyStorageVector};
+        let mut st = NegentropyStorageVector::new();
+        let held = [(wrap["created_at"].as_u64().unwrap(), wrap["id"].as_str().unwrap().to_string()), (now() - 99_999, "ab".repeat(32))];
+        for (t, id) in &held {
+            st.insert(*t, Id::from_byte_array(hex::decode_32(id.as_bytes()).unwrap())).unwrap();
+        }
+        st.seal().unwrap();
+        let mut neg = Negentropy::owned(st, 60_000).unwrap();
+        let init = neg.initiate().unwrap();
+        send(&mut a, json!(["NEG-OPEN", "neg", {"kinds": [1059], "#p": [me.pk()]}, hex::encode_string(&init)])).await;
+        let (mut have, mut need) = (Vec::new(), Vec::new());
+        loop {
+            // The live "dm" subscription is still open, so the new wraps arrive too.
+            let m = loop {
+                let m = recv(&mut a).await;
+                if m[0] != "EVENT" {
+                    break m;
+                }
+            };
+            assert_eq!(m[0], "NEG-MSG", "{m}");
+            let bytes = hex::decode_any_case(m[2].as_str().unwrap().as_bytes()).unwrap();
+            match neg.reconcile_with_ids(&bytes, &mut have, &mut need).unwrap() {
+                Some(next) => send(&mut a, json!(["NEG-MSG", "neg", hex::encode_string(&next)])).await,
+                None => break,
+            }
+        }
+        send(&mut a, json!(["NEG-CLOSE", "neg"])).await;
+        let mut need: Vec<String> = need.iter().map(|i| hex::encode_string(i.as_bytes())).collect();
+        need.sort();
+        more.sort();
+        assert_eq!(need, more);
+        assert_eq!(have.len(), 1, "the wrap the relay never saw");
+    }
+
     // Ephemeral Concord wrap: delivered live, never stored.
     let plane = Signer::new(3);
     send(&mut a, json!(["REQ", "plane", {"kinds": [1059, 21059], "authors": [plane.pk()], "since": now() - 300, "limit": 0}])).await;

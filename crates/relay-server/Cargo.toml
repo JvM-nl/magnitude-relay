@@ -18,6 +18,7 @@ relay-net.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+negentropy = { version = "0.5", default-features = false, features = ["std"] }
 secp256k1.workspace = true
 sha2.workspace = true
 serde_json.workspace = true

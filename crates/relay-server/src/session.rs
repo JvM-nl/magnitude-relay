@@ -7,6 +7,7 @@ use crate::subs::{ConnId, SubIndex};
 use relay_proto::event::{verify_sig, EventInfo};
 use relay_proto::json::{escape_str, Scanner};
 use relay_proto::message::{ClientMsg, MsgError};
+use relay_proto::negentropy::{self, VecStorage};
 use relay_proto::{hex, kind, EventParser, Filter, Record};
 use relay_store::{Outcome, Store, Version};
 use std::collections::HashSet;
@@ -48,15 +49,24 @@ pub struct Ctx<'a> {
     pub now: u64,
 }
 
+/// Open negentropy sessions per connection (Vector runs one per relay at a time).
+const MAX_NEG_SESSIONS: usize = 8;
+/// Largest set a NEG-OPEN may reconcile, as strfry's `maxSyncEvents`.
+const MAX_NEG_ITEMS: usize = 2_000_000;
+/// Response cap in bytes before hex: ~100 KB on the wire, inside the 128 KB
+/// frame Vector's negentropy client assumes.
+const NEG_FRAME_LIMIT: usize = 50_000;
+
 pub struct Session {
     pub conn: ConnId,
     /// Events queued to the writer and not yet answered.
     pub pending: usize,
+    neg: Vec<(Box<str>, VecStorage)>,
 }
 
 impl Session {
     pub fn new(conn: ConnId) -> Session {
-        Session { conn, pending: 0 }
+        Session { conn, pending: 0, neg: Vec::new() }
     }
 
     pub fn on_text(&mut self, text: &str, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
@@ -71,10 +81,9 @@ impl Session {
                 let id = *Record(cx.rec).id();
                 ok(out, &id, false, "restricted: this relay does not use AUTH");
             }
-            Ok(ClientMsg::NegOpen { sub_id, .. } | ClientMsg::NegMsg { sub_id, .. }) => {
-                neg_err(out, sub_id, "error: negentropy is not available yet");
-            }
-            Ok(ClientMsg::NegClose { .. }) => {}
+            Ok(ClientMsg::NegOpen { sub_id, filter, msg }) => self.on_neg_open(sub_id, filter, &msg, cx, out),
+            Ok(ClientMsg::NegMsg { sub_id, msg }) => self.on_neg_msg(sub_id, &msg, out),
+            Ok(ClientMsg::NegClose { sub_id }) => self.neg.retain(|(s, _)| &**s != sub_id),
             Err(MsgError::Filter { sub_id, err }) => closed(out, &sub_id, &format!("error: {err}")),
             Err(e) => notice(out, &e.to_string()),
         }
@@ -191,6 +200,47 @@ impl Session {
         eose(out, sub_id);
     }
 
+    fn on_neg_open(&mut self, sub_id: &str, filter: Filter, msg: &[u8], cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
+        self.neg.retain(|(s, _)| &**s != sub_id);
+        let mut fs = [filter];
+        if let Err(m) = self.check_filters(&mut fs, cx) {
+            return neg_err(out, sub_id, &m);
+        }
+        let [filter] = fs;
+        if self.neg.len() >= MAX_NEG_SESSIONS {
+            return neg_err(out, sub_id, "blocked: too many open negentropy sessions");
+        }
+        cx.store.refresh(cx.snap);
+        // `limit` does not apply to a set reconciliation: the whole matching set is the set.
+        let mut f = filter;
+        f.limit = None;
+        let hits = cx.snap.query(&f, MAX_NEG_ITEMS + 1, cx.now);
+        if hits.len() > MAX_NEG_ITEMS {
+            return neg_err(out, sub_id, "blocked: too many records to reconcile, narrow the filter");
+        }
+        let storage = VecStorage::new(hits.iter().filter(|h| !broad_wrap(&f, cx.snap, h.seq)).map(|h| (h.created_at, h.id)).collect());
+        match negentropy::reconcile(&storage, msg, NEG_FRAME_LIMIT) {
+            Ok(resp) => {
+                neg_msg(out, sub_id, &resp);
+                self.neg.push((sub_id.into(), storage));
+            }
+            Err(e) => neg_err(out, sub_id, &format!("error: {e}")),
+        }
+    }
+
+    fn on_neg_msg(&mut self, sub_id: &str, msg: &[u8], out: &mut dyn Outbox) {
+        let Some((_, storage)) = self.neg.iter().find(|(s, _)| &**s == sub_id) else {
+            return neg_err(out, sub_id, "closed: no open negentropy session with this id");
+        };
+        match negentropy::reconcile(storage, msg, NEG_FRAME_LIMIT) {
+            Ok(resp) => neg_msg(out, sub_id, &resp),
+            Err(e) => {
+                neg_err(out, sub_id, &format!("error: {e}"));
+                self.neg.retain(|(s, _)| &**s != sub_id);
+            }
+        }
+    }
+
     fn on_count(&mut self, sub_id: &str, mut filters: Vec<Filter>, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
         if let Err(msg) = self.check_filters(&mut filters, cx) {
             return closed(out, sub_id, &msg);
@@ -299,6 +349,21 @@ pub fn notice(out: &mut dyn Outbox, msg: &str) {
         escape_str(msg, b);
         b.extend_from_slice(b"\"]");
     });
+}
+
+pub fn neg_msg(out: &mut dyn Outbox, sub_id: &str, msg: &[u8]) {
+    out.text(&mut |b| {
+        b.extend_from_slice(b"[\"NEG-MSG\",\"");
+        b.extend_from_slice(sub_id.as_bytes());
+        b.extend_from_slice(b"\",\"");
+        hex::encode_into(msg, b);
+        b.extend_from_slice(b"\"]");
+    });
+}
+
+/// A gift wrap that a broad filter would match: left out of reconciliation too.
+fn broad_wrap(f: &Filter, snap: &Version, seq: u64) -> bool {
+    broad(f) && snap.record(seq).is_some_and(|r| r.kind() == kind::GIFT_WRAP)
 }
 
 pub fn neg_err(out: &mut dyn Outbox, sub_id: &str, msg: &str) {

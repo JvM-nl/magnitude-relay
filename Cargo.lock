@@ -228,6 +228,7 @@ dependencies = [
 name = "relay-server"
 version = "0.1.0"
 dependencies = [
+ "negentropy",
  "relay-net",
  "relay-proto",
  "relay-store",
