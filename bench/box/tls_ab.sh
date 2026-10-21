@@ -36,7 +36,8 @@ if [ ! -s "$TLS/key.pem" ]; then
 fi
 # The benchmark settings, plus the Unix socket and the relay's own TLS.
 sed "s|^\[relay\]|[relay]\nunix_socket = \"$sock\"|" "$BENCH_ROOT/ours.toml" > "$conf"
-printf '\n[tls]\nenabled = true\ncert = "%s"\nkey = "%s"\nhttps_bind = "127.0.0.1:7808"\n' "$TLS/cert.pem" "$TLS/key.pem" >> "$conf"
+# (http_bind, for ACME challenges and redirects, would take port 80: kept on loopback.)
+printf '\n[tls]\nenabled = true\ncert = "%s"\nkey = "%s"\nhttps_bind = "127.0.0.1:7808"\nhttp_bind = "127.0.0.1:7809"\n' "$TLS/cert.pem" "$TLS/key.pem" >> "$conf"
 export OURS_CONF=$conf
 
 # The production vhost's /nostr location (proxy settings, TLS 1.2/1.3), twice.
@@ -58,6 +59,8 @@ EOF
 }
 cat > "$NGX/nginx.conf" <<EOF
 worker_processes 4;
+# Two descriptors per proxied connection.
+worker_rlimit_nofile 65536;
 pid $RUN_DIR/nginx.pid;
 error_log $NGX/logs/error.log warn;
 events { worker_connections 16384; }
