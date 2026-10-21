@@ -1314,9 +1314,9 @@ async fn costly_reqs_are_answered_off_the_reactors_in_order() {
             assert!(ok_of(&mut c).await.0);
         }
     }
-    // 300 authors (297 with no events) x one kind: 300 index ranges.
+    // 1100 authors (1097 with no events) x one kind: 1100 index ranges.
     let mut authors: Vec<String> = signers.iter().map(Signer::pk).collect();
-    authors.extend((0..297u32).map(|n| {
+    authors.extend((0..1097u32).map(|n| {
         let mut b = [0x5A; 32];
         b[..4].copy_from_slice(&n.to_le_bytes());
         hex::encode_string(&b)
@@ -1356,6 +1356,63 @@ async fn costly_reqs_are_answered_off_the_reactors_in_order() {
     send(&mut c, json!(["REQ", "probe", {"ids": [live["id"]]}])).await;
     let (evs, _) = collect(&mut c, "probe").await;
     assert_eq!(evs.len(), 1, "nothing left over from the closed one before this");
+    drop(c);
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A reconnect burst of Concord clients: each subscribes to a community's
+/// plane keys (1100 authors x 1059 and 21059, past what a reactor answers on
+/// the spot) at the same moment, far more than the workers' queue holds.
+/// Every one gets its history and EOSE; none is refused.
+#[tokio::test]
+async fn a_burst_of_concord_subscriptions_is_never_refused() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-concord-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let relay = Relay::start(dir, free_port());
+    let host = relay.addr.to_string();
+    let plane = Signer::new(31);
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    let t = now();
+    for i in 0..5u64 {
+        send(&mut c, json!(["EVENT", plane.event(t - 10 - i, 1059, json!([]), &format!("stream wrap {i}"))])).await;
+        assert!(ok_of(&mut c).await.0);
+    }
+    let mut authors = vec![plane.pk()];
+    authors.extend((0..1099u32).map(|n| {
+        let mut b = [0x3C; 32];
+        b[..4].copy_from_slice(&n.to_le_bytes());
+        hex::encode_string(&b)
+    }));
+    let req = json!(["REQ", "plane", {"authors": authors, "kinds": [1059, 21059]}]);
+    let mut clients = Vec::new();
+    for _ in 0..200 {
+        clients.push(client_connect(relay.addr, &host, "/").await.unwrap());
+    }
+    let tasks: Vec<_> = clients
+        .into_iter()
+        .map(|mut c| {
+            let req = req.clone();
+            tokio::spawn(async move {
+                send(&mut c, req).await;
+                let (evs, end) = collect(&mut c, "plane").await;
+                (evs.len(), end[0].as_str().unwrap().to_string(), end.to_string())
+            })
+        })
+        .collect();
+    for t in tasks {
+        let (n, kind, end) = t.await.unwrap();
+        assert_eq!((n, kind.as_str()), (5, "EOSE"), "{end}");
+    }
+    let st = stats(&relay).await;
+    eprintln!("offloaded {}, answered on a reactor for a full queue {}", st["reqs_offloaded"], st["reqs_inline_fallback"]);
+    // The live subscription Concord keeps open asks for no history: however
+    // many plane keys it names, it costs nothing and is answered on the spot.
+    let before = st["reqs_offloaded"].as_u64().unwrap();
+    send(&mut c, json!(["REQ", "live", {"authors": authors, "kinds": [1059, 21059], "since": t - 300, "limit": 0}])).await;
+    let (evs, end) = collect(&mut c, "live").await;
+    assert_eq!((evs.len(), end[0].as_str()), (0, Some("EOSE")));
+    assert_eq!(stats(&relay).await["reqs_offloaded"].as_u64(), Some(before));
     drop(c);
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);

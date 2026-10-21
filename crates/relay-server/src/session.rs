@@ -112,9 +112,20 @@ const INLINE_COUNT_KEYS: u64 = 50_000;
 /// REQs expected to read more index entries than this (a few ms with their
 /// records), or to seek more ranges than `INLINE_REQ_RANGES`, are answered by
 /// the query workers: four clients sending 50-filter REQs had held every
-/// other connection on their reactors for 400 ms at a time.
+/// other connection on their reactors for 400 ms at a time. A range costs
+/// about 3.5 us to seek, so 1024 of them is the same few ms: a Concord
+/// subscription (hundreds of plane keys x 1059 and 21059) stays on the
+/// reactors, all of them at once, instead of queueing for a worker.
 const INLINE_REQ_COST: u64 = 20_000;
-const INLINE_REQ_RANGES: usize = 256;
+const INLINE_REQ_RANGES: usize = 1024;
+/// When the workers' queue is full, a REQ up to this size is answered on the
+/// spot rather than refused: up to 2000 authors x 4 kinds, the most Vector and
+/// Concord ask for, so a reconnect burst is slower, never refused. Bigger
+/// ones (only hostile clients send them) get `rate-limited`.
+const FALLBACK_REQ_COST: u64 = 200_000;
+const FALLBACK_REQ_RANGES: usize = 8192;
+/// The same for a COUNT: up to this many index keys are counted on the spot.
+const FALLBACK_COUNT_KEYS: u64 = 1_000_000;
 /// Live events a held subscription keeps before its connection counts as
 /// unable to keep up.
 const HELD_MAX: usize = 4096;
@@ -531,11 +542,11 @@ impl Session {
         if snap.req_cost(&filters, &limits, INLINE_REQ_RANGES) > INLINE_REQ_COST {
             // A worker finds and encodes the stored events; live ones wait in
             // the hold until they have gone out.
-            let token = cx.held.hold(self.conn, sub_id, early);
+            let token = cx.held.hold(self.conn, sub_id, early.clone());
             let job = crate::ingest::ReqJob {
-                snap,
-                filters,
-                limits,
+                snap: snap.clone(),
+                filters: filters.clone(),
+                limits: limits.clone(),
                 now: cx.now,
                 reactor: cx.reactor,
                 conn: self.conn,
@@ -546,12 +557,14 @@ impl Session {
             };
             if (cx.offload)(crate::ingest::Job::Req(job)) {
                 metrics::inc(&cx.m.reqs_offloaded);
-            } else {
-                cx.held.release(self.conn, sub_id);
-                cx.subs.remove(self.conn, sub_id);
-                closed(out, sub_id, "rate-limited: too many large requests in progress, try again shortly");
+                return;
             }
-            return;
+            cx.held.release(self.conn, sub_id);
+            if snap.req_cost(&filters, &limits, FALLBACK_REQ_RANGES) > FALLBACK_REQ_COST {
+                cx.subs.remove(self.conn, sub_id);
+                return closed(out, sub_id, "rate-limited: too many large requests in progress, try again shortly");
+            }
+            metrics::inc(&cx.m.reqs_inline_fallback);
         }
 
         let a = answer(&snap, &filters, &limits, sub_id, self.trusted, cx.now, cx.cfg.max_outbound, out);
@@ -631,13 +644,17 @@ impl Session {
         cx.store.refresh(cx.snap);
         // Exact, always: Vector sizes its syncs with it.
         if cx.snap.count_cost(&filters) > INLINE_COUNT_KEYS {
-            let job = crate::ingest::CountJob { snap: cx.snap.clone(), filters, now: cx.now, reactor: cx.reactor, conn: cx.conn, sub: sub_id.to_string() };
+            let job = crate::ingest::CountJob { snap: cx.snap.clone(), filters: filters.clone(), now: cx.now, reactor: cx.reactor, conn: cx.conn, sub: sub_id.to_string() };
             if (cx.offload)(crate::ingest::Job::Count(job)) {
                 metrics::inc(&cx.m.counts_offloaded);
-            } else {
-                closed(out, sub_id, "rate-limited: too many large counts in progress, try again shortly");
+                return;
             }
-            return;
+            // The workers are busy: one Vector sizes a sync with is counted
+            // here (slower for this reactor), a hostile one is refused.
+            if cx.snap.count_cost(&filters) > FALLBACK_COUNT_KEYS {
+                return closed(out, sub_id, "rate-limited: too many large counts in progress, try again shortly");
+            }
+            metrics::inc(&cx.m.reqs_inline_fallback);
         }
         count_msg(out, sub_id, cx.snap.count_all(&filters, cx.now));
     }

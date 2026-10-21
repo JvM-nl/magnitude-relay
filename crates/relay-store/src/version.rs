@@ -671,6 +671,11 @@ impl Version {
         let mut ranges = 0;
         let mut cost = 0u64;
         for (f, &limit) in filters.iter().zip(limits) {
+            // `limit: 0` reads nothing (Concord's live subscription: every
+            // plane key it holds, no history).
+            if limit == 0 {
+                continue;
+            }
             match self.plan(f) {
                 Plan::Nothing => {}
                 Plan::Ids => cost += f.ids.as_ref().map_or(0, |i| i.len() as u64),
