@@ -366,6 +366,7 @@ where
                     rbuf,
                     rpos: 0,
                     wbuf: Vec::new(),
+                    wpos: 0,
                     dec,
                     enc,
                     comp,
@@ -385,12 +386,19 @@ where
 ///
 /// `queue_*` buffer frames and [`flush`](Self::flush) writes them in one go, so a
 /// benchmark can pipeline many requests per syscall; `send_*` do both.
+///
+/// [`recv`](Self::recv) and [`flush`](Self::flush) are cancel-safe: dropping
+/// either mid-way (a `select!` that took another branch, a timeout) loses no
+/// input and leaves no half-written frame behind, so a caller can wait for a
+/// message and for something else at once.
 pub struct ClientConn<S = TcpStream> {
     stream: S,
     rbuf: Vec<u8>,
     /// Start of the unconsumed input in `rbuf` (consumed bytes are dropped lazily).
     rpos: usize,
     wbuf: Vec<u8>,
+    /// Bytes of `wbuf` already written: a flush that was cancelled resumes here.
+    wpos: usize,
     dec: Decoder,
     enc: ClientEncoder,
     /// Present when permessage-deflate was negotiated.
@@ -432,13 +440,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientConn<S> {
         self.enc.write_ping(&mut self.wbuf, payload);
     }
 
-    /// Writes everything queued.
+    /// Writes everything queued. Progress is kept between calls, so a flush
+    /// that is cancelled and called again sends each byte exactly once.
     pub async fn flush(&mut self) -> io::Result<()> {
-        if !self.wbuf.is_empty() {
-            self.stream.write_all(&self.wbuf).await?;
-            self.wbuf.clear();
+        while self.wpos < self.wbuf.len() {
+            let n = self.stream.write(&self.wbuf[self.wpos..]).await?;
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            self.wpos += n;
         }
+        self.wbuf.clear();
+        self.wpos = 0;
         self.stream.flush().await
+    }
+
+    /// Bytes queued and not yet written.
+    pub fn pending_bytes(&self) -> usize {
+        self.wbuf.len() - self.wpos
     }
 
     pub async fn send_text(&mut self, text: &str) -> io::Result<()> {
@@ -668,6 +687,45 @@ mod tests {
 
         let closed = c.close().await.unwrap();
         assert_eq!(closed, Some((1000, String::new())));
+        server.await.unwrap().unwrap();
+    }
+
+    /// A caller that waits on `recv` and `flush` beside other things cancels
+    /// them all the time: nothing may be lost or sent twice when it does.
+    #[tokio::test]
+    async fn recv_and_flush_survive_cancellation() {
+        let (addr, server) = spawn_echo().await;
+        let mut c = client_connect(addr, "localhost", "/echo").await.unwrap();
+        let tiny = std::time::Duration::from_micros(50);
+        let mut cancelled = (0, 0);
+        for i in 0..20 {
+            // Several megabytes queued: far more than one write takes, so a
+            // flush is cut short many times before it finishes.
+            let msgs: Vec<String> = (0..4).map(|j| text_of(700_000 + i * 1000 + j, (i * 4 + j) as u64 + 7)).collect();
+            for m in &msgs {
+                c.queue_text(m);
+            }
+            loop {
+                match tokio::time::timeout(tiny, c.flush()).await {
+                    Ok(r) => break r.unwrap(),
+                    Err(_) => cancelled.0 += 1,
+                }
+            }
+            assert_eq!(c.pending_bytes(), 0);
+            for (j, m) in msgs.iter().enumerate() {
+                let got = loop {
+                    match tokio::time::timeout(tiny, c.recv()).await {
+                        Ok(r) => break r.unwrap(),
+                        Err(_) => cancelled.1 += 1,
+                    }
+                };
+                assert_eq!(got, Message::Text(m.clone()), "round {i} message {j}");
+            }
+        }
+        // How often each was cut short depends on the machine's load; that it
+        // happened at all is what makes the test mean something.
+        assert!(cancelled.0 + cancelled.1 > 0, "the test must actually cancel: {cancelled:?}");
+        assert_eq!(c.close().await.unwrap(), Some((1000, String::new())));
         server.await.unwrap().unwrap();
     }
 
