@@ -136,6 +136,8 @@ struct Reactor {
     conns: FxMap<ConnId, Rc<ConnOut>>,
     parser: EventParser,
     rec: Vec<u8>,
+    /// Read buffer shared by every connection on this reactor.
+    scratch: Vec<u8>,
 }
 
 /// Frames each reply as a WebSocket text message, built in place.
@@ -177,6 +179,7 @@ pub fn run(idx: usize, shared: Arc<Shared>, listener: Option<std::net::TcpListen
             conns: FxMap::default(),
             parser: EventParser::new(),
             rec: Vec::new(),
+            scratch: vec![0; READ_CHUNK],
         }));
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
         let Some(l) = listener else {
@@ -302,7 +305,69 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
     shared.metrics.open.fetch_sub(1, Ordering::Relaxed);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Bytes read per readiness event, into the reactor's shared scratch buffer.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Decodes and answers every whole frame in `data`. Returns how many bytes were
+/// used (a trailing partial frame is left) and whether the connection is closing.
+fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> (usize, bool) {
+    let broadcast = |m: ReactorMsg| shared.broadcast(m);
+    let allow_event = || shared.take_event(ip);
+    let mut off = 0;
+    loop {
+        let d = match dec.decode(&mut data[off..]) {
+            Ok(d) => d,
+            Err(e) => {
+                ws::write_close(&mut out.buf.borrow_mut(), e.close_code(), e.reason());
+                return (off, true);
+            }
+        };
+        off += d.consumed;
+        match d.event {
+            Some(Event::Text(t)) => {
+                let mut guard = st.borrow_mut();
+                let r = &mut *guard;
+                let m = shared.metrics.of(r.idx);
+                metrics::inc(&m.messages_in);
+                shared.store.refresh(&mut r.snap);
+                let mut cx = Ctx {
+                    cfg: &shared.scfg,
+                    store: &shared.store,
+                    snap: &mut r.snap,
+                    subs: &mut r.subs,
+                    writer: &shared.writer,
+                    reactor: r.idx,
+                    broadcast: &broadcast,
+                    allow_event: &allow_event,
+                    parser: &mut r.parser,
+                    rec: &mut r.rec,
+                    now: crate::ingest::now(),
+                    m,
+                };
+                session.on_text(t, &mut cx, &mut WsOut { buf: &mut out.buf.borrow_mut() });
+            }
+            Some(Event::Binary(_)) => {
+                session::notice(&mut WsOut { buf: &mut out.buf.borrow_mut() }, "error: binary messages are not supported");
+            }
+            Some(Event::Ping(p)) => ws::write_pong(&mut out.buf.borrow_mut(), p),
+            Some(Event::Pong(_)) => {}
+            Some(Event::Close(c)) => {
+                let mut b = out.buf.borrow_mut();
+                match c {
+                    Some((code, _)) => ws::write_close(&mut b, code, ""),
+                    None => ws::write_close_empty(&mut b),
+                }
+                return (off, true);
+            }
+            None => return (off, false),
+        }
+    }
+}
+
+/// Runs one WebSocket connection. Reads land in the reactor's shared scratch
+/// buffer and are decoded in place; the connection keeps bytes of its own only
+/// while a frame is split across reads, and frees them as soon as it is whole,
+/// so an idle connection costs almost nothing.
 async fn serve(
     s: &mut TcpStream,
     buf: &mut Vec<u8>,
@@ -318,64 +383,11 @@ async fn serve(
     let mut wbuf = Vec::new();
     let mut last_rx = Instant::now();
     let mut pinged = false;
-    let broadcast = |m: ReactorMsg| shared.broadcast(m);
-    let allow_event = || shared.take_event(ip);
+    // Frames that arrived with the handshake.
+    let (used, mut closing) = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
+    buf.drain(..used);
+    *buf = buf.to_vec();
     loop {
-        // Decode and answer everything buffered.
-        let mut off = 0;
-        let mut closing = false;
-        loop {
-            let d = match dec.decode(&mut buf[off..]) {
-                Ok(d) => d,
-                Err(e) => {
-                    ws::write_close(&mut out.buf.borrow_mut(), e.close_code(), e.reason());
-                    closing = true;
-                    break;
-                }
-            };
-            off += d.consumed;
-            match d.event {
-                Some(Event::Text(t)) => {
-                    let mut guard = st.borrow_mut();
-                    let r = &mut *guard;
-                    let m = shared.metrics.of(r.idx);
-                    metrics::inc(&m.messages_in);
-                    shared.store.refresh(&mut r.snap);
-                    let mut cx = Ctx {
-                        cfg: &shared.scfg,
-                        store: &shared.store,
-                        snap: &mut r.snap,
-                        subs: &mut r.subs,
-                        writer: &shared.writer,
-                        reactor: r.idx,
-                        broadcast: &broadcast,
-                        allow_event: &allow_event,
-                        parser: &mut r.parser,
-                        rec: &mut r.rec,
-                        now: crate::ingest::now(),
-                        m,
-                    };
-                    session.on_text(t, &mut cx, &mut WsOut { buf: &mut out.buf.borrow_mut() });
-                }
-                Some(Event::Binary(_)) => {
-                    session::notice(&mut WsOut { buf: &mut out.buf.borrow_mut() }, "error: binary messages are not supported");
-                }
-                Some(Event::Ping(p)) => ws::write_pong(&mut out.buf.borrow_mut(), p),
-                Some(Event::Pong(_)) => {}
-                Some(Event::Close(c)) => {
-                    let mut b = out.buf.borrow_mut();
-                    match c {
-                        Some((code, _)) => ws::write_close(&mut b, code, ""),
-                        None => ws::write_close_empty(&mut b),
-                    }
-                    closing = true;
-                    break;
-                }
-                None => break,
-            }
-        }
-        buf.drain(..off);
-
         // Flush (taking the buffer, so fan-out keeps appending to a fresh one).
         if out.overflow.get() {
             ws::write_close(&mut out.buf.borrow_mut(), 1008, "too slow: messages were piling up");
@@ -387,7 +399,8 @@ async fn serve(
             metrics::add(&shared.metrics.of(st.borrow().idx).bytes_out, wbuf.len() as u64);
             s.write_all(&wbuf).await?;
             wbuf.clear();
-            if wbuf.capacity() > 1 << 20 {
+            // Idle connections keep no output buffer; a busy one keeps a modest one.
+            if wbuf.capacity() > 64 * 1024 {
                 wbuf = Vec::new();
             }
         }
@@ -400,20 +413,40 @@ async fn serve(
         tokio::select! {
             r = s.readable() => {
                 r?;
-                let want = dec.needed().saturating_sub(buf.len()).max(16 * 1024);
-                let len = buf.len();
-                buf.resize(len + want, 0);
-                match s.try_read(&mut buf[len..]) {
-                    Ok(0) => return Ok(()),
+                let mut scratch = std::mem::take(&mut st.borrow_mut().scratch);
+                scratch.resize(READ_CHUNK, 0);
+                let result = s.try_read(&mut scratch);
+                match result {
+                    Ok(0) => {
+                        st.borrow_mut().scratch = scratch;
+                        return Ok(());
+                    }
                     Ok(n) => {
-                        buf.truncate(len + n);
                         metrics::add(&shared.metrics.of(st.borrow().idx).bytes_in, n as u64);
                         last_rx = Instant::now();
                         pinged = false;
+                        if buf.is_empty() {
+                            // The common case: decode straight from the scratch buffer.
+                            let (used, c) = process(&mut scratch[..n], &mut dec, &mut session, out, st, shared, ip);
+                            buf.extend_from_slice(&scratch[used..n]);
+                            closing = c;
+                        } else {
+                            buf.extend_from_slice(&scratch[..n]);
+                            let (used, c) = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
+                            buf.drain(..used);
+                            closing = c;
+                        }
+                        if buf.is_empty() && buf.capacity() > 0 {
+                            *buf = Vec::new();
+                        }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => buf.truncate(len),
-                    Err(e) => return Err(e),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        st.borrow_mut().scratch = scratch;
+                        return Err(e);
+                    }
                 }
+                st.borrow_mut().scratch = scratch;
             }
             _ = out.notify.notified() => {}
             _ = tokio::time::sleep_until(idle_at.into()) => {
