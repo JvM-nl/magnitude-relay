@@ -124,7 +124,10 @@ impl Session {
         }
         // A resend is answered from the index, before any hashing.
         cx.store.refresh(cx.snap);
-        if cx.snap.lookup_id(&id).is_some() {
+        // A resend is answered from the index, unless the copy we hold is still
+        // syncing: then the writer answers, after the sync, so an OK never
+        // promises something a crash could take back.
+        if cx.snap.lookup_id(&id).is_some_and(|seq| seq < cx.store.durable_seq()) {
             metrics::inc(&cx.m.events_duplicate);
             return ok(out, &id, true, "duplicate: already have this event");
         }

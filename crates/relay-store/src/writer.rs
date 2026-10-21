@@ -47,6 +47,34 @@ fn lap(slot: usize, t: &mut std::time::Instant) {
     *t = now;
 }
 
+/// The sync a published batch still owes (see `Writer::publish_staged`).
+pub struct SyncTicket {
+    files: Vec<Arc<crate::mmap::MappedFile>>,
+    seq_end: u64,
+    durable: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SyncTicket {
+    /// Folds a later ticket into this one, so one sync covers both.
+    pub fn absorb(&mut self, later: SyncTicket) {
+        for f in later.files {
+            if !self.files.iter().any(|g| Arc::ptr_eq(g, &f)) {
+                self.files.push(f);
+            }
+        }
+        self.seq_end = self.seq_end.max(later.seq_end);
+    }
+
+    /// Syncs, then advances the durability horizon.
+    pub fn sync(self) -> io::Result<()> {
+        for f in &self.files {
+            f.sync()?;
+        }
+        self.durable.fetch_max(self.seq_end, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
 /// A batch written to the log but not yet synced or published (see `Writer::stage`).
 pub struct Staged {
     b: Batch,
@@ -405,9 +433,17 @@ impl Writer {
 
     /// Second half of a write: applies kills, syncs, and publishes.
     pub fn finish(&mut self, s: Staged) -> io::Result<()> {
+        self.publish_staged(s)?.sync()
+    }
+
+    /// Publishes a staged batch without waiting for its sync, and returns the
+    /// sync still owed. Readers and the rules of the next batch see it at once;
+    /// it is durable (and may be acknowledged) only once the ticket's `sync`
+    /// returns, which another thread can do while this one stages more.
+    pub fn publish_staged(&mut self, s: Staged) -> io::Result<SyncTicket> {
         let Staged { b, offs, base_count } = s;
         if b.new.is_empty() && b.kills.is_empty() {
-            return Ok(());
+            return Ok(SyncTicket { files: Vec::new(), seq_end: self.next_seq, durable: self.shared.durable.clone() });
         }
         let mut zero = Vec::with_capacity(b.kills.len());
         for &seq in &b.kills {
@@ -416,11 +452,7 @@ impl Writer {
             zero.push(off);
         }
         let mut t = std::time::Instant::now();
-        if self.opts.sync {
-            self.log.sync()?;
-        } else {
-            self.log.flush()?;
-        }
+        let files = if self.opts.sync { self.log.take_touched()? } else { self.log.flush().map(|_| Vec::new())? };
         lap(0, &mut t);
 
         self.dead.grow_to(self.next_seq);
@@ -437,8 +469,20 @@ impl Writer {
         self.pending_zero.push_back((Arc::downgrade(&old), zero));
         drop(old);
         self.reclaim()?;
-        self.maybe_flush();
+        self.maybe_flush()?;
         lap(3, &mut t);
+        Ok(SyncTicket { files, seq_end: self.next_seq, durable: self.shared.durable.clone() })
+    }
+
+    /// Makes everything written durable now, whatever tickets are outstanding:
+    /// required before anything persistent (a segment flush, a checkpoint) may
+    /// rely on it.
+    fn barrier(&mut self) -> io::Result<()> {
+        if self.shared.durable.load(Ordering::Acquire) >= self.next_seq {
+            return Ok(());
+        }
+        self.log.sync_all()?;
+        self.shared.durable.fetch_max(self.next_seq, Ordering::AcqRel);
         Ok(())
     }
 
@@ -491,16 +535,19 @@ impl Writer {
     }
 
     /// Hands the memory runs to the background worker once they are big enough.
-    fn maybe_flush(&mut self) {
+    fn maybe_flush(&mut self) -> io::Result<()> {
         if !self.flushing && self.mem_bytes() >= self.opts.flush_bytes {
-            self.start_flush();
+            self.start_flush()?;
         }
+        Ok(())
     }
 
-    fn start_flush(&mut self) {
+    fn start_flush(&mut self) -> io::Result<()> {
         if self.mem.is_empty() {
-            return;
+            return Ok(());
         }
+        // The segment will cover every seq below next_seq: they must be durable.
+        self.barrier()?;
         self.frozen = self.mem.len();
         self.flushing = true;
         let id = self.next_seg_id;
@@ -510,6 +557,7 @@ impl Writer {
             self.flushing = false;
             self.frozen = 0;
         }
+        Ok(())
     }
 
     fn maybe_compact(&mut self) {
@@ -562,7 +610,7 @@ impl Writer {
                 drop(self.publish());
                 self.write_checkpoint()?;
                 self.maybe_compact();
-                self.maybe_flush();
+                self.maybe_flush()?;
             }
             Done::Compacted { seg, replaced } => {
                 let (gone, keep): (Vec<_>, Vec<_>) = self.segments.drain(..).partition(|s| replaced.contains(&s.id));
@@ -597,7 +645,7 @@ impl Writer {
         if self.mem.is_empty() {
             return Ok(());
         }
-        self.start_flush();
+        self.start_flush()?;
         while self.flushing {
             let d = self.done.recv().map_err(|_| io::Error::other("store worker stopped"))?;
             self.finish_job(d)?;
@@ -628,6 +676,8 @@ impl Writer {
     /// restart replays only the log after `replay_from`. Order matters: `locs`
     /// and the dead set are made durable before the checkpoint that relies on them.
     fn write_checkpoint(&mut self) -> io::Result<()> {
+        // The dead set may hold kills by batches whose sync is still in flight.
+        self.barrier()?;
         self.locs.sync()?;
         let dead_tmp = self.dir.join("dead.bits.tmp");
         std::fs::write(&dead_tmp, self.dead.to_bytes(self.next_seq))?;

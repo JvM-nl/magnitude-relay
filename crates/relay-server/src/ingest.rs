@@ -8,7 +8,7 @@
 //! learns about new events the moment they are durable: no polling, no inotify.
 
 use crate::subs::ConnId;
-use relay_store::{Outcome, Store, Writer};
+use relay_store::{Outcome, Store, SyncTicket, Writer};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -71,7 +71,55 @@ pub fn now() -> u64 {
 }
 
 /// Runs the writer until every sender is gone.
-pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>) {
+/// A published batch whose OKs wait for its sync.
+struct SyncJob {
+    ticket: Option<SyncTicket>,
+    replies: Vec<Vec<Reply>>,
+    gen: u64,
+}
+
+/// Syncs published batches in order, coalescing whatever has queued into one
+/// sync, then sends their OKs. Runs beside the writer, so staging the next batch
+/// never waits for the disk.
+fn syncer(rx: Receiver<SyncJob>, sinks: Vec<Sink>) {
+    while let Ok(first) = rx.recv() {
+        let mut jobs = vec![first];
+        while let Ok(j) = rx.try_recv() {
+            jobs.push(j);
+        }
+        let mut ticket: Option<SyncTicket> = None;
+        for j in &mut jobs {
+            if let Some(t) = j.ticket.take() {
+                match &mut ticket {
+                    Some(a) => a.absorb(t),
+                    None => ticket = Some(t),
+                }
+            }
+        }
+        let failed = match ticket.map_or(Ok(()), |t| t.sync()) {
+            Ok(()) => false,
+            Err(e) => {
+                eprintln!("sync failed: {e}");
+                true
+            }
+        };
+        for mut j in jobs {
+            if failed {
+                for r in j.replies.iter_mut().flatten() {
+                    r.outcome = None;
+                }
+            }
+            let msg = Arc::new(Replies { gen: j.gen, replies: j.replies });
+            for s in &sinks {
+                s(ReactorMsg::Replies(msg.clone()));
+            }
+        }
+    }
+}
+
+pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>, reply_sinks: Vec<Sink>) {
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel::<SyncJob>();
+    let sync_thread = std::thread::Builder::new().name("syncer".into()).spawn(move || syncer(sync_rx, reply_sinks)).expect("syncer thread");
     let mut last_sweep = Instant::now();
     let mut reqs: Vec<WriteReq> = Vec::new();
     // RELAY_DEBUG_WRITER=1 prints a per-second breakdown of the writer's cycle.
@@ -119,31 +167,38 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
         let stage_secs = t_stage.elapsed().as_secs_f64();
         let mut finish_secs = 0f64;
         let gen = w.next_gen();
-        let outcomes: Vec<Option<Outcome>> = match staged {
+        let n = reqs.len();
+        let (outcomes, ticket): (Vec<Option<Outcome>>, Option<SyncTicket>) = match staged {
             Ok((outcomes, staged)) => {
-                // Relay what was stored now; the sync below only gates the OKs.
-                let events: Vec<Arc<[u8]>> =
-                    reqs.iter().zip(&outcomes).filter(|(_, o)| matches!(o, Outcome::Stored(_))).map(|(r, _)| Arc::<[u8]>::from(r.rec.as_slice())).collect();
-                if !events.is_empty() {
-                    let live = Arc::new(LiveBatch { gen, events });
-                    for s in &sinks {
-                        s(ReactorMsg::Live(live.clone()));
-                    }
-                }
                 let t_finish = Instant::now();
-                let finished = w.finish(staged);
-                finish_secs = t_finish.elapsed().as_secs_f64();
-                match finished {
-                    Ok(()) => outcomes.into_iter().map(Some).collect(),
+                match w.publish_staged(staged) {
+                    Ok(ticket) => {
+                        finish_secs = t_finish.elapsed().as_secs_f64();
+                        // Published as `gen`: relay what was stored right away. The
+                        // sync runs on the syncer thread and gates only the OKs.
+                        let events: Vec<Arc<[u8]>> = reqs
+                            .iter()
+                            .zip(&outcomes)
+                            .filter(|(_, o)| matches!(o, Outcome::Stored(_)))
+                            .map(|(r, _)| Arc::<[u8]>::from(r.rec.as_slice()))
+                            .collect();
+                        if !events.is_empty() {
+                            let live = Arc::new(LiveBatch { gen, events });
+                            for s in &sinks {
+                                s(ReactorMsg::Live(live.clone()));
+                            }
+                        }
+                        (outcomes.into_iter().map(Some).collect(), Some(ticket))
+                    }
                     Err(e) => {
                         eprintln!("write failed: {e}");
-                        vec![None; reqs.len()]
+                        (vec![None; n], None)
                     }
                 }
             }
             Err(e) => {
                 eprintln!("write failed: {e}");
-                vec![None; reqs.len()]
+                (vec![None; n], None)
             }
         };
         let outcomes_len = outcomes.len() as u64;
@@ -152,10 +207,9 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
             let id: [u8; 32] = r.rec[..32].try_into().unwrap();
             replies[r.reactor].push(Reply { conn: r.conn, id, outcome });
         }
-        let msg = Arc::new(Replies { gen: store.generation(), replies });
-        for s in &sinks {
-            s(ReactorMsg::Replies(msg.clone()));
-        }
+        // OKs, duplicates included, wait for the sync of this batch (and so of
+        // every batch before it).
+        let _ = sync_tx.send(SyncJob { ticket, replies, gen: store.generation() });
         if debug {
             d_batches += 1;
             d_events += outcomes_len;
@@ -189,6 +243,9 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
             sweep(&mut w, &mut last_sweep);
         }
     }
+    // Let the syncer finish acknowledging what is in flight.
+    drop(sync_tx);
+    let _ = sync_thread.join();
     // Flush the index on the way out so the next start replays nothing.
     if let Err(e) = w.flush_all().and_then(|_| w.sync()) {
         eprintln!("final flush failed: {e}");

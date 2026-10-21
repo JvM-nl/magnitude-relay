@@ -219,6 +219,27 @@ impl LogWriter {
         Ok(())
     }
 
+    /// Writes queued frames and hands over the segments written since the last
+    /// call, for a sync on another thread.
+    pub fn take_touched(&mut self) -> io::Result<Vec<Arc<MappedFile>>> {
+        self.flush()?;
+        let files = self.touched.iter().map(|&si| self.files[si].clone()).collect();
+        self.touched.clear();
+        Ok(files)
+    }
+
+    /// Syncs every segment file: a barrier after which everything ever written
+    /// is durable, whoever was due to sync it. A sync of a clean file costs
+    /// next to nothing, and this runs only before checkpoints.
+    pub fn sync_all(&mut self) -> io::Result<()> {
+        self.flush()?;
+        for f in &self.files {
+            f.sync()?;
+        }
+        self.touched.clear();
+        Ok(())
+    }
+
     /// Makes everything written so far durable.
     pub fn sync(&mut self) -> io::Result<()> {
         self.flush()?;

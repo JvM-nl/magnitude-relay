@@ -24,7 +24,7 @@ pub mod version;
 pub mod writer;
 
 pub use version::{Hit, Plan, Version};
-pub use writer::{Outcome, Staged, Writer};
+pub use writer::{Outcome, Staged, SyncTicket, Writer};
 
 use crate::dead::DeadSet;
 use crate::keys::KeyBuf;
@@ -94,6 +94,9 @@ fn normalize_url(u: &[u8]) -> String {
 pub(crate) struct Shared {
     pub(crate) current: RwLock<Arc<Version>>,
     pub(crate) gen: AtomicU64,
+    /// Every seq below this is on disk. Published events above it are visible
+    /// (and relayed live) but their sync is still in flight.
+    pub(crate) durable: Arc<AtomicU64>,
 }
 
 /// Format version of the data directory.
@@ -214,7 +217,7 @@ impl Store {
             dead: dead.clone(),
             runs: Arc::new(runs),
         });
-        let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0) });
+        let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0), durable: Arc::new(AtomicU64::new(next_seq)) });
         let mut w = Writer::new(shared.clone(), log, locs, dead, segments, mem, next_seq, opts, dir.to_path_buf(), ck.next_seg_id, ck.covered, ck.replay_from)?;
         w.repair(&tail)?;
         Ok((Store { shared }, w))
@@ -231,6 +234,13 @@ impl Store {
     #[inline]
     pub fn generation(&self) -> u64 {
         self.shared.gen.load(Ordering::Acquire)
+    }
+
+    /// Seqs below this are durable. A published event at or above it must not
+    /// be acknowledged (even as a duplicate) until its sync completes.
+    #[inline]
+    pub fn durable_seq(&self) -> u64 {
+        self.shared.durable.load(Ordering::Acquire)
     }
 
     /// Replaces `v` with the latest version if a newer one was published.

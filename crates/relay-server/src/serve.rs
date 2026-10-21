@@ -45,18 +45,22 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     assert!(shared.reactors.set(txs.clone()).is_ok(), "reactors are set once");
 
-    let sinks: Vec<Sink> = txs
-        .into_iter()
-        .map(|tx| {
-            let s: Sink = Box::new(move |m| {
-                let _ = tx.send(m);
-            });
-            s
-        })
-        .collect();
+    let make_sinks = |txs: &[tmpsc::UnboundedSender<crate::ingest::ReactorMsg>]| -> Vec<Sink> {
+        txs.iter()
+            .cloned()
+            .map(|tx| {
+                let s: Sink = Box::new(move |m| {
+                    let _ = tx.send(m);
+                });
+                s
+            })
+            .collect()
+    };
+    let sinks = make_sinks(&txs);
+    let reply_sinks = make_sinks(&txs);
     let writer = std::thread::Builder::new()
         .name("writer".into())
-        .spawn(move || ingest::run(w, store, wrx, sinks))
+        .spawn(move || ingest::run(w, store, wrx, sinks, reply_sinks))
         .map_err(|e| e.to_string())?;
 
     // The socket is set up through tokio, which needs a runtime in scope.
