@@ -48,9 +48,9 @@ fn main() {
         }
     });
     let mut recips: Vec<([u8; 32], u32)> = recips.into_iter().collect();
-    recips.sort_by(|a, b| b.1.cmp(&a.1));
+    recips.sort_by_key(|r| std::cmp::Reverse(r.1));
     let mut planes: Vec<([u8; 32], u32)> = planes.into_iter().filter(|p| p.1 >= 20).collect();
-    planes.sort_by(|a, b| b.1.cmp(&a.1));
+    planes.sort_by_key(|p| std::cmp::Reverse(p.1));
     eprintln!(
         "{} recipients (heaviest {} wraps, median {}), {} plane-like authors (>=20 wraps, heaviest {}) in {:.2}s",
         recips.len(),

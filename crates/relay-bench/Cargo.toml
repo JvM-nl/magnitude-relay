@@ -1,8 +1,21 @@
 [package]
 name = "relay-bench"
+description = "Load generator and validating tester for Nostr relays: every answer is checked, not just timed"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "relay-bench"
+path = "src/main.rs"
+
 [dependencies]
+relay-proto.workspace = true
+relay-net.workspace = true
+# The bench drives hundreds of connections from a few threads.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+secp256k1.workspace = true
+sha2.workspace = true
+# The reference client, as Vector uses it: the relay is judged against the real thing.
+negentropy = { version = "0.5", default-features = false, features = ["std"] }
