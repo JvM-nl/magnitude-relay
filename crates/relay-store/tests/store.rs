@@ -1274,3 +1274,31 @@ fn a_query_returns_each_event_once() {
     drop((store, w));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_closed_store_leaves_its_directory_alone() {
+    // A log clustering of some megabytes is under way when the writer goes.
+    // Once it has gone, nothing may change in the directory: the next opener
+    // tidies it, and a job still writing there would race that.
+    let dir = tmpdir("close-quiet");
+    // Clustering starts on its own every second sealed segment.
+    let (store, mut w) = Store::open(&dir, log_opts(2)).unwrap();
+    for b in 0..40u64 {
+        let recs: Vec<_> = (0..50).map(|i| ev(b * 50 + i, (i % 7) as u8 + 1, 1000 + b * 50 + i, 14, "[]", &"z".repeat(1000))).collect();
+        write(&mut w, &recs);
+        w.maintain().unwrap();
+    }
+    drop((store, w));
+    let state = |d: &std::path::Path| -> Vec<(PathBuf, u64)> {
+        let mut v: Vec<_> = files_under(d).into_iter().filter_map(|p| std::fs::metadata(&p).ok().map(|m| (p, m.len()))).collect();
+        v.sort();
+        v
+    };
+    let before = state(&dir);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(state(&dir), before, "files changed after the store was closed");
+    // And it opens cleanly, with everything in it.
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(store.snapshot().count(&filter(r#"{"kinds":[14]}"#), 0), 2000);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -17,8 +17,21 @@ use relay_proto::kind;
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+
+/// Set when the writer is dropped: a job in progress gives up at its next
+/// check (what it leaves is a crash's leftovers, removed at the next open), so
+/// that nothing of a closed store still writes into its directory.
+pub type Stop = Arc<AtomicBool>;
+
+fn stopping(stop: &AtomicBool) -> io::Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "the store is closing"));
+    }
+    Ok(())
+}
 
 pub enum Job {
     Flush { id: u64, runs: Vec<Arc<MemRun>>, dead: DeadSet, covered: u64, replay_from: u64 },
@@ -54,36 +67,40 @@ pub fn seg_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("{id:016}.seg"))
 }
 
-/// Runs jobs until the writer hangs up.
-pub fn worker(dir: PathBuf, rx: Receiver<Job>, tx: Sender<Done>) {
+/// Runs jobs until the writer hangs up or `stop` is set.
+pub fn worker(dir: PathBuf, rx: Receiver<Job>, tx: Sender<Done>, stop: Stop) {
     for job in rx {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let stop = &*stop;
         let done = match job {
             Job::Flush { id, runs, dead, covered, replay_from } => {
                 let frozen = runs.len();
                 let srcs = runs.iter().map(|r| Src::Mem { run: r, i: 0 }).collect();
-                match write(&dir, id, srcs, &dead) {
+                match write(&dir, id, srcs, &dead, stop) {
                     Ok(seg) => Done::Flushed { seg, frozen, covered, replay_from },
                     Err(e) => Done::Failed(format!("flush to segment {id}: {e}")),
                 }
             }
             Job::Compact { id, segs, dead } => {
                 let srcs = segs.iter().map(|s| Src::Seg(s.range(&[], &[0xFF; 2]))).collect();
-                match write(&dir, id, srcs, &dead) {
+                match write(&dir, id, srcs, &dead, stop) {
                     Ok(seg) => Done::Compacted { seg, replaced: segs.iter().map(|s| s.id).collect() },
                     Err(e) => Done::Failed(format!("compaction into segment {id}: {e}")),
                 }
             }
-            Job::LogCompact { hot, first_cold, seg_size, log_dir, dead, version, chunk } => match compact_log(&hot, first_cold, seg_size, &log_dir, &dead, &version, chunk) {
+            Job::LogCompact { hot, first_cold, seg_size, log_dir, dead, version, chunk } => match compact_log(&hot, first_cold, seg_size, &log_dir, &dead, &version, chunk, stop) {
                 Ok((runs, moves)) => Done::LogCompacted { runs, moves, retire: hot.iter().map(|h| h.0).collect() },
                 Err(e) => Done::LogFailed(format!("log compaction: {e}")),
             },
-            Job::LogMerge { runs, first_cold, seg_size, log_dir, dead, version } => match merge_runs(&runs, first_cold, seg_size, &log_dir, &dead, &version) {
+            Job::LogMerge { runs, first_cold, seg_size, log_dir, dead, version } => match merge_runs(&runs, first_cold, seg_size, &log_dir, &dead, &version, stop) {
                 Ok((run, moves)) => {
                     Done::LogCompacted { runs: vec![run], moves, retire: runs.iter().flatten().map(|s| COLD_BASE + s.0).collect() }
                 }
                 Err(e) => Done::LogFailed(format!("log merge: {e}")),
             },
-            Job::LogRelink { moves, dead, locs } => match relink(&moves, &dead, &locs) {
+            Job::LogRelink { moves, dead, locs } => match relink(&moves, &dead, &locs, stop) {
                 Ok(()) => Done::LogRelinked { moves },
                 Err(e) => Done::LogFailed(format!("log relink: {e}")),
             },
@@ -122,14 +139,19 @@ impl Src<'_> {
 
 /// Merges `srcs` into segment `id`: written to a temporary name, synced, then
 /// renamed, so a crash never leaves a half-written file under a real name.
-fn write(dir: &Path, id: u64, mut srcs: Vec<Src<'_>>, dead: &DeadSet) -> io::Result<Arc<Segment>> {
+fn write(dir: &Path, id: u64, mut srcs: Vec<Src<'_>>, dead: &DeadSet, stop: &AtomicBool) -> io::Result<Arc<Segment>> {
     let path = seg_path(dir, id);
     let tmp = path.with_extension("seg.tmp");
     let mut w = SegmentWriter::create(&tmp)?;
     let mut cur: Vec<u8> = Vec::new();
     let mut last: Vec<u8> = Vec::new();
     let mut have_last = false;
+    let mut n = 0u32;
     loop {
+        n = n.wrapping_add(1);
+        if n % 4096 == 0 {
+            stopping(stop)?;
+        }
         // Few inputs (a handful of runs or segments): a linear minimum beats a
         // heap. The minimum is copied into a reused buffer, not allocated.
         let mut best = false;
@@ -326,7 +348,17 @@ fn copy_chunk(recs: &mut Vec<Pending>, hot: &[(u64, Arc<MappedFile>)], from: (us
 /// as (seq, new global offset). Streams: records are clustered within chunks
 /// of `chunk_bytes` of log, so memory stays bounded whatever the log's size.
 #[allow(clippy::type_complexity)]
-fn compact_log(hot: &[(u64, Arc<MappedFile>)], first_cold: u64, seg_size: u64, log_dir: &Path, dead: &DeadSet, v: &Version, chunk: u64) -> io::Result<(Vec<ColdRun>, Vec<(u64, u64)>)> {
+#[allow(clippy::too_many_arguments)]
+fn compact_log(
+    hot: &[(u64, Arc<MappedFile>)],
+    first_cold: u64,
+    seg_size: u64,
+    log_dir: &Path,
+    dead: &DeadSet,
+    v: &Version,
+    chunk: u64,
+    stop: &AtomicBool,
+) -> io::Result<(Vec<ColdRun>, Vec<(u64, u64)>)> {
     let limit = if chunk > 0 { chunk } else { chunk_bytes() };
     let mut planes = HashSet::new();
     let mut out = ColdOut::new(log_dir, seg_size, first_cold);
@@ -338,6 +370,10 @@ fn compact_log(hot: &[(u64, Arc<MappedFile>)], first_cold: u64, seg_size: u64, l
         seg.advise(crate::mmap::Advice::Sequential);
         let clean = log::scan_hot(seg, seg_size, *n, |fr| {
             if err.is_some() {
+                return;
+            }
+            if let Err(e) = stopping(stop) {
+                err = Some(e);
                 return;
             }
             let o = fr.off % seg_size;
@@ -429,7 +465,15 @@ impl<'a> RunReader<'a> {
 /// `first_cold`: a streaming k-way merge, so memory is a few buffers whatever
 /// the runs' size, and each input is read front to back. Dead records stay
 /// behind, which is how their space comes back. Returns the run and every move.
-fn merge_runs(runs: &[Vec<(u64, Arc<MappedFile>)>], first_cold: u64, seg_size: u64, log_dir: &Path, dead: &DeadSet, v: &Version) -> io::Result<(ColdRun, Vec<(u64, u64)>)> {
+fn merge_runs(
+    runs: &[Vec<(u64, Arc<MappedFile>)>],
+    first_cold: u64,
+    seg_size: u64,
+    log_dir: &Path,
+    dead: &DeadSet,
+    v: &Version,
+    stop: &AtomicBool,
+) -> io::Result<(ColdRun, Vec<(u64, u64)>)> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let mut planes = HashSet::new();
@@ -449,6 +493,7 @@ fn merge_runs(runs: &[Vec<(u64, Arc<MappedFile>)>], first_cold: u64, seg_size: u
         }
     }
     while let Some(Reverse((_, seq, i))) = heap.pop() {
+        stopping(stop)?;
         out.put(seq, heads[i].take().expect("a head for every heap entry"))?;
         if let Some((k, seq, frame)) = readers[i].next_live(dead, v, &mut planes)? {
             heads[i] = Some(frame);
@@ -465,12 +510,14 @@ fn merge_runs(runs: &[Vec<(u64, Arc<MappedFile>)>], first_cold: u64, seg_size: u
 
 /// Points `locs` at the cold copies of every move whose event is still live,
 /// coalescing runs of consecutive seqs into one write, then syncs it.
-fn relink(moves: &[(u64, u64)], dead: &DeadSet, locs: &MappedFile) -> io::Result<()> {
+fn relink(moves: &[(u64, u64)], dead: &DeadSet, locs: &MappedFile, stop: &AtomicBool) -> io::Result<()> {
     let mut live: Vec<(u64, u64)> = moves.iter().copied().filter(|m| !dead.is_dead(m.0)).collect();
     live.sort_unstable();
     let mut i = 0;
     let mut chunk = Vec::new();
     while i < live.len() {
+        // Stopped part way, the exchange is finished at the next open, as after a crash.
+        stopping(stop)?;
         let start = live[i].0;
         chunk.clear();
         while i < live.len() && live[i].0 == start + (chunk.len() / 8) as u64 {

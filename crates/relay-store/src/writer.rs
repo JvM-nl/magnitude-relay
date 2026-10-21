@@ -142,6 +142,9 @@ pub struct Writer {
     pub(crate) replay_from: u64,
     jobs: Sender<Job>,
     done: Receiver<Done>,
+    /// The background worker, stopped and waited for when the writer goes.
+    bg: Option<std::thread::JoinHandle<()>>,
+    stop: bg::Stop,
     segs: ((usize, usize, usize, usize), Segs),
     /// Every replaced version (gen, handle) with the dead records to zero once
     /// it, and every older version, has no readers left.
@@ -292,6 +295,22 @@ fn p_tags(r: Record<'_>) -> Vec<[u8; 32]> {
         .collect()
 }
 
+impl Drop for Writer {
+    /// Nothing of a closed store may still write into its directory once its
+    /// lock can be released (a new opener's cleanup would race it): the job in
+    /// progress is stopped and the worker waited for, before the writer's share
+    /// of the lock goes.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Hanging up ends the worker's loop once its job returns.
+        let (hung_up, _) = std::sync::mpsc::channel();
+        drop(std::mem::replace(&mut self.jobs, hung_up));
+        if let Some(t) = self.bg.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 impl Writer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -312,7 +331,11 @@ impl Writer {
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let idx = dir.join("idx");
-        std::thread::Builder::new().name("store-bg".into()).spawn(move || bg::worker(idx, job_rx, done_tx))?;
+        let stop = bg::Stop::default();
+        let bg = {
+            let stop = stop.clone();
+            std::thread::Builder::new().name("store-bg".into()).spawn(move || bg::worker(idx, job_rx, done_tx, stop))?
+        };
         let segs = log.segments();
         let shape = log.shape();
         let vanish = VanishCfg::new(&opts.vanish_urls);
@@ -335,6 +358,8 @@ impl Writer {
             replay_from,
             jobs: job_tx,
             done: done_rx,
+            bg: Some(bg),
+            stop,
             segs: (shape, segs),
             pending_zero: VecDeque::new(),
             epoch: 0,
