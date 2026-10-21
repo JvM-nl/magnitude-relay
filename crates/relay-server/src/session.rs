@@ -233,13 +233,16 @@ impl Session {
             hits.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
             hits.dedup_by_key(|h| h.seq);
         }
+        // A gift wrap only broad filters matched is left out; with no broad
+        // filter (Vector's are never broad) every hit came from one that is not.
+        let any_broad = filters.iter().any(broad);
         for (i, h) in hits.iter().enumerate() {
             // A later event's bytes load while this one is written out.
             if let Some(next) = hits.get(i + 3) {
                 snap.prefetch_record(next.seq);
             }
             if let Some(rec) = snap.record(h.seq) {
-                if hides_wrap(&filters, rec) {
+                if any_broad && hides_wrap(&filters, rec) {
                     continue;
                 }
                 event_msg(out, sub_id, rec);

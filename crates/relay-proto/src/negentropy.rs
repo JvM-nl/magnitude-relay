@@ -323,7 +323,7 @@ pub fn reconcile(s: &impl NegStorage, mut q: &[u8], frame_limit: usize) -> Resul
                 let n = get_varint(&mut q)? as usize;
                 // Their ids are not needed by a responder beyond parsing them:
                 // it answers with its own full list for the range.
-                let _theirs: HashSet<&[u8]> = (0..n).map(|_| get_bytes(&mut q, ID_SIZE)).collect::<Result<_, _>>()?;
+                get_bytes(&mut q, n.checked_mul(ID_SIZE).ok_or(NegError::Truncated)?)?;
                 if std::mem::take(&mut skip) {
                     c.bound_out(&prev_bound, &mut o);
                     put_varint(&mut o, MODE_SKIP);

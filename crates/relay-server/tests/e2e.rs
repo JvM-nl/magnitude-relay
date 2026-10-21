@@ -877,6 +877,14 @@ async fn overlapping_filters_send_each_event_once_newest_first() {
     send(&mut c, json!(["REQ", "one", {"ids": [ids[1], ids[1]]}])).await;
     let (evs, _) = collect(&mut c, "one").await;
     assert_eq!(evs.len(), 1);
+    // A broad filter leaves the gift wrap out, unless another names its recipient.
+    send(&mut c, json!(["REQ", "broad", {}])).await;
+    let (evs, _) = collect(&mut c, "broad").await;
+    let got: Vec<&str> = evs.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(got, vec![ids[2].as_str(), ids[0].as_str()]);
+    send(&mut c, json!(["REQ", "named", {}, {"kinds": [1059], "#p": [me.pk()]}])).await;
+    let (evs, _) = collect(&mut c, "named").await;
+    assert_eq!(evs.len(), 3);
     drop(c);
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);

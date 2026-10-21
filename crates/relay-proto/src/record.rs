@@ -379,15 +379,60 @@ pub fn encode_field_str(stored: &[u8], out: &mut Vec<u8>) {
 /// Decimal digits of `v`, appended.
 #[inline]
 pub fn push_u64(out: &mut Vec<u8>, mut v: u64) {
+    // Two digits a step: every event sent writes a ten-digit timestamp.
     let mut buf = [0u8; 20];
     let mut i = buf.len();
-    loop {
+    while v >= 100 {
+        let d = (v % 100) as usize * 2;
+        v /= 100;
+        i -= 2;
+        buf[i..i + 2].copy_from_slice(&DIGIT_PAIRS[d..d + 2]);
+    }
+    if v >= 10 {
+        let d = v as usize * 2;
+        i -= 2;
+        buf[i..i + 2].copy_from_slice(&DIGIT_PAIRS[d..d + 2]);
+    } else {
         i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
+        buf[i] = b'0' + v as u8;
     }
     out.extend_from_slice(&buf[i..]);
+}
+
+/// "00", "01", ... "99", back to back.
+static DIGIT_PAIRS: [u8; 200] = {
+    let mut t = [0u8; 200];
+    let mut i = 0;
+    while i < 100 {
+        t[i * 2] = b'0' + (i / 10) as u8;
+        t[i * 2 + 1] = b'0' + (i % 10) as u8;
+        i += 1;
+    }
+    t
+};
+
+#[cfg(test)]
+mod tests {
+    use super::push_u64;
+
+    #[test]
+    fn integers_print_as_rust_prints_them() {
+        let check = |v: u64| {
+            let mut out = b"x".to_vec();
+            push_u64(&mut out, v);
+            assert_eq!(&out[1..], v.to_string().as_bytes(), "{v}");
+        };
+        for v in 0..20_000u64 {
+            check(v);
+        }
+        for p in 0..20 {
+            let t = 10u64.pow(p);
+            for v in [t - 1, t, t + 1, t.saturating_mul(9).saturating_add(9)] {
+                check(v);
+            }
+        }
+        for v in [1_792_000_000u64, u64::MAX, u64::MAX - 1, u32::MAX as u64] {
+            check(v);
+        }
+    }
 }
