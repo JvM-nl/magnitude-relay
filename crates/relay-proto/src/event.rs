@@ -6,8 +6,10 @@
 
 use crate::json::{self, RawStr, Scanner};
 use crate::record::{self, Record, FLAG_EXPIRATION, FLAG_PROTECTED, FLAG_RAW_FORM, HEADER_LEN};
+use crate::secp::{SigRef, Verifier};
 use crate::{hex, sha256, varint};
 use std::fmt;
+use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
@@ -260,6 +262,119 @@ pub fn parse_event_json(text: &str, parser: &mut EventParser, out: &mut Vec<u8>,
     };
     s.end()?;
     Ok(info)
+}
+
+/// Verifies many JSON events together, giving each line exactly the verdict
+/// `parse_event_json(line, .., true)` would: ids are hashed several at a time
+/// (`sha256::digest_many`) and signatures checked in batches
+/// (`secp::Verifier::verify_batch`). For bulk input such as an import; one
+/// per thread.
+#[derive(Default)]
+pub struct BulkVerifier {
+    parser: EventParser,
+    sigs: Verifier,
+    rec: Vec<u8>,
+    /// Records back to back; `spans[i]` is line i's.
+    data: Vec<u8>,
+    spans: Vec<Range<usize>>,
+    results: Vec<Result<EventInfo, Reject>>,
+    /// What `Scanner::end` said after each parse: trailing bytes are reported
+    /// last, as `parse_event_json` reports them.
+    trailing: Vec<Option<Reject>>,
+    pre: Vec<u8>,
+    pre_spans: Vec<(usize, Range<usize>)>,
+    digests: Vec<[u8; 32]>,
+    ok: Vec<bool>,
+}
+
+impl BulkVerifier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Verifies every line. Afterwards `results()[i]` is line i's verdict and,
+    /// for an accepted line, `record(i)` its record (until the next call).
+    pub fn verify(&mut self, lines: &[&str]) {
+        self.data.clear();
+        self.spans.clear();
+        self.results.clear();
+        self.trailing.clear();
+        for line in lines {
+            let mut s = Scanner::new(line);
+            let r = self.parser.parse_unchecked(&mut s, &mut self.rec);
+            let start = self.data.len();
+            if r.is_ok() {
+                self.data.extend_from_slice(&self.rec);
+            }
+            self.spans.push(start..self.data.len());
+            self.trailing.push(if r.is_ok() { s.end().err().map(Reject::from) } else { None });
+            self.results.push(r);
+        }
+
+        // Ids, all preimages hashed together.
+        self.pre.clear();
+        self.pre_spans.clear();
+        for (i, r) in self.results.iter().enumerate() {
+            if r.is_ok() {
+                let start = self.pre.len();
+                Record(&self.data[self.spans[i].clone()]).write_id_preimage(&mut self.pre);
+                self.pre_spans.push((i, start..self.pre.len()));
+            }
+        }
+        let pres: Vec<&[u8]> = self.pre_spans.iter().map(|(_, r)| &self.pre[r.clone()]).collect();
+        self.digests.clear();
+        self.digests.resize(pres.len(), [0; 32]);
+        sha256::digest_many(&pres, &mut self.digests);
+        for (k, (i, _)) in self.pre_spans.iter().enumerate() {
+            let i = *i;
+            if self.digests[k] == *Record(&self.data[self.spans[i].clone()]).id() {
+                continue;
+            }
+            let Ok(info) = self.results[i] else { unreachable!() };
+            self.results[i] = if !info.any_escaped {
+                Err(Reject::IdMismatch)
+            } else {
+                // The canonical form did not hash to the id: the one-event
+                // path retries with the strings exactly as received.
+                let mut s = Scanner::new(lines[i]);
+                let r = self.parser.parse_id_checked(&mut s, &mut self.rec);
+                if r.is_ok() {
+                    let start = self.data.len();
+                    self.data.extend_from_slice(&self.rec);
+                    self.spans[i] = start..self.data.len();
+                }
+                r
+            };
+        }
+
+        // Signatures, in one batch.
+        let idx: Vec<usize> = (0..lines.len()).filter(|&i| self.results[i].is_ok()).collect();
+        let refs: Vec<SigRef<'_>> = idx
+            .iter()
+            .map(|&i| {
+                let r = Record(&self.data[self.spans[i].clone()]);
+                SigRef { pubkey: r.pubkey(), msg: r.id(), sig: r.sig() }
+            })
+            .collect();
+        self.sigs.verify_batch(&refs, &mut self.ok);
+        for (&i, &ok) in idx.iter().zip(&self.ok) {
+            if !ok {
+                self.results[i] = Err(Reject::SigInvalid);
+            } else if let Some(e) = self.trailing[i] {
+                self.results[i] = Err(e);
+            }
+        }
+    }
+
+    /// One verdict per line of the last `verify`.
+    pub fn results(&self) -> &[Result<EventInfo, Reject>] {
+        &self.results
+    }
+
+    /// Line i's record, after `verify` accepted it.
+    pub fn record(&self, i: usize) -> &[u8] {
+        &self.data[self.spans[i].clone()]
+    }
 }
 
 #[inline]

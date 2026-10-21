@@ -14,10 +14,16 @@
 //!   plus the curve primitives and per-signature bookkeeping underneath.
 //! * `tune`: multi-scalar multiplication, Strauss against Pippenger at each
 //!   window width, by number of terms (`TUNE_MIN=<n>` skips smaller sums).
+//! * `ingest`: the whole verified path per core, JSON to accepted record: the
+//!   old one-at-a-time path, the reactor's, and bulk at several chunk sizes.
+//! * `diff <events.jsonl> [threads] [one_in]`: bulk verification against one
+//!   at a time on every line of a file of any size, with one line in `one_in`
+//!   (default 50, 0 for none) corrupted on purpose; verdicts and records must
+//!   be identical.
 //!
 //! Timings are the best of three passes: the production box is never idle.
 
-use relay_proto::event::{parse_event_json, EventParser};
+use relay_proto::event::{parse_event_json, BulkVerifier, EventParser};
 use relay_proto::json::Scanner;
 use relay_proto::secp::field::Fe;
 use relay_proto::secp::group::{Affine, Jacobian};
@@ -31,8 +37,12 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: sigbench <steps|sha|batch|tune> <events.jsonl> [max]";
+    let usage = "usage: sigbench <steps|sha|batch|tune|ingest> <events.jsonl> [max] | sigbench diff <events.jsonl> [threads] [one_in]";
     let mode = args.get(1).expect(usage).clone();
+    if mode == "diff" {
+        let arg = |i: usize, d: u64| args.get(i).map_or(d, |s| s.parse().unwrap());
+        return diff(args.get(2).expect(usage), arg(3, 4) as usize, arg(4, 50));
+    }
     let path = args.get(2).expect(usage);
     let max: usize = args.get(3).map_or(usize::MAX, |s| s.parse().unwrap());
     let text = std::fs::read_to_string(path).unwrap();
@@ -42,6 +52,7 @@ fn main() {
         "sha" => sha(&lines),
         "batch" => batch(&lines),
         "tune" => tune(&lines),
+        "ingest" => ingest(&lines),
         _ => panic!("{usage}"),
     }
 }
@@ -465,3 +476,191 @@ fn tune(lines: &[&str]) {
     }
 }
 
+/// Verified events per second on one core, whole path from JSON to an
+/// accepted record: the path as it was (sha2's SHA-256, libsecp256k1's
+/// lift_x and verify, one event at a time), `parse_event_json` as it is now,
+/// the reactor's way (id check, then libsecp256k1 with the key cache), and in
+/// bulk (`BulkVerifier`) at several chunk sizes. Rounds alternate between the
+/// methods and the best of each is kept, so drift in the box's load hits them
+/// all alike.
+fn ingest(lines: &[&str]) {
+    let n = lines.len();
+    let mut parser = EventParser::new();
+    let mut rec = Vec::new();
+    let mut pre = Vec::new();
+    let mut v = Verifier::new();
+    let mut bulk = BulkVerifier::new();
+    let methods = [
+        "before: sha2 + libsecp256k1, one at a time",
+        "parse_event_json(verify), one at a time",
+        "reactor: id check + cached verify_one",
+        "bulk, chunks of 16",
+        "bulk, chunks of 64",
+        "bulk, chunks of 256",
+        "bulk, chunks of 2048",
+    ];
+    let mut best = vec![f64::MAX; methods.len()];
+    for _round in 0..3 {
+        for (m, b) in best.iter_mut().enumerate() {
+            let t = Instant::now();
+            let ok = match m {
+                0 => lines
+                    .iter()
+                    .filter(|l| {
+                        let mut s = Scanner::new(l);
+                        if parser.parse_unchecked(&mut s, &mut rec).is_err() {
+                            return false;
+                        }
+                        pre.clear();
+                        Record(&rec).write_id_preimage(&mut pre);
+                        let id: [u8; 32] = Sha256::digest(&pre).into();
+                        let r = Record(&rec);
+                        id == *r.id()
+                            && XOnlyPublicKey::from_byte_array(*r.pubkey()).is_ok_and(|pk| schnorr::verify(&schnorr::Signature::from_byte_array(*r.sig()), r.id(), &pk).is_ok())
+                            && s.end().is_ok()
+                    })
+                    .count(),
+                1 => lines.iter().filter(|l| parse_event_json(l, &mut parser, &mut rec, true).is_ok()).count(),
+                2 => lines
+                    .iter()
+                    .filter(|l| {
+                        let mut s = Scanner::new(l);
+                        parser.parse_id_checked(&mut s, &mut rec).is_ok() && s.end().is_ok() && {
+                            let r = Record(&rec);
+                            v.verify_one(&SigRef { pubkey: r.pubkey(), msg: r.id(), sig: r.sig() })
+                        }
+                    })
+                    .count(),
+                _ => {
+                    let size = [16, 64, 256, 2048][m - 3];
+                    let mut ok = 0;
+                    for chunk in lines.chunks(size) {
+                        bulk.verify(chunk);
+                        ok += bulk.results().iter().filter(|r| r.is_ok()).count();
+                    }
+                    ok
+                }
+            };
+            *b = b.min(t.elapsed().as_nanos() as f64 / n as f64);
+            black_box(ok);
+        }
+    }
+    for (name, ns) in methods.iter().zip(&best) {
+        println!("{name:<40} {ns:>7.0} ns/event {:>8.0} events/s {:>5.2}x", 1e9 / ns, best[0] / ns);
+    }
+}
+
+/// Differential check on real events, streamed from a file of any size:
+/// every line goes through `BulkVerifier` (in chunks of 2048) and through
+/// `parse_event_json(.., true)`, and the verdicts and records must be equal.
+/// One line in `one_in` (0 for none) is corrupted first, in ways that reach
+/// each check: a signature digit flipped (bad signature), s pushed to n or
+/// above, r set to a value that is not a curve x, the pubkey replaced and
+/// the id recomputed over it (valid id, signature by someone else), content
+/// changed (bad id).
+fn diff(path: &str, threads: usize, one_in: u64) {
+    use std::io::BufRead;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    let file = std::io::BufReader::with_capacity(8 << 20, std::fs::File::open(path).unwrap());
+    let reader = Mutex::new((file.lines(), 0u64));
+    let (lines_seen, accepted, rejected, corrupted) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut bulk = BulkVerifier::new();
+                let mut parser = EventParser::new();
+                let mut rec = Vec::new();
+                loop {
+                    let (mut chunk, first) = {
+                        let mut r = reader.lock().unwrap();
+                        let chunk: Vec<String> = r.0.by_ref().take(2048).map(|l| l.unwrap()).collect();
+                        let first = r.1;
+                        r.1 += chunk.len() as u64;
+                        (chunk, first)
+                    };
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    let mut seed = first.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                    for line in chunk.iter_mut() {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        if one_in > 0 && seed % one_in == 0 {
+                            if let Some(c) = corrupt(line, seed >> 8, &mut parser, &mut rec) {
+                                *line = c;
+                                corrupted.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+                    bulk.verify(&refs);
+                    for (i, line) in chunk.iter().enumerate() {
+                        let want = parse_event_json(line, &mut parser, &mut rec, true);
+                        let got = bulk.results()[i];
+                        assert_eq!(got, want, "line {}: verdicts differ", first + i as u64 + 1);
+                        if want.is_ok() {
+                            assert_eq!(bulk.record(i), rec.as_slice(), "line {}: records differ", first + i as u64 + 1);
+                            accepted.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            rejected.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    let n = lines_seen.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
+                    if n % (2048 * 100) < chunk.len() as u64 {
+                        eprintln!("  {n} lines, {:.0}/s", n as f64 / started.elapsed().as_secs_f64());
+                    }
+                }
+            });
+        }
+    });
+    println!(
+        "{} lines ({} corrupted on purpose): {} accepted, {} rejected; bulk and one-at-a-time agree on every verdict and record ({:.0} s)",
+        lines_seen.load(Ordering::Relaxed),
+        corrupted.load(Ordering::Relaxed),
+        accepted.load(Ordering::Relaxed),
+        rejected.load(Ordering::Relaxed),
+        started.elapsed().as_secs_f64()
+    );
+}
+
+/// A damaged copy of a valid event line (see `diff`), or None if the line
+/// does not parse to begin with.
+fn corrupt(line: &str, r: u64, parser: &mut EventParser, rec: &mut Vec<u8>) -> Option<String> {
+    parser.parse_unchecked(&mut Scanner::new(line), rec).ok()?;
+    let mut ev = rec.clone();
+    let set_id = |ev: &mut Vec<u8>| {
+        let mut pre = Vec::new();
+        Record(ev).write_id_preimage(&mut pre);
+        let id: [u8; 32] = Sha256::digest(&pre).into();
+        ev[..32].copy_from_slice(&id);
+    };
+    match r % 5 {
+        // A signature digit (r or s half).
+        0 => ev[64 + (r >> 8) as usize % 64] ^= 1 << ((r >> 16) % 8),
+        // s = n or more.
+        1 => ev[96..128].copy_from_slice(&[0xff; 32]),
+        // r not an x on the curve (x = 5 is not: 125 + 7 = 132 is a non-residue mod p).
+        2 => {
+            ev[64..96].fill(0);
+            ev[95] = 5;
+        }
+        // Someone else's pubkey, with the id over it: the signature cannot hold.
+        3 => {
+            ev[32] ^= 0x55;
+            set_id(&mut ev);
+        }
+        // Content changed, id left: bad id.
+        _ => {
+            let mut out = Vec::new();
+            Record(&ev).write_json(&mut out);
+            let s = String::from_utf8(out).ok()?;
+            return Some(s.replacen("\"content\":\"", "\"content\":\"~", 1));
+        }
+    }
+    let mut out = Vec::new();
+    Record(&ev).write_json(&mut out);
+    String::from_utf8(out).ok()
+}
