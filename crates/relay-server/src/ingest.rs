@@ -9,8 +9,9 @@
 
 use crate::subs::ConnId;
 use relay_store::{Outcome, Store, SyncTicket, Writer};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,9 +23,32 @@ const MAX_BATCH_BYTES: usize = 32 << 20;
 const SWEEP_EVERY: Duration = Duration::from_secs(10);
 /// How long the writer waits for work before checking for shutdown.
 const IDLE_TICK: Duration = Duration::from_millis(200);
+/// The same while an operator's request is being worked through: its next
+/// piece is usually already on its way.
+const CONTROL_TICK: Duration = Duration::from_millis(2);
 
 /// Set on SIGTERM: the writer finishes the batch in flight, syncs, and returns.
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// What the admin socket asks of the writer, which alone may change the store.
+/// The writer takes one between batches, so live writes wait for at most one.
+pub enum Control {
+    /// Kill whichever of these events are still live; the reply is how many were.
+    Kill { seqs: Vec<u64>, reply: Sender<io::Result<usize>> },
+    /// Record the kills so far in a checkpoint, so they survive a restart.
+    Checkpoint { reply: Sender<io::Result<()>> },
+}
+
+fn control(w: &mut Writer, c: Control) {
+    match c {
+        Control::Kill { seqs, reply } => {
+            let _ = reply.send(w.kill_live(&seqs));
+        }
+        Control::Checkpoint { reply } => {
+            let _ = reply.send(w.write_checkpoint());
+        }
+    }
+}
 
 pub struct WriteReq {
     pub reactor: usize,
@@ -129,7 +153,7 @@ fn syncer(rx: Receiver<SyncJob>, sinks: Vec<Sink>) {
     }
 }
 
-pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>, reply_sinks: Vec<Sink>) {
+pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, ctl: Receiver<Control>, sinks: Vec<Sink>, reply_sinks: Vec<Sink>) {
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<SyncJob>();
     let sync_thread = std::thread::Builder::new().name("syncer".into()).spawn(move || syncer(sync_rx, reply_sinks)).expect("syncer thread");
     let mut last_sweep = Instant::now();
@@ -139,11 +163,19 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
     let (mut d_batches, mut d_events, mut d_stage, mut d_finish, mut d_idle, mut d_queue) = (0u64, 0u64, 0f64, 0f64, 0f64, 0f64);
     let mut d_last = Instant::now();
     loop {
+        // Operator work gets a turn between batches, one piece at a time.
+        let wait = match ctl.try_recv() {
+            Ok(c) => {
+                control(&mut w, c);
+                CONTROL_TICK
+            }
+            Err(_) => IDLE_TICK,
+        };
         let wait_started = Instant::now();
         if SHUTDOWN.load(Ordering::Acquire) {
             break;
         }
-        let first = match rx.recv_timeout(IDLE_TICK) {
+        let first = match rx.recv_timeout(wait) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
                 if let Err(e) = w.prepare() {

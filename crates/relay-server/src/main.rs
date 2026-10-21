@@ -1,11 +1,13 @@
 //! The relay binary.
 
+mod admin;
 mod brand;
 mod config;
 mod export;
 mod import;
 mod ingest;
 mod metrics;
+mod operator;
 mod reactor;
 mod serve;
 mod session;
@@ -32,6 +34,22 @@ commands:
   export [--since T] [--until T]
                        write every live event as JSONL to stdout
   stats                print store statistics
+  query --filter JSON [--limit N]
+                       print matching events as JSONL, newest first
+  count --filter JSON  print how many events match
+  delete --filter JSON [--age SECS] [--all] (--dry-run | --yes)
+                       remove matching events. --dry-run prints how many would
+                       go, with a few samples, and changes nothing; --yes does
+                       it. This is not a NIP-09 deletion: nothing is kept to
+                       block it, so a deleted event can be published again
+      --age SECS       only events created more than SECS seconds ago
+      --all            allow a filter with no conditions, which matches every
+                       event ({})
+
+  --filter takes one NIP-01 filter or a JSON array of them (their union); a
+  limit inside a filter is refused (query has --limit). While the relay runs,
+  query, count and delete reach it through <data>/admin.sock, which only the
+  user running the relay can open; otherwise they open the data directory.
 
   --config FILE        settings file (default: ./relay.toml if it exists; every
                        setting is optional, see `{bin} init`)
@@ -86,6 +104,29 @@ fn run() -> Result<(), String> {
             }
             None => Ok(None),
         }
+    };
+
+    let text = |args: &mut Vec<String>, name: &str| -> Result<Option<String>, String> {
+        match args.iter().position(|a| a == name) {
+            Some(i) => {
+                let v = args.get(i + 1).ok_or(format!("{name} needs a value"))?.clone();
+                args.drain(i..i + 2);
+                Ok(Some(v))
+            }
+            None => Ok(None),
+        }
+    };
+    // A misspelt option must not be dropped: for `delete` it would mean a
+    // wider delete than the one typed.
+    let no_more = |args: &[String]| -> Result<(), String> {
+        match args.first() {
+            Some(a) => Err(format!("unexpected argument {a:?}; try --help")),
+            None => Ok(()),
+        }
+    };
+    let filters = |args: &mut Vec<String>, cmd: &str| -> Result<Vec<relay_proto::Filter>, String> {
+        let f = text(args, "--filter")?.ok_or(format!("{cmd} needs --filter"))?;
+        operator::parse_filters(&f)
     };
 
     let cmd = if args.is_empty() { String::from("serve") } else { args.remove(0) };
@@ -167,6 +208,24 @@ fn run() -> Result<(), String> {
             println!("dead: {}", v.dead_count());
             println!("index keys: {} ({:.1} MB in memory, {:.1} MB in {} segment files)", v.index_keys(), v.index_bytes() as f64 / 1e6, v.segment_bytes() as f64 / 1e6, w.segment_count());
             Ok(())
+        }
+        "query" => {
+            let fs = filters(&mut args, "query")?;
+            let limit = value(&mut args, "--limit")?;
+            no_more(&args)?;
+            operator::run_query(&load()?, fs, limit)
+        }
+        "count" => {
+            let fs = filters(&mut args, "count")?;
+            no_more(&args)?;
+            operator::run_count(&load()?, fs)
+        }
+        "delete" => {
+            let fs = filters(&mut args, "delete")?;
+            let age = value(&mut args, "--age")?;
+            let (all, dry_run, yes) = (flag(&mut args, "--all"), flag(&mut args, "--dry-run"), flag(&mut args, "--yes"));
+            no_more(&args)?;
+            operator::run_delete(&load()?, fs, age, all, dry_run, yes)
         }
         "help" | "--help" | "-h" => {
             print!("{} {}\n\n{}", brand::NAME, brand::VERSION, USAGE.replace("{bin}", brand::SLUG));
