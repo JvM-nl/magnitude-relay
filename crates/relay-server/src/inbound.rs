@@ -341,6 +341,7 @@ mod tests {
             max_event_bytes: 65_536,
             max_future_seconds: 900,
             max_tags: 100,
+            max_outbound: 1 << 20,
             kind_allowed: Box::new(|k| k == 1),
         };
         let refs: Vec<(&str, usize, bool)> = texts.iter().map(|t| (t.as_str(), 0, false)).collect();

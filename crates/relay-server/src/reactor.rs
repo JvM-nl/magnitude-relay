@@ -234,6 +234,11 @@ thread_local! {
 
 impl Outbox for WsOut<'_> {
     #[inline]
+    fn queued(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[inline]
     fn text(&mut self, f: &mut dyn FnMut(&mut Vec<u8>)) {
         match self.z.as_deref_mut() {
             None => {

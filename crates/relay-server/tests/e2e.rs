@@ -1150,3 +1150,39 @@ async fn a_subscriber_that_never_reads_is_dropped() {
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Found by the adversarial suite's hostile clients: a REQ's stored results
+/// were all built in memory before any went out (50 filters of 5000 events
+/// can be hundreds of megabytes, held while the client does not read). They
+/// now stop at the connection's outbound limit, with a CLOSED that says why.
+#[tokio::test]
+async fn an_answer_past_the_outbound_limit_ends_in_closed() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-bigreq-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start_limits(dir.clone(), port, "outbound_buffer_bytes = 300000\n", "");
+    let host = format!("127.0.0.1:{port}");
+    let me = Signer::new(23);
+    let author = Signer::new(24);
+    let mut publisher = client_connect(relay.addr, &host, "/").await.unwrap();
+    let body = "v".repeat(30_000);
+    for n in 0..30u64 {
+        send(&mut publisher, json!(["EVENT", author.event(now() - n, 1059, json!([["p", me.pk()]]), &body)])).await;
+    }
+    for _ in 0..30 {
+        assert!(ok_of(&mut publisher).await.0);
+    }
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    send(&mut c, json!(["REQ", "big", {"kinds": [1059], "#p": [me.pk()], "limit": 100}])).await;
+    let (evs, end) = collect(&mut c, "big").await;
+    assert_eq!(end[0], "CLOSED", "{end}");
+    assert!(end[2].as_str().unwrap().contains("larger than"), "{end}");
+    assert!(evs.len() < 30 && evs.len() >= 9, "{} events before the cut", evs.len());
+    // A narrower request is answered whole, and the connection works on.
+    send(&mut c, json!(["REQ", "small", {"kinds": [1059], "#p": [me.pk()], "limit": 5}])).await;
+    let (evs, end) = collect(&mut c, "small").await;
+    assert_eq!((evs.len(), end[0].as_str().unwrap()), (5, "EOSE"));
+    drop((c, publisher));
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
