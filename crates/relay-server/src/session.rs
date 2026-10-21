@@ -214,11 +214,18 @@ impl Session {
         // `limit` does not apply to a set reconciliation: the whole matching set is the set.
         let mut f = filter;
         f.limit = None;
-        let hits = cx.snap.query(&f, MAX_NEG_ITEMS + 1, cx.now);
-        if hits.len() > MAX_NEG_ITEMS {
+        // Vector's DM shape is answered from covering index keys alone.
+        let items = match cx.snap.neg_items(&f, cx.now) {
+            Some(items) => items,
+            None => {
+                let hits = cx.snap.query(&f, MAX_NEG_ITEMS + 1, cx.now);
+                hits.iter().filter(|h| !broad_wrap(&f, cx.snap, h.seq)).map(|h| (h.created_at, h.id)).collect()
+            }
+        };
+        if items.len() > MAX_NEG_ITEMS {
             return neg_err(out, sub_id, "blocked: too many records to reconcile, narrow the filter");
         }
-        let storage = VecStorage::new(hits.iter().filter(|h| !broad_wrap(&f, cx.snap, h.seq)).map(|h| (h.created_at, h.id)).collect());
+        let storage = VecStorage::new(items);
         match negentropy::reconcile(&storage, msg, NEG_FRAME_LIMIT) {
             Ok(resp) => {
                 neg_msg(out, sub_id, &resp);

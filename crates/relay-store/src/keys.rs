@@ -18,7 +18,13 @@
 //! DELETED       0A ‖ target id ‖ deleter pubkey          (kind-5 `e` tombstone, permanent)
 //! ADDR_DELETED  0B ‖ pubkey ‖ kind ‖ d-field ‖ created_at (kind-5 `a` tombstone, permanent)
 //! VANISH        0C ‖ pubkey ‖ created_at                  (NIP-62 tombstone, permanent)
+//! NEG           0D ‖ name ‖ field ‖ kind ‖ created_at ‖ id ‖ seq   (NIP-77 covering)
 //! ```
+//!
+//! NEG keys carry the event id itself, so a negentropy set for Vector's DM sync
+//! shape (`kinds:[1059] #p:[me]`) is read from index blocks alone: no event is
+//! touched, which is what keeps a large mailbox sync fast on a machine whose
+//! log does not fit in RAM.
 
 use relay_proto::record::{Field, Record};
 use relay_proto::{hex, kind, varint};
@@ -35,6 +41,10 @@ pub const T_EXPIRY: u8 = 0x09;
 pub const T_DELETED: u8 = 0x0A;
 pub const T_ADDR_DELETED: u8 = 0x0B;
 pub const T_VANISH: u8 = 0x0C;
+pub const T_NEG: u8 = 0x0D;
+
+/// Kinds whose `p` tags get covering NEG keys: Vector's only NIP-77 shape.
+pub const NEG_KINDS: &[u64] = &[1059];
 
 /// Tag values longer than this (stored form) are not indexed, as in strfry.
 pub const MAX_INDEXED_VALUE: usize = 256;
@@ -45,7 +55,7 @@ pub const EMPTY_FIELD: [u8; 1] = [0];
 /// Key types whose last 8 bytes are the seq of the event they index.
 #[inline]
 pub fn has_seq(key: &[u8]) -> bool {
-    key.first().is_some_and(|&t| t <= T_EXPIRY)
+    key.first().is_some_and(|&t| t <= T_EXPIRY || t == T_NEG)
 }
 
 /// The part of a key that queries name exactly, and so what bloom filters are
@@ -61,6 +71,7 @@ pub fn bloom_prefix(key: &[u8]) -> &[u8] {
         Some(&T_CREATED | &T_EXPIRY) => &key[..n.min(1)],
         Some(&T_KIND | &T_AUTHOR | &T_AUTHOR_KIND | &T_TAG | &T_TAG_KIND | &T_ADDR) => &key[..n.saturating_sub(16)],
         Some(&T_ADDR_DELETED | &T_VANISH) => &key[..n.saturating_sub(8)],
+        Some(&T_NEG) => &key[..n.saturating_sub(48)],
         _ => key,
     }
 }
@@ -173,9 +184,9 @@ pub fn index_keys(rec: Record<'_>, seq: u64, kb: &mut KeyBuf, scratch: &mut Vec<
         if !name.is_ascii_alphabetic() || value.len() > MAX_INDEXED_VALUE + 3 {
             continue;
         }
-        let dup = (first_tag_key..kb.len()).step_by(2).any(|i| {
+        let dup = (first_tag_key..kb.len()).any(|i| {
             let key = kb.key(i);
-            key[1] == name && &key[2..key.len() - 16] == value
+            key[0] == T_TAG && key[1] == name && &key[2..key.len() - 16] == value
         });
         if dup {
             continue;
@@ -192,6 +203,16 @@ pub fn index_keys(rec: Record<'_>, seq: u64, kb: &mut KeyBuf, scratch: &mut Vec<
         kb.put_u64(k);
         kb.put_u64(ca);
         kb.put_u64(seq);
+
+        if name == b'p' && NEG_KINDS.contains(&k) {
+            kb.begin(T_NEG);
+            kb.put(&[name]);
+            kb.put(value);
+            kb.put_u64(k);
+            kb.put_u64(ca);
+            kb.put(id);
+            kb.put_u64(seq);
+        }
     }
 
     if kind::is_replaceable(k) || kind::is_addressable(k) {

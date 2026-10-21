@@ -436,3 +436,41 @@ fn vanish_nip62() {
     assert!(ids(&store, &format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##), 10).is_empty());
     assert_eq!(write(&mut w, &[ev(11, 40, 199, 30078, r#"[["d","x"]]"#, "old")]), vec![Outcome::Deleted]);
 }
+
+#[test]
+fn negentropy_covering_set_matches_query() {
+    let dir = tmpdir("neg");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    let me = pk(50);
+    let other = pk(51);
+    let mut n = 0u64;
+    for i in 0..600u64 {
+        n += 1;
+        let to = if i % 3 == 0 { &other } else { &me };
+        let tags = if i % 10 == 0 {
+            // Some already expired, some expiring later.
+            format!(r#"[["p","{to}"],["expiration","{}"]]"#, if i % 20 == 0 { 500 } else { 5000 })
+        } else {
+            format!(r#"[["p","{to}"]]"#)
+        };
+        write(&mut w, &[ev(n, (i % 4) as u8 + 60, 100 + i % 50, 1059, &tags, "w")]);
+    }
+    // The recipient deletes a few of their wraps.
+    let dels: Vec<String> = (1..40u64).filter(|i| i % 3 != 1).map(|i| format!(r#"["e","{}"]"#, hex32(0xEE, i))).collect();
+    write(&mut w, &[ev(9000, 50, 1000, 5, &format!("[{}]", dels.join(",")), "")]);
+    let snap = store.snapshot();
+    for (fj, now) in [
+        (format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##), 1000u64),
+        (format!(r##"{{"kinds":[1059],"#p":["{me}","{other}"],"since":120,"until":140}}"##), 1000),
+        (format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##), 6000),
+    ] {
+        let f = filter(&fj);
+        let mut covered = snap.neg_items(&f, now).expect("covered shape");
+        covered.sort();
+        let mut queried: Vec<(u64, [u8; 32])> = snap.query(&f, usize::MAX, now).iter().map(|h| (h.created_at, h.id)).collect();
+        queried.sort();
+        assert!(!queried.is_empty());
+        assert_eq!(covered, queried, "{fj} at {now}");
+    }
+    assert!(snap.neg_items(&filter(r#"{"kinds":[1059],"authors":["00"]}"#.replace("00", &pk(1)).as_str()), 0).is_none());
+}

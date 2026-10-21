@@ -387,6 +387,48 @@ impl Version {
         hits
     }
 
+    /// The NIP-77 set for `kinds:[k...] #name:[values...]` within `[since, until]`,
+    /// read from covering NEG keys alone. `None` when the shape is not covered
+    /// (the caller falls back to a query). Live, unexpired events only: the set
+    /// must match exactly what a REQ by id would return, or Vector's client
+    /// treats the sync as failed.
+    pub fn neg_items(&self, f: &Filter, now: u64) -> Option<Vec<(u64, [u8; 32])>> {
+        let kinds = f.kinds.as_deref()?;
+        if f.ids.is_some() || f.authors.is_some() || f.tags.len() != 1 || f.tags[0].name != b'p' {
+            return None;
+        }
+        if !kinds.iter().all(|k| keys::NEG_KINDS.contains(k)) {
+            return None;
+        }
+        let since = f.since.unwrap_or(0);
+        let until = f.until.unwrap_or(u64::MAX);
+        // Expired but not yet swept: the few seqs in the sweep's gap.
+        let mut expired = std::collections::HashSet::new();
+        self.for_range(&[T_EXPIRY], &prefix(T_EXPIRY, &[&now.saturating_add(1).to_be_bytes()]), |k| {
+            expired.insert(seq_of(k));
+        });
+        let mut items = Vec::new();
+        for v in &f.tags[0].values {
+            for k in kinds {
+                let p = prefix(T_NEG, &[b"p", v, &k.to_be_bytes()]);
+                let lo = prefix(T_NEG, &[b"p", v, &k.to_be_bytes(), &since.to_be_bytes()]);
+                let hi = prefix(T_NEG, &[b"p", v, &k.to_be_bytes(), &until.to_be_bytes(), &[0xFF; 41]]);
+                for r in self.runs.iter() {
+                    r.scan(&lo, &hi, Some(&p), &mut |key| {
+                        let n = key.len();
+                        let seq = seq_of(key);
+                        if self.is_live(seq) && !expired.contains(&seq) {
+                            let ca = u64::from_be_bytes(key[n - 48..n - 40].try_into().unwrap());
+                            items.push((ca, key[n - 40..n - 8].try_into().unwrap()));
+                        }
+                        true
+                    });
+                }
+            }
+        }
+        Some(items)
+    }
+
     /// Number of matching events (NIP-45). Exact plans never read a record.
     pub fn count(&self, f: &Filter, now: u64) -> u64 {
         match self.plan(f) {
