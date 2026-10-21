@@ -14,6 +14,7 @@ use crate::version::{Run, Version};
 use crate::{Options, Shared, VanishCfg};
 use relay_proto::kind;
 use relay_proto::record::{Field, Record};
+use relay_proto::Filter;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -105,6 +106,10 @@ pub(crate) type ColdRuns = Vec<(Vec<u64>, u64)>;
 /// Cold runs merged at once, and how far apart in size they may be.
 const MERGE_FANIN: usize = 4;
 const MERGE_RATIO: u64 = 4;
+
+/// Events an operator removal kills per commit: enough to amortise the sync,
+/// few enough that the writer is never away from client batches for long.
+pub const DELETE_BATCH: usize = 4096;
 
 /// A segment tier: segments within a factor of 4 in size share a level, and a
 /// level holding this many is merged into one.
@@ -550,6 +555,54 @@ impl Writer {
         self.commit(b)
     }
 
+    /// Kills whichever of `seqs` are still live, in one commit. Returns how many were.
+    /// The kills reach disk as dead flags in the log but not yet in a checkpoint:
+    /// call [`write_checkpoint`](Self::write_checkpoint) once the last batch is in.
+    pub fn kill_live(&mut self, seqs: &[u64]) -> io::Result<usize> {
+        let v = self.current();
+        let mut live: Vec<u64> = seqs.iter().copied().filter(|&s| v.is_live(s)).collect();
+        drop(v);
+        live.sort_unstable();
+        live.dedup();
+        self.kill_seqs(&live)?;
+        Ok(live.len())
+    }
+
+    /// Operator removal: kills every live event matching any of `filters` (and,
+    /// with `older_than`, created strictly before it). Returns how many.
+    ///
+    /// Not a NIP-09 deletion: no tombstone is kept, so a deleted event can be
+    /// published again. The kills go in batches of [`DELETE_BATCH`], each its own
+    /// commit. A server that must keep serving writes feeds batches to
+    /// `kill_live` between its own instead.
+    pub fn delete_matching(&mut self, filters: &[Filter], older_than: Option<u64>, now: u64) -> io::Result<usize> {
+        let v = self.current();
+        let mut deleted = 0;
+        let killed = self.kill_batches(&v, filters, older_than, now, &mut deleted);
+        // Until the snapshot is gone the killed records cannot be zeroed. What
+        // was killed is made permanent before anything may zero it, even when a
+        // batch failed part-way.
+        drop(v);
+        if deleted > 0 {
+            self.write_checkpoint()?;
+            self.reclaim()?;
+        }
+        killed.map(|()| deleted)
+    }
+
+    fn kill_batches(&mut self, v: &Version, filters: &[Filter], older_than: Option<u64>, now: u64, deleted: &mut usize) -> io::Result<()> {
+        let mut batch = Vec::with_capacity(DELETE_BATCH);
+        for hit in v.matching(filters, older_than, now) {
+            batch.push(hit.seq);
+            if batch.len() == DELETE_BATCH {
+                *deleted += self.kill_live(&batch)?;
+                batch.clear();
+            }
+        }
+        *deleted += self.kill_live(&batch)?;
+        Ok(())
+    }
+
     /// Marks events whose NIP-40 expiration is `<= now` dead. Returns how many.
     pub fn sweep_expired(&mut self, now: u64) -> io::Result<usize> {
         let v = self.current();
@@ -948,7 +1001,11 @@ impl Writer {
     /// Records that every key below `covered` is in the listed segments, so a
     /// restart replays only the log after `replay_from`. Order matters: `locs`
     /// and the dead set are made durable before the checkpoint that relies on them.
-    pub(crate) fn write_checkpoint(&mut self) -> io::Result<()> {
+    ///
+    /// This is also what makes `kill_live` kills survive a restart: unlike a
+    /// deletion event or an expiry, they leave no key behind for a restart to
+    /// re-derive them from, and the log is replayed only from `replay_from`.
+    pub fn write_checkpoint(&mut self) -> io::Result<()> {
         // The dead set may hold kills by batches whose sync is still in flight.
         self.barrier()?;
         self.locs.sync()?;

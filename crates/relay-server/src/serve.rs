@@ -1,5 +1,6 @@
 //! `serve`: start the relay. Also what running the binary with no arguments does.
 
+use crate::admin;
 use crate::config::{store_options, Config};
 use crate::ingest::{self, Sink};
 use crate::reactor::{self, Shared};
@@ -20,6 +21,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let events = w.next_seq();
     let threads = if cfg.relay.threads == 0 { std::thread::available_parallelism().map_or(4, |n| n.get()) } else { cfg.relay.threads };
     let bind = cfg.relay.bind;
+    let data = cfg.store.data.clone();
 
     let kinds = cfg.policy.kind_policy();
     let scfg = SessionCfg {
@@ -58,16 +60,37 @@ pub fn run(cfg: Config) -> Result<(), String> {
     };
     let sinks = make_sinks(&txs);
     let reply_sinks = make_sinks(&txs);
+    let (ctl_tx, ctl_rx) = mpsc::channel();
+    let admin_store = store.clone();
     let writer = std::thread::Builder::new()
         .name("writer".into())
-        .spawn(move || ingest::run(w, store, wrx, sinks, reply_sinks))
+        .spawn(move || ingest::run(w, store, wrx, ctl_rx, sinks, reply_sinks))
         .map_err(|e| e.to_string())?;
+
+    // Ready before the relay's own port is, so that a script which waits for
+    // the port can run operator commands at once. Not fatal: the relay serves
+    // without it.
+    let admin = match admin::start(&data, admin_store, ctl_tx) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("admin socket unavailable ({e}): query, count and delete cannot reach this relay while it runs");
+            None
+        }
+    };
 
     // The socket is set up through tokio, which needs a runtime in scope.
     let l = {
         let setup = tokio::runtime::Builder::new_current_thread().enable_io().build().map_err(|e| e.to_string())?;
         let _enter = setup.enter();
-        reactor::listener(bind).map_err(|e| format!("cannot listen on {bind}: {e}"))?
+        match reactor::listener(bind) {
+            Ok(l) => l,
+            Err(e) => {
+                if let Some(a) = &admin {
+                    a.stop();
+                }
+                return Err(format!("cannot listen on {bind}: {e}"));
+            }
+        }
     };
     let mut conn_txs = Vec::with_capacity(threads);
     for (i, rx) in rxs.into_iter().enumerate() {
@@ -87,6 +110,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     wait_for_signal();
     eprintln!("shutting down: finishing the batch in flight");
     ingest::SHUTDOWN.store(true, Ordering::Release);
+    if let Some(a) = &admin {
+        a.stop();
+    }
     let _ = writer.join();
     eprintln!("stopped cleanly");
     std::process::exit(0);

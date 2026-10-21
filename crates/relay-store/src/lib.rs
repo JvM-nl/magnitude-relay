@@ -23,7 +23,7 @@ pub mod segment;
 pub mod version;
 pub mod writer;
 
-pub use version::{Hit, Plan, Version};
+pub use version::{Hit, Matching, Plan, Version};
 pub use writer::{Outcome, Staged, SyncTicket, Writer};
 
 use crate::dead::DeadSet;

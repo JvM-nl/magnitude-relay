@@ -4,7 +4,9 @@
 use relay_proto::event::parse_event_json;
 use relay_proto::json::Scanner;
 use relay_proto::{hex, EventParser, Filter, Record};
+use relay_store::writer::DELETE_BATCH;
 use relay_store::{Options, Outcome, Store, Writer};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -297,6 +299,7 @@ fn queries_match_brute_force() {
         all.extend(batch);
     }
     let snap = store.snapshot();
+    let mut prev: Option<Filter> = None;
     for q in 0..400 {
         let mut parts = Vec::new();
         if rng.below(2) == 0 {
@@ -330,6 +333,20 @@ fn queries_match_brute_force() {
 
         let total = all.iter().filter(|r| f.matches(Record(r))).count() as u64;
         assert_eq!(snap.count(&f, 0), total, "count {q}: {fjson}");
+
+        // The lazy walk yields every match, newest first, with no limit; and over
+        // two filters, each event of the union once.
+        let seqs_of = |fs: &[Filter]| -> Vec<(u64, u64)> { snap.matching(fs, None, 0).map(|h| (h.created_at, h.seq)).collect() };
+        let walk = seqs_of(std::slice::from_ref(&f));
+        assert!(walk.windows(2).all(|w| w[0] > w[1]), "walk order {q}: {fjson}");
+        assert_eq!(walk.len() as u64, total, "walk {q}: {fjson}");
+        if let Some(p) = &prev {
+            let walk = seqs_of(&[f.clone(), p.clone()]);
+            assert!(walk.windows(2).all(|w| w[0] > w[1]), "union order {q}: {fjson}");
+            let union = all.iter().filter(|r| f.matches(Record(r)) || p.matches(Record(r))).count();
+            assert_eq!(walk.len(), union, "union {q}: {fjson}");
+        }
+        prev = Some(f);
     }
 }
 
@@ -965,4 +982,140 @@ fn interrupted_log_merge_finishes_at_open() {
     }
     let (store, _w) = Store::open(&crash, log_opts(0)).unwrap();
     wl.check(&store, "reopen after the merge");
+}
+
+/// `n` events: event `i` is by author `i % 3 + 1`, of kind 1059 when `i` is even
+/// and 14 when odd, created at `1000 + i`.
+fn fill(w: &mut Writer, n: u64) {
+    let recs: Vec<_> = (0..n).map(|i| ev(i, (i % 3) as u8 + 1, 1000 + i, if i % 2 == 0 { 1059 } else { 14 }, "[]", "x")).collect();
+    for chunk in recs.chunks(97) {
+        write(w, chunk);
+    }
+}
+
+/// What a delete should have done, tracked by hand: marks the events `pred`
+/// accepts as gone and says how many that newly was.
+fn forget(alive: &mut [bool], pred: impl Fn(u64) -> bool) -> usize {
+    let mut n = 0;
+    for (i, a) in alive.iter_mut().enumerate() {
+        if *a && pred(i as u64) {
+            *a = false;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Asserts the store holds exactly the events `alive` says, to the query, the count and the walk.
+fn assert_alive(store: &Store, alive: &[bool], what: &str) {
+    let want: BTreeSet<[u8; 32]> = (0..alive.len() as u64).filter(|&i| alive[i as usize]).map(id_of).collect();
+    let snap = store.snapshot();
+    let walked: Vec<_> = snap.matching(&[filter("{}")], None, 2_000).collect();
+    assert_eq!(walked.iter().map(|h| h.id).collect::<BTreeSet<_>>(), want, "{what}: walk");
+    assert_eq!(walked.len(), want.len(), "{what}: walk repeats an event");
+    assert_eq!(snap.count(&filter("{}"), 2_000), want.len() as u64, "{what}: count");
+    let queried: BTreeSet<[u8; 32]> = snap.query(&filter("{}"), usize::MAX, 2_000).iter().map(|h| h.id).collect();
+    assert_eq!(queried, want, "{what}: query");
+}
+
+#[test]
+fn delete_matching_removes_only_what_matches() {
+    let dir = tmpdir("delete");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    fill(&mut w, 600);
+    let mut alive = vec![true; 600];
+    let (author, kind, at) = (|i: u64| i % 3 + 1, |i: u64| if i % 2 == 0 { 1059 } else { 14 }, |i: u64| 1000 + i);
+    assert_alive(&store, &alive, "before");
+
+    // One filter: its events go from query and count, nothing else does.
+    let mine = filter(&format!(r#"{{"kinds":[14],"authors":["{}"]}}"#, pk(1)));
+    assert_eq!(w.delete_matching(std::slice::from_ref(&mine), None, 2_000).unwrap(), forget(&mut alive, |i| kind(i) == 14 && author(i) == 1));
+    assert_eq!(store.snapshot().count(&mine, 2_000), 0);
+    assert!(store.snapshot().query(&mine, 1_000, 2_000).is_empty());
+    assert_alive(&store, &alive, "one filter");
+    assert_eq!(w.delete_matching(std::slice::from_ref(&mine), None, 2_000).unwrap(), 0, "nothing left to delete");
+
+    // A restart does not bring them back: the kills leave no rule key in the
+    // log for the replay to re-derive them from.
+    drop((store, w));
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    assert_alive(&store, &alive, "after reopen");
+
+    // `older_than` is exclusive: the wrap created at exactly 1300 stays.
+    let wraps = filter(r#"{"kinds":[1059]}"#);
+    assert_eq!(w.delete_matching(std::slice::from_ref(&wraps), Some(1300), 2_000).unwrap(), forget(&mut alive, |i| kind(i) == 1059 && at(i) < 1300));
+    assert!(store.snapshot().lookup_id(&id_of(300)).is_some());
+    assert!(store.snapshot().lookup_id(&id_of(298)).is_none());
+    assert_alive(&store, &alive, "older_than");
+
+    // It narrows a filter's own `until`, and never widens it.
+    let early = filter(r#"{"kinds":[14],"until":1100}"#);
+    assert_eq!(w.delete_matching(std::slice::from_ref(&early), Some(1500), 2_000).unwrap(), forget(&mut alive, |i| kind(i) == 14 && at(i) <= 1100));
+    let narrow = filter(r#"{"kinds":[14],"until":1400}"#);
+    assert_eq!(w.delete_matching(std::slice::from_ref(&narrow), Some(1200), 2_000).unwrap(), forget(&mut alive, |i| kind(i) == 14 && at(i) < 1200));
+    assert_alive(&store, &alive, "until");
+
+    // Nothing is older than the epoch, and no filters match nothing.
+    assert_eq!(w.delete_matching(&[filter("{}")], Some(0), 2_000).unwrap(), 0);
+    assert_eq!(w.delete_matching(&[], None, 2_000).unwrap(), 0);
+
+    // A union counts an event matched by both filters once.
+    let by_two = filter(&format!(r#"{{"authors":["{}"]}}"#, pk(2)));
+    let late = filter(r#"{"kinds":[1059],"since":1500}"#);
+    let want = forget(&mut alive, |i| author(i) == 2 || (kind(i) == 1059 && at(i) >= 1500));
+    assert_eq!(w.delete_matching(&[by_two, late], None, 2_000).unwrap(), want);
+    assert_alive(&store, &alive, "union");
+
+    // And all of it holds after another restart.
+    drop((store, w));
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    assert_alive(&store, &alive, "after second reopen");
+}
+
+#[test]
+fn delete_matching_runs_in_batches() {
+    let dir = tmpdir("delete-batches");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    let n = DELETE_BATCH as u64 * 2 + 100;
+    fill(&mut w, n);
+    // Whole batches and a partial one.
+    assert_eq!(w.delete_matching(&[filter(r#"{"kinds":[1059]}"#)], None, 2_000).unwrap() as u64, n / 2);
+    assert_eq!(store.snapshot().count(&filter("{}"), 1_000_000), n / 2);
+    drop((store, w));
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(store.snapshot().count(&filter("{}"), 1_000_000), n / 2);
+    assert_eq!(store.snapshot().count(&filter(r#"{"kinds":[1059]}"#), 1_000_000), 0);
+}
+
+#[test]
+fn operator_deleted_content_is_zeroed_on_disk() {
+    let dir = tmpdir("delete-zero");
+    let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+    let secret = "SECRET-CONTENT-YYYY";
+    write(&mut w, &[ev(1, 1, 100, 14, "[]", secret), ev(2, 1, 101, 14, "[]", "kept-content")]);
+    let seg = dir.join("log").join("00000000.log");
+    let on_disk = |s: &str| std::fs::read(&seg).unwrap().windows(s.len()).any(|w| w == s.as_bytes());
+    assert!(on_disk(secret));
+    // By id, which takes the other plan.
+    assert_eq!(w.delete_matching(&[filter(&format!(r#"{{"ids":["{}"]}}"#, hex32(0xEE, 1)))], None, 1_000).unwrap(), 1);
+    assert!(!on_disk(secret), "the deleted event's bytes are zeroed once the delete is over");
+    assert!(on_disk("kept-content"));
+}
+
+#[test]
+fn matching_skips_expired_and_dead() {
+    let dir = tmpdir("matching");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    write(&mut w, &[ev(1, 1, 100, 1059, r#"[["expiration","500"]]"#, "typing"), ev(2, 1, 100, 1059, "[]", "msg"), ev(3, 1, 101, 1059, "[]", "gone")]);
+    let walk = |f: &str, older: Option<u64>, now: u64| store.snapshot().matching(&[filter(f)], older, now).map(|h| h.id).collect::<Vec<_>>();
+    assert_eq!(walk("{}", None, 499).len(), 3);
+    assert_eq!(walk("{}", None, 500), vec![id_of(3), id_of(2)], "expired at 500, newest first");
+    // The same by id.
+    let one = format!(r#"{{"ids":["{}"]}}"#, hex32(0xEE, 1));
+    assert_eq!(walk(&one, None, 499), vec![id_of(1)]);
+    assert!(walk(&one, None, 500).is_empty());
+    assert_eq!(w.delete_matching(&[filter(&format!(r#"{{"ids":["{}"]}}"#, hex32(0xEE, 3)))], None, 500).unwrap(), 1);
+    assert_eq!(walk("{}", None, 500), vec![id_of(2)]);
+    assert!(walk("{}", Some(100), 500).is_empty(), "created at 100 is not older than 100");
+    assert_eq!(walk("{}", Some(101), 500), vec![id_of(2)]);
 }

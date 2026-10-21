@@ -448,3 +448,260 @@ async fn large_live_events_reach_every_subscriber_intact() {
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Runs one of the binary's commands against the relay whose settings are in
+/// `dir`: (success, stdout, stderr).
+fn run(dir: &std::path::Path, args: &[&str]) -> (bool, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_magnitude-relay")).arg("--config").arg(dir.join("relay.toml")).args(args).output().unwrap();
+    (out.status.success(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+}
+
+/// A command that must succeed; its stdout.
+fn run_ok(dir: &std::path::Path, args: &[&str]) -> String {
+    let (ok, out, err) = run(dir, args);
+    assert!(ok, "{args:?} failed: {err}");
+    out
+}
+
+/// A command that must be refused, whose complaint contains `why`.
+fn run_refused(dir: &std::path::Path, args: &[&str], why: &str) {
+    let (ok, out, err) = run(dir, args);
+    assert!(!ok, "{args:?} should have been refused; it printed {out:?}");
+    assert!(err.contains(why), "{args:?}: wanted {why:?} in {err:?}");
+}
+
+/// The ids of the JSONL events a command printed, in order.
+fn ids_printed(out: &str) -> Vec<String> {
+    out.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].as_str().unwrap().to_string()).collect()
+}
+
+async fn ids_over_req(relay: &Relay, filter: Value) -> Vec<String> {
+    let host = relay.addr.to_string();
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    send(&mut c, json!(["REQ", "r", filter])).await;
+    let (evs, _) = collect(&mut c, "r").await;
+    evs.iter().map(|e| e["id"].as_str().unwrap().to_string()).collect()
+}
+
+#[tokio::test]
+async fn operator_commands_reach_a_running_relay_and_a_stopped_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("relay-e2e-adm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start(dir.clone(), port);
+    let host = format!("127.0.0.1:{port}");
+    let (me, other) = (Signer::new(11), Signer::new(12));
+
+    // Four wraps to `me`, 4000 to 1000 seconds old, and a profile each.
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    let mut wrap_events = Vec::new();
+    for age in [4000, 3000, 2000, 1000] {
+        let wrap = other.event(now() - age, 1059, json!([["p", me.pk()]]), &format!("wrap {age}"));
+        send(&mut c, json!(["EVENT", wrap])).await;
+        assert!(ok_of(&mut c).await.0);
+        wrap_events.push(wrap);
+    }
+    let wraps: Vec<String> = wrap_events.iter().map(|w| w["id"].as_str().unwrap().to_string()).collect();
+    let mut profiles = Vec::new();
+    for s in [&me, &other] {
+        let p = s.event(now() - 10, 0, json!([]), "{}");
+        send(&mut c, json!(["EVENT", p])).await;
+        assert!(ok_of(&mut c).await.0);
+        profiles.push(p["id"].as_str().unwrap().to_string());
+    }
+    drop(c);
+    let to_me = json!({"kinds": [1059], "#p": [me.pk()]});
+    let newest_first = |ids: &[String]| ids.iter().rev().cloned().collect::<Vec<_>>();
+
+    // The socket is there, and only its owner can open it.
+    let sock = dir.join("data").join("admin.sock");
+    assert_eq!(std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!dir.join("data").join("admin.tmp").exists(), "the staging directory is gone");
+
+    // Reading through the running relay.
+    assert_eq!(run_ok(&dir, &["count", "--filter", r#"{"kinds":[1059]}"#]), "4\n");
+    assert_eq!(run_ok(&dir, &["count", "--filter", r#"[{"kinds":[1059]},{"kinds":[0]},{"kinds":[1059,0]}]"#]), "6\n", "a union counts an event once");
+    let q = run_ok(&dir, &["query", "--filter", r#"{"kinds":[1059]}"#]);
+    assert_eq!(ids_printed(&q), newest_first(&wraps));
+    // The same bytes REQ would send for it.
+    let first: Value = serde_json::from_str(q.lines().next().unwrap()).unwrap();
+    assert_eq!(first["content"], "wrap 1000");
+    assert_eq!(ids_printed(&run_ok(&dir, &["query", "--filter", r#"{"kinds":[1059]}"#, "--limit", "2"])), newest_first(&wraps)[..2]);
+
+    // Refusals change nothing.
+    run_refused(&dir, &["delete", "--filter", r#"{"kinds":[1059]}"#], "--dry-run");
+    run_refused(&dir, &["delete", "--filter", r#"{"kinds":[1059]}"#, "--dry-run", "--yes"], "not both");
+    run_refused(&dir, &["delete", "--filter", "{}", "--yes"], "--all");
+    run_refused(&dir, &["delete", "--filter", "{}", "--dry-run"], "--all");
+    run_refused(&dir, &["delete", "--filter", r#"[{"kinds":[1059]},{}]"#, "--age", "5", "--yes"], "--all");
+    run_refused(&dir, &["delete", "--filter", r#"{"kinds":[1059]}"#, "--yes", "--agee", "5"], "unexpected argument");
+    run_refused(&dir, &["delete", "--filter", r#"{"kinds":[1059],"limit":1}"#, "--yes"], "limit");
+    run_refused(&dir, &["delete", "--yes"], "needs --filter");
+    run_refused(&dir, &["query", "--filter", r#"{"kinds":[1059]"#], "bad");
+    assert_eq!(run_ok(&dir, &["count", "--filter", "[{}]"]), "6\n");
+
+    // A dry run says what would go and touches nothing.
+    let dry = run_ok(&dir, &["delete", "--filter", r#"{"kinds":[1059]}"#, "--dry-run"]);
+    assert!(dry.starts_with("would delete 4 events"), "{dry}");
+    for id in &wraps {
+        assert!(dry.contains(id.as_str()), "{id} not among the samples: {dry}");
+    }
+    assert!(dry.contains("kind 1059") && dry.contains(&other.pk()[..8]), "{dry}");
+    let aged = run_ok(&dir, &["delete", "--filter", r#"{"kinds":[1059]}"#, "--age", "2500", "--dry-run"]);
+    assert!(aged.starts_with("would delete 2 events"), "{aged}");
+    run_refused(&dir, &["count", "--filter", "{}", "--age", "5"], "unexpected argument");
+    assert_eq!(ids_over_req(&relay, to_me.clone()).await.len(), 4);
+
+    // Delete the old ones, then the rest: gone for a client too, and the
+    // profiles are never touched.
+    assert_eq!(run_ok(&dir, &["delete", "--filter", r#"{"kinds":[1059]}"#, "--age", "2500", "--yes"]), "deleted 2 events\n");
+    assert_eq!(ids_over_req(&relay, to_me.clone()).await, newest_first(&wraps[2..]));
+    assert_eq!(run_ok(&dir, &["delete", "--filter", r#"{"kinds":[1059]}"#, "--yes"]), "deleted 2 events\n");
+    assert!(ids_over_req(&relay, to_me.clone()).await.is_empty());
+    assert_eq!(run_ok(&dir, &["delete", "--filter", r#"{"kinds":[1059]}"#, "--yes"]), "deleted 0 events\n");
+    assert_eq!(ids_over_req(&relay, json!({"kinds": [0]})).await.len(), 2);
+    assert_eq!(run_ok(&dir, &["count", "--filter", "{}"]), "2\n");
+    assert_eq!(ids_printed(&run_ok(&dir, &["query", "--filter", "{}"])).len(), 2);
+
+    // A deleted event can be published again: no tombstone is kept.
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    send(&mut c, json!(["EVENT", wrap_events[3]])).await;
+    assert!(ok_of(&mut c).await.0);
+    drop(c);
+    assert_eq!(ids_over_req(&relay, to_me.clone()).await, vec![wraps[3].clone()]);
+    assert_eq!(run_ok(&dir, &["delete", "--filter", r#"{"kinds":[1059]}"#, "--yes"]), "deleted 1 event\n");
+
+    // Stopped cleanly, the relay takes its socket with it. The same commands
+    // now open the data directory.
+    let dir = relay.stop();
+    assert!(!sock.exists(), "the socket is removed on clean shutdown");
+    assert_eq!(run_ok(&dir, &["count", "--filter", "{}"]), "2\n");
+    let mut stored = ids_printed(&run_ok(&dir, &["query", "--filter", r#"{"kinds":[0]}"#]));
+    stored.sort();
+    let mut want = profiles.clone();
+    want.sort();
+    assert_eq!(stored, want);
+    assert_eq!(run_ok(&dir, &["count", "--filter", r#"{"kinds":[1059]}"#]), "0\n");
+    let dry = run_ok(&dir, &["delete", "--filter", &format!(r#"{{"authors":["{}"]}}"#, other.pk()), "--dry-run"]);
+    assert!(dry.starts_with("would delete 1 event "), "{dry}");
+    assert_eq!(run_ok(&dir, &["count", "--filter", "{}"]), "2\n");
+    assert_eq!(run_ok(&dir, &["delete", "--filter", &format!(r#"{{"authors":["{}"]}}"#, other.pk()), "--yes"]), "deleted 1 event\n");
+    assert_eq!(ids_printed(&run_ok(&dir, &["query", "--filter", "{}"])), vec![profiles[0].clone()]);
+
+    // Neither delete came back with a restart.
+    let port = free_port();
+    let relay = Relay::start(dir.clone(), port);
+    assert_eq!(ids_over_req(&relay, json!({"kinds": [0]})).await, vec![profiles[0].clone()]);
+    assert!(ids_over_req(&relay, to_me).await.is_empty());
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn operator_deleted_content_leaves_the_disk() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-adm-zero-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start_with(dir.clone(), port, "segment_mb = 16\n");
+    let host = format!("127.0.0.1:{port}");
+    let me = Signer::new(31);
+    let secret = "SECRET-NOTE-WWWW";
+    let ev = me.event(now(), 30078, json!([["d", "notes"]]), secret);
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    send(&mut c, json!(["EVENT", ev])).await;
+    assert!(ok_of(&mut c).await.0);
+    drop(c);
+    assert!(log_bytes(&dir).windows(secret.len()).any(|w| w == secret.as_bytes()));
+
+    let by_id = format!(r#"{{"ids":["{}"]}}"#, ev["id"].as_str().unwrap());
+    assert_eq!(run_ok(&dir, &["delete", "--filter", &by_id, "--yes"]), "deleted 1 event\n");
+    // The relay's own readers and the command's snapshot are gone a moment
+    // later, and then the bytes are too.
+    let t = Instant::now();
+    while log_bytes(&dir).windows(secret.len()).any(|w| w == secret.as_bytes()) {
+        assert!(t.elapsed() < Duration::from_secs(5), "deleted content still on disk after 5 s");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_crashed_relays_admin_socket_is_replaced() {
+    use std::os::unix::net::UnixListener;
+    let dir = std::env::temp_dir().join(format!("relay-e2e-stale-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // What a killed relay leaves: a socket file no one is listening on.
+    let sock = dir.join("data").join("admin.sock");
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    drop(UnixListener::bind(&sock).unwrap());
+    assert!(sock.exists());
+
+    let relay = Relay::start(dir.clone(), free_port());
+    assert_eq!(run_ok(&dir, &["count", "--filter", "{}"]), "0\n");
+    let dir = relay.stop();
+    assert!(!sock.exists());
+
+    // A file that is not a socket is left alone, and the relay serves without it.
+    std::fs::write(&sock, "mine").unwrap();
+    let relay = Relay::start(dir.clone(), free_port());
+    assert_eq!(std::fs::read_to_string(&sock).unwrap(), "mine");
+    run_refused(&dir, &["count", "--filter", "{}"], "admin socket");
+    let dir = relay.stop();
+    assert_eq!(std::fs::read_to_string(&sock).unwrap(), "mine");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_big_delete_runs_beside_live_writes() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("relay-e2e-big-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Settings written by a first start; then 60,000 events loaded offline.
+    drop(Relay::start(dir.clone(), free_port()).stop());
+    let n = 60_000u64;
+    let file = dir.join("in.jsonl");
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&file).unwrap());
+    for i in 0..n {
+        let (id, pk) = (format!("{:064x}", i + 1), format!("{:064x}", i % 7 + 1));
+        let (at, sig) = (1_700_000_000 + i, "00".repeat(64));
+        writeln!(f, r#"{{"content":"x","created_at":{at},"id":"{id}","kind":14,"pubkey":"{pk}","sig":"{sig}","tags":[]}}"#).unwrap();
+    }
+    drop(f);
+    run_ok(&dir, &["import", "--no-verify", file.to_str().unwrap()]);
+    assert_eq!(run_ok(&dir, &["count", "--filter", "{}"]), format!("{n}\n"));
+
+    let port = free_port();
+    let relay = Relay::start(dir.clone(), port);
+    let host = format!("127.0.0.1:{port}");
+    let mut delete = Command::new(env!("CARGO_BIN_EXE_magnitude-relay"))
+        .arg("--config")
+        .arg(dir.join("relay.toml"))
+        .args(["delete", "--filter", r#"{"kinds":[14]}"#, "--yes"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Writes made while it runs are all accepted.
+    let me = Signer::new(21);
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    let mut slowest = Duration::ZERO;
+    for i in 0..40 {
+        let ev = me.event(now(), 30078, json!([["d", format!("note-{i}")]]), "live");
+        let t = Instant::now();
+        send(&mut c, json!(["EVENT", ev])).await;
+        assert!(ok_of(&mut c).await.0);
+        slowest = slowest.max(t.elapsed());
+    }
+    eprintln!("slowest OK while the delete ran: {slowest:?} (delete still running afterwards: {})", delete.try_wait().unwrap().is_none());
+    let out = delete.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("deleted {n} events\n"));
+    assert_eq!(run_ok(&dir, &["count", "--filter", r#"{"kinds":[14]}"#]), "0\n");
+    assert_eq!(run_ok(&dir, &["count", "--filter", "{}"]), "40\n", "the live writes are all there, and nothing else");
+    assert_eq!(ids_over_req(&relay, json!({"kinds": [30078], "authors": [me.pk()]})).await.len(), 40);
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
