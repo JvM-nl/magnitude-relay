@@ -133,6 +133,8 @@ pub struct Writer {
     pub(crate) vanish: VanishCfg,
     /// `mem[..frozen]` are being flushed into a segment.
     frozen: usize,
+    /// One filter over every memory run, published with each version.
+    mem_bloom: Arc<crate::bloom::SharedBloom>,
     flushing: bool,
     compacting: bool,
     pub(crate) next_seg_id: u64,
@@ -295,6 +297,16 @@ fn p_tags(r: Record<'_>) -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// The shared filter over `mem`, sized for what memory holds between flushes
+/// (index keys are rarely under 24 bytes).
+pub(crate) fn mem_bloom(opts: &Options, mem: &[Arc<MemRun>]) -> Arc<crate::bloom::SharedBloom> {
+    let b = crate::bloom::SharedBloom::with_capacity((opts.flush_bytes / 24).max(1024));
+    for m in mem {
+        b.add(&m.prefix_hashes());
+    }
+    Arc::new(b)
+}
+
 impl Drop for Writer {
     /// Nothing of a closed store may still write into its directory once its
     /// lock can be released (a new opener's cleanup would race it): the job in
@@ -320,6 +332,7 @@ impl Writer {
         dead: DeadSet,
         segments: Vec<Arc<Segment>>,
         mem: Vec<Arc<MemRun>>,
+        mem_bloom: Arc<crate::bloom::SharedBloom>,
         next_seq: u64,
         opts: Options,
         dir: PathBuf,
@@ -346,6 +359,7 @@ impl Writer {
             dead,
             segments,
             mem,
+            mem_bloom,
             next_seq,
             opts,
             dir,
@@ -552,7 +566,10 @@ impl Writer {
             self.dead.set(seq);
         }
         if !b.keys.is_empty() {
-            self.mem.push(Arc::new(MemRun::build(&b.keys)));
+            let (run, hashes) = MemRun::build_hashed(&b.keys);
+            // Before the version holding the run is published.
+            self.mem_bloom.add(&hashes);
+            self.mem.push(Arc::new(run));
             lap(1, &mut t);
             self.merge_mem();
             lap(2, &mut t);
@@ -951,6 +968,9 @@ impl Writer {
         match d {
             Done::Flushed { seg, frozen, covered, replay_from } => {
                 self.mem.drain(..frozen);
+                // A fresh shared filter, of the runs still in memory: older
+                // versions keep the one that covers theirs.
+                self.mem_bloom = mem_bloom(&self.opts, &self.mem);
                 self.frozen = 0;
                 self.flushing = false;
                 self.segments.push(seg);
@@ -1131,6 +1151,8 @@ impl Writer {
             locs: self.locs.map(),
             dead: self.dead.clone(),
             runs: Arc::new(runs),
+            mem_start: self.segments.len(),
+            mem_bloom: self.mem_bloom.clone(),
         });
         let old = std::mem::replace(&mut *self.shared.current.write().unwrap(), v);
         self.shared.gen.store(gen, Ordering::Release);

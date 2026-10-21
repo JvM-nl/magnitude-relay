@@ -134,6 +134,10 @@ pub struct Version {
     pub(crate) dead: DeadSet,
     /// Segments first (oldest first), then memory runs (oldest first).
     pub(crate) runs: Arc<Vec<Run>>,
+    /// Where the memory runs start in `runs`.
+    pub(crate) mem_start: usize,
+    /// A filter over every memory run's prefixes (see `bloom::SharedBloom`).
+    pub(crate) mem_bloom: Arc<crate::bloom::SharedBloom>,
 }
 
 /// One query result, enough to order it and fetch it.
@@ -229,6 +233,18 @@ impl Version {
         &self.runs
     }
 
+    /// The runs that may hold keys with bloom prefix `p`, oldest first: the
+    /// memory runs are left out together when their shared filter rules `p`
+    /// out (each run's own filter is still asked by the callers' scans).
+    #[inline]
+    fn runs_for(&self, p: &[u8]) -> &[Run] {
+        if self.mem_start < self.runs.len() && !self.mem_bloom.may_contain(p) {
+            &self.runs[..self.mem_start]
+        } else {
+            &self.runs
+        }
+    }
+
     /// Visits every key in `[lo, hi)`, run by run (not merged across runs).
     pub fn for_range(&self, lo: &[u8], hi: &[u8], mut f: impl FnMut(&[u8])) {
         for r in self.runs.iter() {
@@ -243,7 +259,7 @@ impl Version {
     /// (so segments that lack it are skipped with one bloom probe).
     pub fn for_prefix(&self, p: &[u8], mut f: impl FnMut(&[u8])) {
         let end = prefix_end(p);
-        for r in self.runs.iter() {
+        for r in self.runs_for(p) {
             r.scan(p, &end, Some(p), &mut |k| {
                 f(k);
                 true
@@ -256,7 +272,7 @@ impl Version {
         let p = prefix(T_ID, &[id]);
         let end = prefix_end(&p);
         let mut found = None;
-        for r in self.runs.iter().rev() {
+        for r in self.runs_for(&p).iter().rev() {
             r.scan(&p, &end, Some(&p), &mut |k| {
                 let seq = seq_of(k);
                 if self.is_live(seq) {
@@ -276,7 +292,7 @@ impl Version {
     pub fn prefix_has(&self, p: &[u8], n: usize) -> bool {
         let end = prefix_end(p);
         let mut seen = 0;
-        for r in self.runs.iter() {
+        for r in self.runs_for(p) {
             r.scan(p, &end, Some(p), &mut |_| {
                 seen += 1;
                 seen < n
@@ -290,13 +306,13 @@ impl Version {
 
     /// True if exactly `key` exists in some run (tombstone lookups).
     pub fn has_key(&self, key: &[u8]) -> bool {
-        self.runs.iter().any(|r| r.contains(key))
+        self.runs_for(keys::bloom_prefix(key)).iter().any(|r| r.contains(key))
     }
 
     /// Number of index entries under `p` with created_at in `[since, until]`.
     fn estimate(&self, p: &[u8], since: u64, until: u64) -> u64 {
         let (lo, hi) = bounds(p, since, until);
-        self.runs.iter().map(|r| r.estimate(&lo, &hi, Some(p))).sum()
+        self.runs_for(p).iter().map(|r| r.estimate(&lo, &hi, Some(p))).sum()
     }
 
     fn estimate_all(&self, prefixes: &[Vec<u8>], since: u64, until: u64) -> u64 {
@@ -530,7 +546,7 @@ impl Version {
                 let p = prefix(T_NEG, &[b"p", v, &k.to_be_bytes()]);
                 let lo = prefix(T_NEG, &[b"p", v, &k.to_be_bytes(), &since.to_be_bytes()]);
                 let hi = prefix(T_NEG, &[b"p", v, &k.to_be_bytes(), &until.to_be_bytes(), &[0xFF; 49]]);
-                for r in self.runs.iter() {
+                for r in self.runs_for(&p) {
                     r.scan(&lo, &hi, Some(&p), &mut |key| {
                         let n = key.len();
                         let seq = seq_of(key);
@@ -580,7 +596,7 @@ impl Version {
         let mut n = 0u64;
         for p in &prefixes {
             let (lo, hi) = bounds(p, since, until);
-            for r in self.runs.iter() {
+            for r in self.runs_for(p) {
                 r.scan(&lo, &hi, Some(p), &mut |k| {
                     let seq = seq_of(k);
                     n += u64::from(self.is_live(seq) && !expired.contains(&seq));
@@ -741,7 +757,7 @@ impl<'a> Merge<'a> {
         let mut heap = BinaryHeap::new();
         for p in prefixes {
             let (lo_key, hi_key) = bounds(p, since, until);
-            for run in v.runs.iter() {
+            for run in v.runs_for(p) {
                 if !run.may_contain(Some(p)) {
                     continue;
                 }

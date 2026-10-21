@@ -84,9 +84,60 @@ impl Bloom {
     }
 }
 
+/// One filter over every memory run between two flushes: a lookup it rules
+/// out skips them all on one probe (a dozen or more runs each have their own
+/// filter too). Bits are only ever set, before the version holding their run
+/// is published, so an older version's reader sees at most extra bits, which
+/// costs a false positive and nothing else. A flush starts a new one.
+pub struct SharedBloom {
+    lines: Box<[AtomicLine]>,
+}
+
+#[repr(C, align(64))]
+struct AtomicLine([std::sync::atomic::AtomicU64; 8]);
+
+impl SharedBloom {
+    /// Sized for about `prefixes` distinct prefixes.
+    pub fn with_capacity(prefixes: usize) -> SharedBloom {
+        let n = blocks_for(prefixes) as usize;
+        SharedBloom { lines: (0..n).map(|_| AtomicLine(Default::default())).collect() }
+    }
+
+    pub fn add(&self, hashes: &[u64]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.lines.len() as u64;
+        for &h in hashes {
+            probe(h, n, |blk, bit| {
+                self.lines[blk].0[(bit / 64) as usize].fetch_or(1 << (bit % 64), Relaxed);
+                true
+            });
+        }
+    }
+
+    /// False means no key with bloom prefix `p` was added.
+    #[inline]
+    pub fn may_contain(&self, p: &[u8]) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let lines = &self.lines;
+        probe(hash64(p), lines.len() as u64, |blk, bit| lines[blk].0[(bit / 64) as usize].load(Relaxed) & (1 << (bit % 64)) != 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_filter_knows_what_was_added() {
+        let keys: Vec<Vec<u8>> = (0..5_000u32).map(|i| [&b"s"[..], &i.to_be_bytes()].concat()).collect();
+        let s = SharedBloom::with_capacity(10_000);
+        assert!(!keys.iter().any(|k| s.may_contain(k)));
+        let hashes: Vec<u64> = keys.iter().map(|k| hash64(k)).collect();
+        s.add(&hashes[..2_500]);
+        assert!(keys[..2_500].iter().all(|k| s.may_contain(k)));
+        s.add(&hashes[2_500..]);
+        assert!(keys.iter().all(|k| s.may_contain(k)));
+    }
 
     #[test]
     fn no_false_negatives_and_few_false_positives() {

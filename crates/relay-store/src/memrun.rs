@@ -17,9 +17,28 @@ pub struct MemRun {
     bloom: Bloom,
 }
 
+/// Sorted keys keep equal prefixes adjacent, so each is hashed once.
+fn prefix_hashes(data: &[u8], offs: &[u32]) -> Vec<u64> {
+    let mut hashes = Vec::new();
+    let mut last: Option<&[u8]> = None;
+    for w in offs.windows(2) {
+        let p = keys::bloom_prefix(&data[w[0] as usize..w[1] as usize]);
+        if last != Some(p) {
+            hashes.push(bloom::hash64(p));
+            last = Some(p);
+        }
+    }
+    hashes
+}
+
 impl MemRun {
     /// Sorts and deduplicates a batch of keys into a run.
     pub fn build(kb: &KeyBuf) -> MemRun {
+        MemRun::build_hashed(kb).0
+    }
+
+    /// [`build`](Self::build), and the run's prefix hashes (for a shared filter).
+    pub fn build_hashed(kb: &KeyBuf) -> (MemRun, Vec<u64>) {
         let mut idx: Vec<u32> = (0..kb.len() as u32).collect();
         idx.sort_unstable_by(|&a, &b| keys::key_cmp(kb.key(a as usize), kb.key(b as usize)));
         idx.dedup_by(|a, b| kb.key(*a as usize) == kb.key(*b as usize));
@@ -30,23 +49,21 @@ impl MemRun {
             data.extend_from_slice(kb.key(i as usize));
         }
         offs.push(data.len() as u32);
-        MemRun::sealed(data, offs)
+        let hashes = prefix_hashes(&data, &offs);
+        let bloom = Bloom::new(&hashes);
+        (MemRun { data, offs, bloom }, hashes)
     }
 
     /// The run of these sorted keys, with its bloom filter.
     fn sealed(data: Vec<u8>, offs: Vec<u32>) -> MemRun {
-        // Sorted keys keep equal prefixes adjacent, so each is hashed once.
-        let mut hashes = Vec::new();
-        let mut last: Option<&[u8]> = None;
-        for w in offs.windows(2) {
-            let p = keys::bloom_prefix(&data[w[0] as usize..w[1] as usize]);
-            if last != Some(p) {
-                hashes.push(bloom::hash64(p));
-                last = Some(p);
-            }
-        }
+        let hashes = prefix_hashes(&data, &offs);
         let bloom = Bloom::new(&hashes);
         MemRun { data, offs, bloom }
+    }
+
+    /// The hashes of its keys' distinct bloom prefixes, for a shared filter.
+    pub fn prefix_hashes(&self) -> Vec<u64> {
+        prefix_hashes(&self.data, &self.offs)
     }
 
     /// False means no key with bloom prefix `p` is in this run.

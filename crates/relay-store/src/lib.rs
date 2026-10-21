@@ -281,6 +281,7 @@ impl Store {
         let mem = if kb.is_empty() { Vec::new() } else { vec![Arc::new(MemRun::build(&kb))] };
         drop(kb);
 
+        let mem_bloom = writer::mem_bloom(&opts, &mem);
         let mut runs: Vec<Run> = segments.iter().map(|s| Run::Disk(s.clone())).collect();
         runs.extend(mem.iter().map(|m| Run::Mem(m.clone())));
         let v = Arc::new(Version {
@@ -291,6 +292,8 @@ impl Store {
             locs: locs.map(),
             dead: dead.clone(),
             runs: Arc::new(runs),
+            mem_start: segments.len(),
+            mem_bloom: mem_bloom.clone(),
         });
         let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0), durable: Arc::new(AtomicU64::new(next_seq)), _lock: lock });
         let finish_intent = !ck.intent_cold.is_empty();
@@ -301,6 +304,7 @@ impl Store {
             dead,
             segments,
             mem,
+            mem_bloom,
             next_seq,
             opts,
             dir.to_path_buf(),
