@@ -33,6 +33,44 @@ pub struct SessionCfg {
     pub kind_allowed: Box<dyn Fn(u64) -> bool + Send + Sync>,
 }
 
+impl SessionCfg {
+    pub fn from_config(cfg: &crate::config::Config) -> SessionCfg {
+        let kinds = cfg.policy.kind_policy();
+        SessionCfg {
+            max_subscriptions: cfg.limits.max_subscriptions,
+            max_filters: cfg.limits.max_filters,
+            max_filter_values: cfg.limits.max_filter_values,
+            default_limit: cfg.limits.default_limit,
+            max_limit: cfg.limits.max_limit,
+            max_event_bytes: cfg.policy.max_event_bytes,
+            max_future_seconds: cfg.policy.max_future_seconds,
+            max_tags: cfg.policy.max_tags,
+            kind_allowed: Box::new(move |k| kinds.allows(k)),
+        }
+    }
+
+    /// Why an event is refused on policy alone, before anything is hashed:
+    /// the same answer for a client's EVENT and for an event synced in.
+    pub fn refusal(&self, info: &EventInfo, rec: Record<'_>, now: u64) -> Option<String> {
+        if !(self.kind_allowed)(info.kind) {
+            Some(format!("blocked: kind {} is not accepted by this relay", info.kind))
+        } else if info.tag_count as usize > self.max_tags {
+            Some(String::from("invalid: too many tags"))
+        } else if info.created_at > now + self.max_future_seconds {
+            Some(String::from("invalid: created_at is too far in the future"))
+        } else if info.expiration.is_some_and(|e| e <= now) {
+            Some(String::from("invalid: event has already expired"))
+        } else if info.protected {
+            // NIP-70 needs AUTH to prove authorship, and this relay never uses AUTH.
+            Some(String::from("blocked: protected events are not accepted here"))
+        } else if rec.json_len() > self.max_event_bytes {
+            Some(format!("invalid: event is larger than {} bytes", self.max_event_bytes))
+        } else {
+            None
+        }
+    }
+}
+
 /// Everything a session needs from its reactor.
 pub struct Ctx<'a> {
     pub cfg: &'a SessionCfg,
@@ -106,23 +144,7 @@ impl Session {
         metrics::inc(&cx.m.events_in);
         let id = *Record(cx.rec).id();
         // Cheap checks first: nothing below costs a hash until these pass.
-        let rejection = if !(cx.cfg.kind_allowed)(info.kind) {
-            Some(format!("blocked: kind {} is not accepted by this relay", info.kind))
-        } else if info.tag_count as usize > cx.cfg.max_tags {
-            Some(String::from("invalid: too many tags"))
-        } else if info.created_at > cx.now + cx.cfg.max_future_seconds {
-            Some(String::from("invalid: created_at is too far in the future"))
-        } else if info.expiration.is_some_and(|e| e <= cx.now) {
-            Some(String::from("invalid: event has already expired"))
-        } else if info.protected {
-            // NIP-70 needs AUTH to prove authorship, and this relay never uses AUTH.
-            Some(String::from("blocked: protected events are not accepted here"))
-        } else if Record(cx.rec).json_len() > cx.cfg.max_event_bytes {
-            Some(format!("invalid: event is larger than {} bytes", cx.cfg.max_event_bytes))
-        } else {
-            None
-        };
-        if let Some(msg) = rejection {
+        if let Some(msg) = cx.cfg.refusal(&info, Record(cx.rec), cx.now) {
             metrics::inc(&cx.m.events_refused);
             return ok(out, &id, false, &msg);
         }
@@ -378,7 +400,7 @@ pub fn ok_reply(out: &mut dyn Outbox, r: &Reply) {
         Some(Outcome::Stored(_)) => (true, ""),
         Some(Outcome::Duplicate) => (true, "duplicate: already have this event"),
         Some(Outcome::Superseded) => (false, "duplicate: a newer version of this event is already stored"),
-        Some(Outcome::Deleted) => (false, "blocked: this event was deleted"),
+        Some(Outcome::Deleted | Outcome::Vanished) => (false, "blocked: this event was deleted"),
         Some(Outcome::Rejected(m)) => (false, m),
         None => (false, "error: could not store the event, try again"),
     };

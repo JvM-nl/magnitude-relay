@@ -1,6 +1,7 @@
 //! `/stats` (JSON) and `/metrics` (Prometheus text): the counters plus the
 //! store's shape, rendered by hand.
 
+use crate::config::json_str;
 use crate::reactor::Shared;
 use std::fmt::Write;
 use std::sync::atomic::Ordering;
@@ -43,7 +44,7 @@ pub fn json(shared: &Shared) -> String {
     }
     let _ = write!(
         o,
-        ",\"store\":{{\"events\":{},\"live\":{},\"dead\":{},\"index_keys\":{},\"index_memory_bytes\":{},\"index_segment_bytes\":{},\"segments\":{}}}}}",
+        ",\"store\":{{\"events\":{},\"live\":{},\"dead\":{},\"index_keys\":{},\"index_memory_bytes\":{},\"index_segment_bytes\":{},\"segments\":{}}}",
         st.events,
         st.events - st.dead,
         st.dead,
@@ -52,6 +53,19 @@ pub fn json(shared: &Shared) -> String {
         st.segment_bytes,
         st.segments
     );
+    // One object per [[sync]] entry: which relay, which way, which events, then its counters.
+    o.push_str(",\"sync\":[");
+    for (i, s) in shared.sync.iter().enumerate() {
+        if i > 0 {
+            o.push(',');
+        }
+        let _ = write!(o, "{{\"url\":{},\"direction\":\"{}\",\"filter\":{}", json_str(&s.url), s.direction, json_str(&s.filter));
+        for (k, v) in s.fields() {
+            let _ = write!(o, ",\"{k}\":{v}");
+        }
+        o.push('}');
+    }
+    o.push_str("]}");
     o
 }
 
@@ -72,6 +86,18 @@ pub fn prometheus(shared: &Shared) -> String {
     gauge("store_segments", st.segments as u64);
     for (k, v) in t.fields() {
         let _ = writeln!(o, "# TYPE relay_{k} counter\nrelay_{k} {v}");
+    }
+    // Labelled by the other relay's URL; a label value escapes `\`, `"` and newlines.
+    if let Some(first) = shared.sync.first() {
+        for (k, _) in first.fields() {
+            let kind = if matches!(k, "connected" | "last_reconcile_at" | "last_reconcile_ms" | "last_need" | "last_have") { "gauge" } else { "counter" };
+            let _ = writeln!(o, "# TYPE relay_sync_{k} {kind}");
+            for s in &shared.sync {
+                let url = s.url.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+                let v = s.fields().into_iter().find(|(n, _)| *n == k).map_or(0, |(_, v)| v);
+                let _ = writeln!(o, "relay_sync_{k}{{url=\"{url}\",direction=\"{}\"}} {v}", s.direction);
+            }
+        }
     }
     o
 }

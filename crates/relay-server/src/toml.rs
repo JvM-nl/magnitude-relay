@@ -7,6 +7,7 @@
 //! let a typo become a silently ignored setting.
 //!
 //! Supported: comments, blank lines, `[section]` headers (one level, bare names),
+//! `[[section]]` headers for a list of tables (each one starts another entry),
 //! `key = value` with bare keys, and values that are basic strings with the
 //! escapes `\"` `\\` `\n` `\t` `\r` and a four-digit unicode escape, literal
 //! `'strings'`, decimal integers (sign and `_` separators allowed), `true` and
@@ -58,18 +59,22 @@ pub struct Section {
     pub name: String,
     /// Line of the `[header]`; 0 for the top level.
     pub line: usize,
+    /// Written `[[name]]`: one entry of a list, and the name may repeat.
+    pub array: bool,
     /// In file order.
     pub entries: Vec<Entry>,
 }
 
 /// Sections in file order. The top-level section (`""`) is present only if the
-/// file has keys before its first header, and then it is first.
+/// file has keys before its first header, and then it is first. A `[[name]]`
+/// list has one section per entry, in file order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Document {
     pub sections: Vec<Section>,
 }
 
 impl Document {
+    /// The section called `name` (the first entry, for a list).
     pub fn section(&self, name: &str) -> Option<&Section> {
         self.sections.iter().find(|s| s.name == name)
     }
@@ -101,18 +106,28 @@ pub fn parse(text: &str) -> Result<Document> {
     // Windows Notepad prepends a byte order mark to UTF-8 files; it is not content.
     let text = if text.as_bytes().starts_with(&[0xEF, 0xBB, 0xBF]) { &text[3..] } else { text };
     let mut p = Parser { s: text, b: text.as_bytes(), p: 0, line: 1 };
-    let mut sections = vec![Section { name: String::new(), line: 0, entries: Vec::new() }];
+    let mut sections = vec![Section { name: String::new(), line: 0, array: false, entries: Vec::new() }];
     let mut cur = 0;
     loop {
         p.skip_trivia();
         let Some(c) = p.peek() else { break };
         let line = p.line;
         if c == b'[' {
-            let name = p.header()?;
+            let (name, array) = p.header()?;
             if let Some(first) = sections.iter().find(|s| s.name == name) {
-                return p.fail_at(line, format!("section [{name}] appears twice (first on line {}); put all its settings under one header", first.line));
+                let msg = match (first.array, array) {
+                    (true, true) => None,
+                    (false, false) => {
+                        Some(format!("section [{name}] appears twice (first on line {}); put all its settings under one header", first.line))
+                    }
+                    (true, false) => Some(format!("[{name}] is written [[{name}]] on line {}: use [[{name}]] for every entry", first.line)),
+                    (false, true) => Some(format!("[[{name}]] is written [{name}] on line {}: use one form", first.line)),
+                };
+                if let Some(msg) = msg {
+                    return p.fail_at(line, msg);
+                }
             }
-            sections.push(Section { name, line, entries: Vec::new() });
+            sections.push(Section { name, line, array, entries: Vec::new() });
             cur = sections.len() - 1;
         } else {
             let (key, value) = p.key_value()?;
@@ -215,11 +230,12 @@ impl<'a> Parser<'a> {
         self.s[start..self.p].to_string()
     }
 
-    /// `[name]`; the cursor is on the `[`.
-    fn header(&mut self) -> Result<String> {
+    /// `[name]` or `[[name]]` (then `true`); the cursor is on the `[`.
+    fn header(&mut self) -> Result<(String, bool)> {
         self.p += 1;
-        if self.peek() == Some(b'[') {
-            return self.fail("arrays of tables ([[name]]) are not supported; use a plain [name] section");
+        let array = self.peek() == Some(b'[');
+        if array {
+            self.p += 1;
         }
         self.skip_blanks();
         let name = self.bare_key();
@@ -237,8 +253,14 @@ impl<'a> Parser<'a> {
             None | Some(b'\n') => return self.fail("section header is missing its closing ']'"),
             Some(_) => return self.fail(format!("unexpected `{}` in section name: use letters, digits, '_' and '-' only", self.here())),
         }
+        if array {
+            if self.peek() != Some(b']') {
+                return self.fail(format!("[[{name}]] is missing its second closing ']'"));
+            }
+            self.p += 1;
+        }
         self.end_of_line("the section header")?;
-        Ok(name)
+        Ok((name, array))
     }
 
     fn key_value(&mut self) -> Result<(String, Value)> {
@@ -637,8 +659,24 @@ mod tests {
     }
 
     #[test]
+    fn arrays_of_tables() {
+        let d = doc("[a]\nk = 1\n\n[[s]]\nurl = \"x\"\nn = 1\n[[ s ]]\nurl = \"y\"\n[b]\nk = 2\n");
+        let names: Vec<_> = d.sections.iter().map(|s| (s.name.as_str(), s.line, s.array)).collect();
+        assert_eq!(names, [("a", 1, false), ("s", 4, true), ("s", 7, true), ("b", 9, false)]);
+        // The same key in two entries is two settings, not a repeat.
+        let urls: Vec<_> = d.sections.iter().filter(|s| s.name == "s").map(|s| s.entries[0].value.clone()).collect();
+        assert_eq!(urls, [Value::Str("x".into()), Value::Str("y".into())]);
+        assert_eq!(d.section("s").unwrap().line, 4, "the first entry");
+        fails("[[s]]\nk = 1\nk = 2", 3, "set twice in [s]");
+        fails("[[s]]\n[s]\n", 2, "[s] is written [[s]] on line 1: use [[s]] for every entry");
+        fails("[s]\n[[s]]\n", 2, "[[s]] is written [s] on line 1");
+        fails("[[s]", 1, "second closing ']'");
+        fails("[[s] ]", 1, "second closing ']'");
+        fails("[[]]", 1, "empty section name");
+    }
+
+    #[test]
     fn header_errors() {
-        fails("[[a]]", 1, "arrays of tables");
         fails("\n[]", 2, "empty section name");
         fails("[a.b]", 1, "dotted section names");
         fails("[a", 1, "missing its closing");

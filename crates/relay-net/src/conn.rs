@@ -366,6 +366,7 @@ where
                     rbuf,
                     rpos: 0,
                     wbuf: Vec::new(),
+                    wpos: 0,
                     dec,
                     enc,
                     comp,
@@ -385,12 +386,19 @@ where
 ///
 /// `queue_*` buffer frames and [`flush`](Self::flush) writes them in one go, so a
 /// benchmark can pipeline many requests per syscall; `send_*` do both.
+///
+/// [`recv`](Self::recv) and [`flush`](Self::flush) are cancel-safe: dropping
+/// either mid-way (a `select!` that took another branch, a timeout) loses no
+/// input and leaves no half-written frame behind, so a caller can wait for a
+/// message and for something else at once.
 pub struct ClientConn<S = TcpStream> {
     stream: S,
     rbuf: Vec<u8>,
     /// Start of the unconsumed input in `rbuf` (consumed bytes are dropped lazily).
     rpos: usize,
     wbuf: Vec<u8>,
+    /// Bytes of `wbuf` already written: a flush that was cancelled resumes here.
+    wpos: usize,
     dec: Decoder,
     enc: ClientEncoder,
     /// Present when permessage-deflate was negotiated.
@@ -432,13 +440,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientConn<S> {
         self.enc.write_ping(&mut self.wbuf, payload);
     }
 
-    /// Writes everything queued.
+    /// Writes everything queued. Progress is kept between calls, so a flush
+    /// that is cancelled and called again sends each byte exactly once.
     pub async fn flush(&mut self) -> io::Result<()> {
-        if !self.wbuf.is_empty() {
-            self.stream.write_all(&self.wbuf).await?;
-            self.wbuf.clear();
+        while self.wpos < self.wbuf.len() {
+            let n = self.stream.write(&self.wbuf[self.wpos..]).await?;
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            self.wpos += n;
         }
+        self.wbuf.clear();
+        self.wpos = 0;
         self.stream.flush().await
+    }
+
+    /// Bytes queued and not yet written.
+    pub fn pending_bytes(&self) -> usize {
+        self.wbuf.len() - self.wpos
     }
 
     pub async fn send_text(&mut self, text: &str) -> io::Result<()> {
@@ -559,8 +578,12 @@ mod tests {
     /// The loop every connection owner writes: decode what is buffered, answer in
     /// one output buffer, flush once, read more.
     async fn echo_server(listener: TcpListener) -> io::Result<()> {
-        let (mut s, _) = listener.accept().await?;
+        let (s, _) = listener.accept().await?;
         s.set_nodelay(true)?;
+        echo_on(s).await
+    }
+
+    async fn echo_on<S: AsyncRead + AsyncWrite + Unpin>(mut s: S) -> io::Result<()> {
         let mut buf = Vec::new();
         match server_handshake(&mut s, &mut buf, DEFAULT_MAX_HEAD).await? {
             Handshake::Upgraded(req) => assert_eq!(req.path, "/echo"),
@@ -668,6 +691,51 @@ mod tests {
 
         let closed = c.close().await.unwrap();
         assert_eq!(closed, Some((1000, String::new())));
+        server.await.unwrap().unwrap();
+    }
+
+    /// A caller that waits on `recv` and `flush` beside other things cancels
+    /// them all the time: nothing may be lost or sent twice when it does.
+    /// Over a pipe that holds 16 KiB, a message ten times that size cannot be
+    /// sent or received in one go, and each call here is dropped the first
+    /// time it has to wait, so both are cut short many times per message.
+    #[tokio::test]
+    async fn recv_and_flush_survive_cancellation() {
+        let (client_end, server_end) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(echo_on(server_end));
+        let mut c = client_handshake(client_end, "localhost", "/echo").await.unwrap();
+        let mut cancelled = (0, 0);
+        // A byte sent twice or lost corrupts the stream and the echo never
+        // comes: that must fail, not spin forever.
+        // Each message takes a dozen or so cut-short calls each way.
+        let stuck = |n: u64| assert!(n < 5_000, "the echo stopped coming: bytes were lost or sent twice");
+        for i in 0..12 {
+            let m = text_of(160_000 + i * 1000, i as u64 + 7);
+            c.queue_text(&m);
+            loop {
+                tokio::select! {
+                    biased;
+                    r = c.flush() => break r.unwrap(),
+                    () = std::future::ready(()) => cancelled.0 += 1,
+                }
+                stuck(cancelled.0);
+                // Let the other end take what was written.
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(c.pending_bytes(), 0);
+            let got = loop {
+                tokio::select! {
+                    biased;
+                    r = c.recv() => break r.unwrap(),
+                    () = std::future::ready(()) => cancelled.1 += 1,
+                }
+                stuck(cancelled.1);
+                tokio::task::yield_now().await;
+            };
+            assert_eq!(got, Message::Text(m), "message {i}");
+        }
+        assert!(cancelled.0 >= 12 && cancelled.1 >= 12, "both must actually be cut short: {cancelled:?}");
+        assert_eq!(c.close().await.unwrap(), Some((1000, String::new())));
         server.await.unwrap().unwrap();
     }
 

@@ -1,4 +1,6 @@
-//! Negentropy (NIP-77) set reconciliation, protocol v1, responder side.
+//! Negentropy (NIP-77) set reconciliation, protocol v1: the responder a relay
+//! runs for its clients, and the initiator it runs itself when it syncs from
+//! another relay.
 //!
 //! The wire format is easy to get subtly wrong, and every client relies on it:
 //! varints are **big-endian** base-128 (not LEB128); bound timestamps are
@@ -6,7 +8,8 @@
 //! infinity; an id prefix in a bound is zero-padded for comparison. The
 //! algorithm follows the reference implementation step for step (16 buckets,
 //! id lists under 32 items, frame-size cut-off with a fingerprint for the rest)
-//! so it interoperates with every client, Vector's included.
+//! so it interoperates with every client, Vector's included, and with every
+//! relay (strfry's responder is the same algorithm in C++).
 //!
 //! Storage is a trait: today a sorted vector with prefix sums (fingerprints of
 //! any range in O(1)); later the covering index, which never reads an event.
@@ -21,6 +24,10 @@ pub const FINGERPRINT_SIZE: usize = 16;
 const BUCKETS: usize = 16;
 const DOUBLE_BUCKETS: usize = 2 * BUCKETS;
 
+/// The smallest frame limit the reference implementation accepts: below it a
+/// message cannot always carry one range's worth of fingerprints.
+pub const MIN_FRAME_LIMIT: usize = 4096;
+
 const MODE_SKIP: u64 = 0;
 const MODE_FINGERPRINT: u64 = 1;
 const MODE_ID_LIST: u64 = 2;
@@ -31,16 +38,22 @@ pub enum NegError {
     BadMode,
     BadVersion,
     BoundTooLong,
+    /// A responder answered in a protocol version we do not speak (it names the one it does).
+    UnsupportedVersion(u8),
+    /// A frame size limit below what the protocol needs to make progress.
+    FrameLimitTooSmall,
 }
 
 impl fmt::Display for NegError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            NegError::Truncated => "negentropy message ends prematurely",
-            NegError::BadMode => "unknown negentropy mode",
-            NegError::BadVersion => "invalid negentropy protocol version",
-            NegError::BoundTooLong => "negentropy bound id longer than 32 bytes",
-        })
+        match self {
+            NegError::Truncated => f.write_str("negentropy message ends prematurely"),
+            NegError::BadMode => f.write_str("unknown negentropy mode"),
+            NegError::BadVersion => f.write_str("invalid negentropy protocol version"),
+            NegError::BoundTooLong => f.write_str("negentropy bound id longer than 32 bytes"),
+            NegError::UnsupportedVersion(v) => write!(f, "the other side speaks negentropy version 0x{v:02x}, not 0x{PROTOCOL_VERSION:02x}"),
+            NegError::FrameLimitTooSmall => write!(f, "a negentropy frame limit must be 0 (none) or at least {MIN_FRAME_LIMIT} bytes"),
+        }
     }
 }
 
@@ -347,6 +360,127 @@ pub fn reconcile(s: &impl NegStorage, mut q: &[u8], frame_limit: usize) -> Resul
         prev_bound = curr;
     }
     Ok(out)
+}
+
+/// The initiating side of a reconciliation: a client, or a relay syncing from
+/// another. It holds its own items, sends the first message, and answers each
+/// of the responder's messages until nothing differs. Along the way it learns
+/// which ids only it holds (`have`) and which only the responder holds (`need`).
+///
+/// Every step is the reference implementation's `reconcile_aux` with
+/// `is_initiator` set: the same splits, the same skips, the same frame cut-off,
+/// so a responder cannot tell it from the reference client.
+pub struct Initiator<S: NegStorage> {
+    storage: S,
+    frame_limit: usize,
+}
+
+impl<S: NegStorage> Initiator<S> {
+    /// `frame_limit` caps each outgoing message in bytes (before hex), 0 for no
+    /// cap. Keep it under what the responder accepts in one websocket message,
+    /// halved for the hex: strfry takes 128 KiB messages, so 60 000 is safe.
+    pub fn new(storage: S, frame_limit: usize) -> Result<Initiator<S>, NegError> {
+        if frame_limit != 0 && frame_limit < MIN_FRAME_LIMIT {
+            return Err(NegError::FrameLimitTooSmall);
+        }
+        Ok(Initiator { storage, frame_limit })
+    }
+
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    /// The opening message: the whole set as 16 fingerprints (or one id list
+    /// when it holds fewer than 32 items). Always small, whatever the set.
+    pub fn initiate(&self) -> Vec<u8> {
+        let mut out = vec![PROTOCOL_VERSION];
+        let mut c = Codec { last_in: 0, last_out: 0 };
+        split_range(&self.storage, &mut c, 0, self.storage.size(), Bound::ts(u64::MAX), &mut out);
+        out
+    }
+
+    /// Takes the responder's message. Ids found only on this side are appended
+    /// to `have`, ids found only on the other to `need`. Returns the next
+    /// message to send, or `None` once the sets are reconciled.
+    pub fn reconcile(&self, mut q: &[u8], have: &mut Vec<[u8; ID_SIZE]>, need: &mut Vec<[u8; ID_SIZE]>) -> Result<Option<Vec<u8>>, NegError> {
+        let s = &self.storage;
+        let mut out = vec![PROTOCOL_VERSION];
+        let (&version, rest) = q.split_first().ok_or(NegError::Truncated)?;
+        q = rest;
+        if !(0x60..=0x6F).contains(&version) {
+            return Err(NegError::BadVersion);
+        }
+        if version != PROTOCOL_VERSION {
+            return Err(NegError::UnsupportedVersion(version));
+        }
+        let limit = self.frame_limit;
+        let exceeded = |n: usize| limit != 0 && n > limit - 200;
+        let mut c = Codec { last_in: 0, last_out: 0 };
+        let size = s.size();
+        let mut prev_bound = Bound::ts(0);
+        let mut prev_index = 0usize;
+        let mut skip = false;
+
+        while !q.is_empty() {
+            let mut o = Vec::new();
+            let curr = c.bound_in(&mut q)?;
+            let mode = get_varint(&mut q)?;
+            let lower = prev_index;
+            let upper = s.lower_bound(prev_index, size, &curr);
+
+            match mode {
+                MODE_SKIP => skip = true,
+                MODE_FINGERPRINT => {
+                    let theirs = get_bytes(&mut q, FINGERPRINT_SIZE)?;
+                    if theirs != s.fingerprint(lower, upper) {
+                        if std::mem::take(&mut skip) {
+                            c.bound_out(&prev_bound, &mut o);
+                            put_varint(&mut o, MODE_SKIP);
+                        }
+                        split_range(s, &mut c, lower, upper, curr, &mut o);
+                    } else {
+                        skip = true;
+                    }
+                }
+                MODE_ID_LIST => {
+                    let n = get_varint(&mut q)?;
+                    // The count comes from the other side: the message must hold
+                    // that many ids before room is made for them.
+                    if n > (q.len() / ID_SIZE) as u64 {
+                        return Err(NegError::Truncated);
+                    }
+                    let mut theirs: HashSet<[u8; ID_SIZE]> = HashSet::with_capacity(n as usize);
+                    for _ in 0..n {
+                        theirs.insert(get_bytes(&mut q, ID_SIZE)?.try_into().unwrap());
+                    }
+                    for i in lower..upper {
+                        let id = s.item(i).1;
+                        if !theirs.remove(&id) {
+                            have.push(id);
+                        }
+                    }
+                    need.extend(theirs);
+                    // Settled: nothing goes back for this range.
+                    skip = true;
+                }
+                _ => return Err(NegError::BadMode),
+            }
+
+            if exceeded(out.len() + o.len()) {
+                // Out of room: the rest of our set as one fingerprint, which the
+                // responder splits again in its answer.
+                let fp = s.fingerprint(upper, size);
+                c.bound_out(&Bound::ts(u64::MAX), &mut out);
+                put_varint(&mut out, MODE_FINGERPRINT);
+                out.extend_from_slice(&fp);
+                break;
+            }
+            out.extend_from_slice(&o);
+            prev_index = upper;
+            prev_bound = curr;
+        }
+        Ok((out.len() > 1).then_some(out))
+    }
 }
 
 fn split_range(s: &impl NegStorage, c: &mut Codec, lower: usize, upper: usize, upper_bound: Bound, o: &mut Vec<u8>) {

@@ -252,7 +252,10 @@ name = "relay-net"
 version = "0.1.0"
 dependencies = [
  "miniz_oxide",
+ "rustls",
  "tokio",
+ "tokio-rustls",
+ "webpki-roots",
 ]
 
 [[package]]

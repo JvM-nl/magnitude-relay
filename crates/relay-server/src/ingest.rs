@@ -30,7 +30,8 @@ const CONTROL_TICK: Duration = Duration::from_millis(2);
 /// Set on SIGTERM: the writer finishes the batch in flight, syncs, and returns.
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// What the admin socket asks of the writer, which alone may change the store.
+/// What the relay itself asks of the writer, which alone may change the store:
+/// the admin socket's operator commands, and events another relay sent us.
 /// The writer takes one between batches, so live writes wait for at most one.
 pub enum Control {
     /// Kill whichever of these events are still live; the reply is how many were.
@@ -41,7 +42,15 @@ pub enum Control {
     BeginBackup { reply: Sender<io::Result<relay_store::backup::Plan>> },
     /// The backup is over (finished or not): log compaction may go on.
     EndBackup { reply: Sender<io::Result<()>> },
+    /// Store these records exactly as a client's EVENTs are stored: the same
+    /// rules, relayed live to subscribers, answered once durable. They must
+    /// already be verified and allowed by the policy, as a reactor's are.
+    Ingest { recs: Vec<Vec<u8>>, reply: IngestReply },
 }
+
+/// Gets one outcome per record, in order, once the batch is on disk; `None`
+/// when it could not be written.
+pub type IngestReply = Box<dyn FnOnce(Option<Vec<Outcome>>) + Send>;
 
 pub(crate) fn control(w: &mut Writer, c: Control) {
     match c {
@@ -60,6 +69,9 @@ pub(crate) fn control(w: &mut Writer, c: Control) {
         Control::EndBackup { reply } => {
             let _ = reply.send(w.end_backup());
         }
+        // The writer loop stores these itself (it has the reactors to tell);
+        // anywhere else there is no writer to store them through.
+        Control::Ingest { reply, .. } => reply(None),
     }
 }
 
@@ -132,12 +144,13 @@ pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// Runs the writer until every sender is gone.
 /// A published batch whose OKs wait for its sync.
 struct SyncJob {
     ticket: Option<SyncTicket>,
     replies: Vec<Vec<Reply>>,
     gen: u64,
+    /// Told whether the sync failed, after it: how an ingested batch is answered.
+    done: Option<Box<dyn FnOnce(bool) + Send>>,
 }
 
 /// Syncs published batches in order, coalescing whatever has queued into one
@@ -175,10 +188,80 @@ fn syncer(rx: Receiver<SyncJob>, sinks: Vec<Sink>) {
             for s in &sinks {
                 s(ReactorMsg::Replies(msg.clone()));
             }
+            if let Some(done) = j.done {
+                done(failed);
+            }
         }
     }
 }
 
+/// One batch through the writer, as [`commit`] leaves it.
+struct Committed {
+    /// Per record; all `None` when the batch could not be written.
+    outcomes: Vec<Option<Outcome>>,
+    /// The sync still owed, unless writing failed.
+    ticket: Option<SyncTicket>,
+    /// For the RELAY_DEBUG_WRITER timings.
+    stage_secs: f64,
+    finish_secs: f64,
+}
+
+/// Stages and publishes one batch, relaying what was stored to every reactor
+/// at once (live delivery does not wait for the disk; only the answers do).
+fn commit(w: &mut Writer, recs: &[&[u8]], received: Instant, sinks: &[Sink]) -> Committed {
+    let failed = |stage_secs| Committed { outcomes: vec![None; recs.len()], ticket: None, stage_secs, finish_secs: 0.0 };
+    let t_stage = Instant::now();
+    let staged = w.stage(recs);
+    let stage_secs = t_stage.elapsed().as_secs_f64();
+    let (outcomes, staged) = match staged {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("write failed: {e}");
+            return failed(stage_secs);
+        }
+    };
+    let gen = w.next_gen();
+    let t_finish = Instant::now();
+    match w.publish_staged(staged) {
+        Ok(ticket) => {
+            let finish_secs = t_finish.elapsed().as_secs_f64();
+            // Published as `gen`: relay what was stored right away. The sync
+            // runs on the syncer thread and gates only the answers.
+            let events: Vec<Arc<[u8]>> =
+                recs.iter().zip(&outcomes).filter(|(_, o)| matches!(o, Outcome::Stored(_))).map(|(r, _)| Arc::<[u8]>::from(*r)).collect();
+            if !events.is_empty() {
+                let live = Arc::new(LiveBatch { gen, events, received, sent: Instant::now() });
+                for s in sinks {
+                    s(ReactorMsg::Live(live.clone()));
+                }
+            }
+            Committed { outcomes: outcomes.into_iter().map(Some).collect(), ticket: Some(ticket), stage_secs, finish_secs }
+        }
+        Err(e) => {
+            eprintln!("write failed: {e}");
+            failed(stage_secs)
+        }
+    }
+}
+
+/// A batch the relay itself handed in (see [`Control::Ingest`]).
+fn ingest(w: &mut Writer, store: &Store, recs: Vec<Vec<u8>>, reply: IngestReply, sinks: &[Sink], sync_tx: &std::sync::mpsc::Sender<SyncJob>) {
+    let refs: Vec<&[u8]> = recs.iter().map(Vec::as_slice).collect();
+    let Committed { outcomes, ticket, .. } = commit(w, &refs, Instant::now(), sinks);
+    let Some(ticket) = ticket else { return reply(None) };
+    let outcomes: Vec<Outcome> = outcomes.into_iter().flatten().collect();
+    // Reactors get an (empty) answer too: it is how they learn the batch they
+    // were relayed live has been published.
+    let replies = (0..sinks.len()).map(|_| Vec::new()).collect();
+    let done = Box::new(move |failed: bool| reply((!failed).then_some(outcomes)));
+    if let Err(e) = sync_tx.send(SyncJob { ticket: Some(ticket), replies, gen: store.generation(), done: Some(done) }) {
+        if let Some(done) = e.0.done {
+            done(true);
+        }
+    }
+}
+
+/// Runs the writer until every sender is gone.
 pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, ctl: Receiver<Control>, sinks: Vec<Sink>, reply_sinks: Vec<Sink>) {
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<SyncJob>();
     let sync_thread = std::thread::Builder::new().name("syncer".into()).spawn(move || syncer(sync_rx, reply_sinks)).expect("syncer thread");
@@ -189,8 +272,12 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, ctl: Receiver<Co
     let (mut d_batches, mut d_events, mut d_stage, mut d_finish, mut d_idle, mut d_queue) = (0u64, 0u64, 0f64, 0f64, 0f64, 0f64);
     let mut d_last = Instant::now();
     loop {
-        // Operator work gets a turn between batches, one piece at a time.
+        // Operator work and synced events get a turn between batches, one piece at a time.
         let wait = match ctl.try_recv() {
+            Ok(Control::Ingest { recs, reply }) => {
+                ingest(&mut w, &store, recs, reply, &sinks, &sync_tx);
+                CONTROL_TICK
+            }
             Ok(c) => {
                 control(&mut w, c);
                 CONTROL_TICK
@@ -235,46 +322,9 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, ctl: Receiver<Co
         }
 
         d_idle += wait_started.elapsed().as_secs_f64();
-        let t_stage = Instant::now();
         let refs: Vec<&[u8]> = reqs.iter().map(|r| r.rec.as_slice()).collect();
-        let staged = w.stage(&refs);
-        let stage_secs = t_stage.elapsed().as_secs_f64();
-        let mut finish_secs = 0f64;
-        let gen = w.next_gen();
-        let n = reqs.len();
-        let (outcomes, ticket): (Vec<Option<Outcome>>, Option<SyncTicket>) = match staged {
-            Ok((outcomes, staged)) => {
-                let t_finish = Instant::now();
-                match w.publish_staged(staged) {
-                    Ok(ticket) => {
-                        finish_secs = t_finish.elapsed().as_secs_f64();
-                        // Published as `gen`: relay what was stored right away. The
-                        // sync runs on the syncer thread and gates only the OKs.
-                        let events: Vec<Arc<[u8]>> = reqs
-                            .iter()
-                            .zip(&outcomes)
-                            .filter(|(_, o)| matches!(o, Outcome::Stored(_)))
-                            .map(|(r, _)| Arc::<[u8]>::from(r.rec.as_slice()))
-                            .collect();
-                        if !events.is_empty() {
-                            let live = Arc::new(LiveBatch { gen, events, received, sent: Instant::now() });
-                            for s in &sinks {
-                                s(ReactorMsg::Live(live.clone()));
-                            }
-                        }
-                        (outcomes.into_iter().map(Some).collect(), Some(ticket))
-                    }
-                    Err(e) => {
-                        eprintln!("write failed: {e}");
-                        (vec![None; n], None)
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("write failed: {e}");
-                (vec![None; n], None)
-            }
-        };
+        let Committed { outcomes, ticket, stage_secs, finish_secs } = commit(&mut w, &refs, received, &sinks);
+        drop(refs);
         let outcomes_len = outcomes.len() as u64;
         let mut replies: Vec<Vec<Reply>> = (0..sinks.len()).map(|_| Vec::new()).collect();
         for (r, outcome) in reqs.drain(..).zip(outcomes) {
@@ -283,7 +333,7 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, ctl: Receiver<Co
         }
         // OKs, duplicates included, wait for the sync of this batch (and so of
         // every batch before it).
-        let _ = sync_tx.send(SyncJob { ticket, replies, gen: store.generation() });
+        let _ = sync_tx.send(SyncJob { ticket, replies, gen: store.generation(), done: None });
         if debug {
             d_batches += 1;
             d_events += outcomes_len;

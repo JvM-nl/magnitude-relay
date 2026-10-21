@@ -6,8 +6,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# wss:// for the client side (connector.rs): rustls with the ring provider,
+# trusting webpki-roots. Off by default; only the relay's sync needs it.
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
+
 [dependencies]
 tokio.workspace = true
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Reference codec for tests and the benchmark example only: our own DEFLATE is

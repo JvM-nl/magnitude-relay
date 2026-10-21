@@ -27,7 +27,8 @@ sha2 = { version = "0.10", features = ["asm"] }
 libc = "0.2"
 # TLS and cryptography are never written in-house: rustls (ring provider, no
 # aws-lc), its tokio glue, ring for the ACME account's signatures, and the CA
-# trust store our ACME client uses. Only relay-tls depends on them at run time.
+# trust store our ACME client uses. Only relay-tls depends on them at run time,
+# and relay-net's `tls` feature (wss:// to other relays, for sync).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
@@ -44,3 +45,14 @@ debug = 1
 [profile.bench]
 inherits = "release"
 debug = 1
+
+# The reference negentropy crate is only ever a test oracle; optimised, the
+# interop tests over a million items run in seconds rather than half a minute.
+[profile.dev.package.negentropy]
+opt-level = 3
+
+# libsecp256k1 (C) optimised in debug builds too: tests sign and verify
+# hundreds of thousands of events, ten times slower unoptimised. Our own code
+# stays at the debug level.
+[profile.dev.package.secp256k1-sys]
+opt-level = 3

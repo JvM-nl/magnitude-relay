@@ -176,6 +176,26 @@ fn deletions_follow_concord() {
     assert_eq!(write(&mut w, &[ev(1, 5, 100, 1059, &format!(r#"[["p","{recipient}"]]"#), "wrap")]), vec![Outcome::Deleted]);
 }
 
+/// A sync can bring a deletion before the event it deletes: the tombstone
+/// must hold for an event this store has never seen.
+#[test]
+fn deletions_that_arrive_first_hold() {
+    let dir = tmpdir("del-first");
+    let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+    let recipient = pk(9);
+    let note = ev(1, 3, 100, 1, "[]", "note");
+    let wrap = ev(2, 4, 100, 1059, &format!(r#"[["p","{recipient}"]]"#), "wrap");
+    let by_author = ev(3, 3, 200, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "");
+    let by_recipient = ev(4, 9, 200, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 2)), "");
+    assert!(write(&mut w, &[by_author, by_recipient]).iter().all(|o| matches!(o, Outcome::Stored(_))));
+    assert_eq!(write(&mut w, &[note.clone(), wrap.clone()]), vec![Outcome::Deleted, Outcome::Deleted]);
+    // From index segments too, after a reopen.
+    w.compact_all().unwrap();
+    drop((_store, w));
+    let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(write(&mut w, &[note, wrap]), vec![Outcome::Deleted, Outcome::Deleted]);
+}
+
 #[test]
 fn ordering_ties_and_limits() {
     let dir = tmpdir("ties");
@@ -441,8 +461,8 @@ fn vanish_nip62() {
     assert!(ids(&store, &format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##), 10).is_empty());
     assert_eq!(ids(&store, r#"{"kinds":[0]}"#, 10), vec![id_of(4)]);
     // Older events from me, or wraps to me, cannot come back; newer ones can.
-    assert_eq!(write(&mut w, &[ev(7, 40, 150, 0, "[]", "old")]), vec![Outcome::Deleted]);
-    assert_eq!(write(&mut w, &[ev(8, 43, 150, 1059, &format!(r#"[["p","{me}"]]"#), "old wrap")]), vec![Outcome::Deleted]);
+    assert_eq!(write(&mut w, &[ev(7, 40, 150, 0, "[]", "old")]), vec![Outcome::Vanished]);
+    assert_eq!(write(&mut w, &[ev(8, 43, 150, 1059, &format!(r#"[["p","{me}"]]"#), "old wrap")]), vec![Outcome::Vanished]);
     assert!(matches!(write(&mut w, &[ev(9, 40, 300, 0, "[]", "new me")])[0], Outcome::Stored(_)));
     // A Concord plane key (it authored wraps) cannot vanish.
     let r = write(&mut w, &[ev(10, 41, 400, 62, r#"[["relay","wss://relay.example/nostr/"]]"#, "")]);
@@ -451,7 +471,7 @@ fn vanish_nip62() {
     // All of it holds after a restart.
     let (store, mut w) = Store::open(&dir, opts()).unwrap();
     assert!(ids(&store, &format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##), 10).is_empty());
-    assert_eq!(write(&mut w, &[ev(11, 40, 199, 30078, r#"[["d","x"]]"#, "old")]), vec![Outcome::Deleted]);
+    assert_eq!(write(&mut w, &[ev(11, 40, 199, 30078, r#"[["d","x"]]"#, "old")]), vec![Outcome::Vanished]);
 }
 
 #[test]

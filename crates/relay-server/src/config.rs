@@ -16,6 +16,7 @@
 use crate::toml::{self, Document, Entry, Value};
 use crate::brand;
 use relay_proto::json::escape_str;
+use relay_proto::Filter;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -100,7 +101,11 @@ const KEYS: &[(&str, &[&str])] = &[
     ),
     ("store", &["data", "sync", "segment_mb", "memory_mb"]),
     ("tls", &["enabled", "domains", "email", "https_bind", "http_bind", "cert", "key", "staging", "directory"]),
+    ("sync", &["url", "filter", "direction", "reconcile_seconds"]),
 ];
+
+/// Sections written `[[name]]`: there may be any number of each.
+const LISTS: &[&str] = &["sync"];
 
 /// Builds the error for a rule that relates settings, blaming the first of `keys` the file wrote.
 type Blame<'a> = dyn Fn(&[(&str, &str)], String) -> ConfigError + 'a;
@@ -118,6 +123,8 @@ pub struct Config {
     pub limits: LimitsCfg,
     pub store: StoreCfg,
     pub tls: TlsCfg,
+    /// One per `[[sync]]` block, in file order.
+    pub sync: Vec<SyncCfg>,
 }
 
 /// `[relay]`: where and how to listen.
@@ -303,6 +310,65 @@ impl TlsCfg {
             }
         }
         out
+    }
+}
+
+/// `[[sync]]`: another relay to copy events from or to, and keep in step with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncCfg {
+    /// `ws://` or `wss://`.
+    pub url: String,
+    /// The events to sync: one filter, or several (their union). `{}` is everything.
+    pub filters: Vec<Filter>,
+    pub direction: Direction,
+    /// Between two full comparisons new events stream live; the comparison
+    /// catches whatever the stream missed (a disconnect, a restart).
+    pub reconcile_seconds: u64,
+}
+
+/// Which way a sync copies events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Theirs to us.
+    Down,
+    /// Ours to them.
+    Up,
+    Both,
+}
+
+impl Direction {
+    pub const NAMES: [&'static str; 3] = ["down", "up", "both"];
+
+    pub fn parse(s: &str) -> Option<Direction> {
+        match s {
+            "down" => Some(Direction::Down),
+            "up" => Some(Direction::Up),
+            "both" => Some(Direction::Both),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Direction::Down => "down",
+            Direction::Up => "up",
+            Direction::Both => "both",
+        }
+    }
+
+    pub fn down(self) -> bool {
+        matches!(self, Direction::Down | Direction::Both)
+    }
+
+    pub fn up(self) -> bool {
+        matches!(self, Direction::Up | Direction::Both)
+    }
+}
+
+impl Default for SyncCfg {
+    /// Everything, theirs to us, compared hourly. No url: one must be given.
+    fn default() -> Self {
+        SyncCfg { url: String::new(), filters: vec![Filter::default()], direction: Direction::Down, reconcile_seconds: 3600 }
     }
 }
 
@@ -552,6 +618,14 @@ impl Config {
             if !KEYS.iter().any(|(s, _)| *s == sec.name) {
                 return Err(ConfigError::at(sec.line, unknown_section(&sec.name)));
             }
+            let list = LISTS.contains(&sec.name.as_str());
+            if sec.array && !list {
+                return Err(ConfigError::at(sec.line, format!("write [{0}] with single brackets: there is only one [{0}] section", sec.name)));
+            }
+            if list && !sec.array {
+                return Err(ConfigError::at(sec.line, format!("write [[{0}]] with double brackets: there can be one for each relay", sec.name)));
+            }
+            let mut sync = SyncCfg::default();
             for e in &sec.entries {
                 let applied = match sec.name.as_str() {
                     "relay" => apply_relay(&mut cfg.relay, e),
@@ -560,6 +634,7 @@ impl Config {
                     "limits" => apply_limits(&mut cfg.limits, e),
                     "store" => apply_store(&mut cfg.store, e),
                     "tls" => apply_tls(&mut cfg.tls, e),
+                    "sync" => apply_sync(&mut sync, e),
                     _ => Ok(false),
                 };
                 match applied {
@@ -567,6 +642,12 @@ impl Config {
                     Ok(false) => return Err(ConfigError::at(e.line, unknown_key(&sec.name, &e.key))),
                     Err(msg) => return Err(ConfigError::at(e.line, msg)),
                 }
+            }
+            if sec.name == "sync" {
+                if sync.url.is_empty() {
+                    return Err(ConfigError::at(sec.line, "this [[sync]] has no url: name the relay, like url = \"wss://relay.example.com\""));
+                }
+                cfg.sync.push(sync);
             }
         }
         cfg.check_together(&doc)?;
@@ -731,7 +812,8 @@ impl Obj {
     }
 }
 
-fn json_str(s: &str) -> String {
+/// `s` as a JSON string literal, quotes included.
+pub fn json_str(s: &str) -> String {
     let mut v = Vec::with_capacity(s.len() + 2);
     v.push(b'"');
     escape_str(s, &mut v);
@@ -1071,6 +1153,31 @@ fn apply_tls(c: &mut TlsCfg, e: &Entry) -> Result<bool, String> {
     Ok(true)
 }
 
+fn apply_sync(c: &mut SyncCfg, e: &Entry) -> Result<bool, String> {
+    match e.key.as_str() {
+        "url" => {
+            let s = string(e)?;
+            relay_net::connector::RelayUrl::parse(s)?;
+            c.url = s.to_string();
+        }
+        "filter" => {
+            c.filters = crate::operator::parse_filters(string(e)?).map_err(|why| {
+                format!("`filter` must be a Nostr filter in JSON, like '{{\"kinds\":[0]}}' (in single quotes), or a list of them: {why}")
+            })?;
+        }
+        "direction" => {
+            let s = string(e)?;
+            c.direction = Direction::parse(s).ok_or_else(|| {
+                let hint = suggest(s, &Direction::NAMES).map(|d| format!(" (did you mean \"{d}\"?)")).unwrap_or_default();
+                format!("`direction` is \"down\" (theirs to us), \"up\" (ours to them) or \"both\", not \"{s}\"{hint}")
+            })?;
+        }
+        "reconcile_seconds" => c.reconcile_seconds = int(e, 1, 30 * 86_400)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Messages for names the relay does not know.
 
@@ -1347,6 +1454,27 @@ const TEMPLATE: &str = r##"# {name} settings
 # Another ACME certificate authority, as its directory address (an https:// URL).
 # Empty means Let's Encrypt.
 # directory = ""
+
+# Other relays to copy events from, or to, and keep in step with: one block
+# like the one below for each. Nothing is synced unless you add one. The two
+# relays first compare what they hold (NIP-77: only the differences travel),
+# then new events stream live, and the comparison runs again every
+# reconcile_seconds to catch anything the stream missed. Events copied in are
+# checked like any app's: signatures, the kinds accepted here, deletions.
+#
+# [[sync]]
+# url = "wss://relay.example.com"
+
+# Which events: a Nostr filter in JSON, or a list of filters. Put JSON in
+# 'single quotes' so its own quotes need no backslashes, as in
+# '{"kinds":[0,10002]}'. The default, "{}", means every event.
+# filter = "{}"
+
+# "down" copies their events here, "up" copies ours to them, "both" does both.
+# direction = "down"
+
+# Seconds between full comparisons. New events arrive live in between.
+# reconcile_seconds = 3600
 "##;
 
 #[cfg(test)]
@@ -1398,22 +1526,27 @@ mod tests {
 
         // Uncomment every `# key = value` line and the result must still be the
         // defaults: the documented values are the real ones, and every key in the
-        // file is a key the parser accepts.
+        // file is a key the parser accepts. A list section's header is commented
+        // out too (there are none by default); uncommented, its block is one
+        // entry holding the example url and every other default.
         let mut seen: Vec<String> = Vec::new();
         let uncommented: String = text
             .lines()
             .map(|l| {
                 let setting = l.strip_prefix("# ").and_then(|r| r.split_once(" = ")).filter(|(k, _)| KEYS.iter().any(|(_, ks)| ks.contains(k)));
+                let list_header = LISTS.iter().any(|s| l == format!("# [[{s}]]"));
                 match setting {
                     Some((k, _)) => {
                         seen.push(k.to_string());
                         format!("{}\n", &l[2..])
                     }
+                    None if list_header => format!("{}\n", &l[2..]),
                     None => format!("{l}\n"),
                 }
             })
             .collect();
-        assert_eq!(ok(&uncommented), Config::default(), "with every setting uncommented");
+        let example = SyncCfg { url: "wss://relay.example.com".into(), ..SyncCfg::default() };
+        assert_eq!(ok(&uncommented), Config { sync: vec![example], ..Config::default() }, "with every setting uncommented");
 
         // Every key is documented exactly once, under its own header.
         let all: Vec<&str> = KEYS.iter().flat_map(|(_, ks)| ks.iter().copied()).collect();
@@ -1428,7 +1561,50 @@ mod tests {
             assert_eq!(&got, keys, "[{section}] keys, in order");
         }
         assert!(text.lines().all(|l| l.chars().count() <= 90), "keep lines short enough for a terminal");
-        assert!(text.contains(brand::NAME) && !text.contains('{'), "placeholders replaced");
+        assert!(text.contains(brand::NAME), "the name is filled in");
+        for placeholder in ["{name}", "{slug}", "{vector_kinds}"] {
+            assert!(!text.contains(placeholder), "{placeholder} replaced");
+        }
+    }
+
+    #[test]
+    fn sync_blocks() {
+        let c = ok(r##"
+[[sync]]
+url = "ws://127.0.0.1:7777"
+
+[[sync]]
+url = "wss://relay.example.com/nostr"
+filter = '[{"kinds":[0,10002]},{"kinds":[1059],"#p":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}]'
+direction = "both"
+reconcile_seconds = 60
+"##);
+        assert_eq!(c.sync.len(), 2);
+        assert_eq!(c.sync[0], SyncCfg { url: "ws://127.0.0.1:7777".into(), ..SyncCfg::default() });
+        let s = &c.sync[1];
+        assert_eq!((s.url.as_str(), s.direction, s.reconcile_seconds, s.filters.len()), ("wss://relay.example.com/nostr", Direction::Both, 60, 2));
+        assert_eq!(s.filters[0].kinds, Some(vec![0, 10002]));
+        assert!(s.direction.up() && s.direction.down() && !Direction::Down.up() && !Direction::Up.down());
+        // Everything else is untouched.
+        assert_eq!(Config { sync: Vec::new(), ..c }, Config::default());
+    }
+
+    #[test]
+    fn sync_mistakes() {
+        fails("[sync]\nurl = \"ws://h\"", Some(1), "write [[sync]] with double brackets");
+        fails("[[relay]]\nthreads = 1", Some(1), "write [relay] with single brackets");
+        fails("[[sync]]\nfilter = \"{}\"\n", Some(1), "has no url");
+        fails("[[sync]]\nurl = \"ws://h\"\n[[sync]]\ndirection = \"up\"\n", Some(3), "has no url");
+        fails("[[sync]]\nurl = \"http://h\"", Some(2), "must start with ws:// or wss://");
+        fails("[[sync]]\nurl = \"ws://h:99999\"", Some(2), "bad port");
+        fails("[[sync]]\nurl = \"ws://h\"\nfilter = \"kinds\"", Some(3), "must be a Nostr filter in JSON");
+        fails("[[sync]]\nurl = \"ws://h\"\nfilter = '{\"limit\":5}'", Some(3), "limit");
+        fails("[[sync]]\nurl = \"ws://h\"\nfilter = '{\"kinds\":[1],\"nope\":1}'", Some(3), "unknown key");
+        fails("[[sync]]\nurl = \"ws://h\"\ndirection = \"dwon\"", Some(3), "did you mean \"down\"?");
+        fails("[[sync]]\nurl = \"ws://h\"\ndirection = \"sideways\"", Some(3), "\"down\" (theirs to us)");
+        fails("[[sync]]\nurl = \"ws://h\"\nreconcile_seconds = 0", Some(3), "between 1 and");
+        fails("[[sync]]\nurl = \"ws://h\"\nbind = \"x\"", Some(3), "`bind` belongs in [relay]");
+        fails("[relay]\nurl = \"ws://h\"", Some(2), "`url` belongs in [sync]");
     }
 
     #[test]

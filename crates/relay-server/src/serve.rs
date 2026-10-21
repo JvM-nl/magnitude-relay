@@ -28,21 +28,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let https_bind = cfg.tls.enabled.then_some(cfg.tls.https_bind);
     let http_bind = cfg.tls.http_bind.filter(|_| cfg.tls.enabled);
 
-    let kinds = cfg.policy.kind_policy();
-    let scfg = SessionCfg {
-        max_subscriptions: cfg.limits.max_subscriptions,
-        max_filters: cfg.limits.max_filters,
-        max_filter_values: cfg.limits.max_filter_values,
-        default_limit: cfg.limits.default_limit,
-        max_limit: cfg.limits.max_limit,
-        max_event_bytes: cfg.policy.max_event_bytes,
-        max_future_seconds: cfg.policy.max_future_seconds,
-        max_tags: cfg.policy.max_tags,
-        kind_allowed: Box::new(move |k| kinds.allows(k)),
-    };
+    let scfg = Arc::new(SessionCfg::from_config(&cfg));
+    let syncs = cfg.sync.clone();
 
     let (wtx, wrx) = mpsc::sync_channel(WRITE_QUEUE);
-    let shared = Arc::new(Shared::new(cfg, scfg, store.clone(), wtx, threads));
+    let shared = Arc::new(Shared::new(cfg, scfg.clone(), store.clone(), wtx, threads));
     let mut txs = Vec::with_capacity(threads);
     let mut rxs = Vec::with_capacity(threads);
     for _ in 0..threads {
@@ -77,10 +67,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Ready before the relay's own port is, so that a script which waits for
     // the port can run operator commands at once. Not fatal: the relay serves
     // without it.
-    let admin = match admin::start(&data, admin_store, ctl_tx) {
+    let admin = match admin::start(&data, admin::Ctx { store: admin_store.clone(), ctl: ctl_tx.clone(), policy: scfg.clone() }) {
         Ok(a) => Some(a),
         Err(e) => {
-            eprintln!("admin socket unavailable ({e}): query, count and delete cannot reach this relay while it runs");
+            eprintln!("admin socket unavailable ({e}): query, count, delete and sync cannot reach this relay while it runs");
             None
         }
     };
@@ -120,6 +110,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
         std::thread::Builder::new().name("acceptor-tls".into()).spawn(move || reactor::accept_loop(tl, conns, Some(config))).map_err(|e| e.to_string())?;
     }
     std::thread::Builder::new().name("acceptor".into()).spawn(move || reactor::accept_loop(l, conn_txs, None)).map_err(|e| e.to_string())?;
+    // Other relays to keep in step with, on a thread of their own.
+    crate::sync::live::start(syncs, shared.sync.clone(), admin_store, ctl_tx, scfg).map_err(|e| format!("cannot start syncing: {e}"))?;
     eprintln!(
         "{} {} listening on {bind}: {threads} reactors, {events} events, ready in {:.2}s",
         crate::brand::NAME,

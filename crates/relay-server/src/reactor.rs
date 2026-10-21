@@ -40,7 +40,9 @@ const MAX_HEAD: usize = 8 * 1024;
 /// touched on connect, disconnect and EVENT.
 pub struct Shared {
     pub cfg: Config,
-    pub scfg: SessionCfg,
+    /// Shared with the admin socket and the sync thread, which hold events to
+    /// the same policy as the reactors.
+    pub scfg: Arc<SessionCfg>,
     pub store: Store,
     pub writer: SyncSender<WriteReq>,
     pub reactors: OnceLock<Vec<mpsc::UnboundedSender<ReactorMsg>>>,
@@ -50,6 +52,8 @@ pub struct Shared {
     pub next_conn: AtomicU64,
     ips: Mutex<FxMap<IpAddr, IpState>>,
     pub metrics: Metrics,
+    /// One per `[[sync]]` entry.
+    pub sync: Vec<Arc<crate::sync::live::Stats>>,
 }
 
 struct IpState {
@@ -60,8 +64,9 @@ struct IpState {
 }
 
 impl Shared {
-    pub fn new(cfg: Config, scfg: SessionCfg, store: Store, writer: SyncSender<WriteReq>, reactors: usize) -> Shared {
+    pub fn new(cfg: Config, scfg: Arc<SessionCfg>, store: Store, writer: SyncSender<WriteReq>, reactors: usize) -> Shared {
         let nip11 = cfg.nip11_json();
+        let sync = crate::sync::live::stats_for(&cfg.sync);
         Shared {
             cfg,
             scfg,
@@ -73,6 +78,7 @@ impl Shared {
             next_conn: AtomicU64::new(1),
             ips: Mutex::new(FxMap::default()),
             metrics: Metrics::new(reactors),
+            sync,
         }
     }
 
