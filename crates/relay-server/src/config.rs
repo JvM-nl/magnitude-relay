@@ -38,6 +38,11 @@ pub const VECTOR_KINDS: &[u64] = &[
     62,
     // Gift wrap: DM, Concord stream wrap and direct invite.
     1059,
+    // Concord events from before seals, published bare: today's Concord sends
+    // these kinds only inside gift wraps, and 3300, 3301, 3304, 3305, 3307 and
+    // 3311 are retired outright. Still accepted and stored until November 2026,
+    // then removed (owner's call, 2026-10-21); production strfry holds 43k.
+    3300, 3301, 3302, 3303, 3304, 3305, 3306, 3307, 3308, 3309, 3310, 3311, 3314,
     // Relay list.
     10002,
     // Emoji list.
@@ -79,7 +84,7 @@ pub const SUPPORTED_NIPS: &[u32] = &[1, 9, 11, 40, 45, 59, 62, 70, 77];
 /// Every section and its keys. The single source for "did you mean" hints and
 /// for the test that keeps the documented default file complete.
 const KEYS: &[(&str, &[&str])] = &[
-    ("relay", &["bind", "threads", "real_ip_header", "urls", "compression"]),
+    ("relay", &["bind", "unix_socket", "unix_socket_mode", "threads", "real_ip_header", "urls", "compression"]),
     (
         "info",
         &["name", "description", "pubkey", "contact", "icon", "banner", "privacy_policy", "terms_of_service", "privacy_addresses"],
@@ -131,6 +136,11 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayCfg {
     pub bind: SocketAddr,
+    /// A Unix socket to listen on as well, for a web server on the same
+    /// machine; empty for none.
+    pub unix_socket: String,
+    /// Its permission bits.
+    pub unix_socket_mode: u32,
     /// 0 = one reactor per hardware thread.
     pub threads: usize,
     /// Lowercase header naming the real client address, or empty to trust the
@@ -377,6 +387,8 @@ impl Default for RelayCfg {
         // 7777 is strfry's port, so an existing nginx upstream keeps working.
         RelayCfg {
             bind: SocketAddr::from(([127, 0, 0, 1], 7777)),
+            unix_socket: String::new(),
+            unix_socket_mode: 0o666,
             threads: 0,
             real_ip_header: String::new(),
             urls: Vec::new(),
@@ -909,6 +921,14 @@ fn bind_addr(key: &str, s: &str, port: u16) -> Result<SocketAddr, String> {
 fn apply_relay(c: &mut RelayCfg, e: &Entry) -> Result<bool, String> {
     match e.key.as_str() {
         "bind" => c.bind = bind_addr("bind", string(e)?, 7777)?,
+        "unix_socket" => c.unix_socket = string(e)?.to_string(),
+        "unix_socket_mode" => {
+            let s = string(e)?;
+            c.unix_socket_mode = u32::from_str_radix(s, 8)
+                .ok()
+                .filter(|m| !s.is_empty() && *m <= 0o777)
+                .ok_or_else(|| format!("`unix_socket_mode` is permission bits in octal, like \"666\" or \"660\", not \"{s}\""))?;
+        }
         "threads" => c.threads = int(e, 0, 1024)? as usize,
         "compression" => {
             c.compression = match string(e)? {
@@ -1285,6 +1305,17 @@ const TEMPLATE: &str = r##"# {name} settings
 # To accept connections from anywhere use "0.0.0.0:7777" ("[::]:7777" adds IPv6).
 # bind = "127.0.0.1:7777"
 
+# A Unix socket to listen on as well, like "/run/relay/relay.sock": a web server
+# on the same computer reaches the relay through it more cheaply than over
+# 127.0.0.1 (nginx: proxy_pass http://unix:/run/relay/relay.sock;). Its
+# directory must exist. Empty means none.
+# unix_socket = ""
+
+# Who may connect to that socket, as permission bits: "666" lets every local
+# user, as 127.0.0.1 does; "660" only the socket's owner and group (put the web
+# server's user in the relay's group).
+# unix_socket_mode = "666"
+
 # Worker threads. 0 means one per hardware thread, which is almost always right.
 # threads = 0
 
@@ -1608,12 +1639,23 @@ reconcile_seconds = 60
     }
 
     #[test]
+    fn unix_socket_modes() {
+        fails("[relay]\nunix_socket_mode = \"rw\"", Some(2), "permission bits in octal");
+        fails("[relay]\nunix_socket_mode = \"1777\"", Some(2), "permission bits in octal");
+        fails("[relay]\nunix_socket_mode = \"\"", Some(2), "permission bits in octal");
+        fails("[relay]\nunix_socket_mode = 660", Some(2), "unix_socket_mode");
+        assert_eq!(ok("[relay]\nunix_socket_mode = \"600\"").relay.unix_socket_mode, 0o600);
+    }
+
+    #[test]
     fn full_custom_file() {
         let pk = "ab".repeat(32);
         let text = format!(
             r#"
 [relay]
 bind = "0.0.0.0:8080"
+unix_socket = "/run/relay/relay.sock"
+unix_socket_mode = "0660"
 threads = 4
 real_ip_header = "X-Forwarded-For"
 compression = "full"
@@ -1662,6 +1704,8 @@ segment_mb = 64
             c.relay,
             RelayCfg {
                 bind: "0.0.0.0:8080".parse().unwrap(),
+                unix_socket: "/run/relay/relay.sock".into(),
+                unix_socket_mode: 0o660,
                 threads: 4,
                 real_ip_header: "x-forwarded-for".into(),
                 urls: Vec::new(),
