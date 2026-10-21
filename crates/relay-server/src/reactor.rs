@@ -31,6 +31,8 @@ use tokio::sync::{mpsc, Notify};
 /// A client silent this long gets a ping; silent twice as long, it is dropped.
 const IDLE_PING: Duration = Duration::from_secs(60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The longest an idle reactor keeps a replaced snapshot.
+const SNAPSHOT_MAX_AGE: Duration = Duration::from_millis(50);
 const MAX_HEAD: usize = 8 * 1024;
 
 /// State every reactor shares. Read-mostly; the only lock is the per-IP table,
@@ -215,6 +217,7 @@ pub fn run(
             pending: std::collections::VecDeque::new(),
         }));
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
+        tokio::task::spawn_local(keep_fresh(st.clone(), shared.clone()));
         while let Some((s, peer)) = conns.recv().await {
             match TcpStream::from_std(s) {
                 Ok(s) => {
@@ -224,6 +227,19 @@ pub fn run(
             }
         }
     });
+}
+
+/// Lets go of the cached snapshot once a newer version is out, even when no
+/// client message comes in to do it. The store reclaims what old versions pin
+/// (deleted records' bytes, log segments replaced by compaction) only after
+/// every reader has moved on, so an idle reactor must not hold one for long.
+async fn keep_fresh(st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(SNAPSHOT_MAX_AGE);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        shared.store.refresh(&mut st.borrow_mut().snap);
+    }
 }
 
 /// Delivers OK replies and live events from each committed batch.

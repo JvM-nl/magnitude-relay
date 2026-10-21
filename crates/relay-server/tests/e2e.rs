@@ -18,11 +18,16 @@ struct Relay {
 
 impl Relay {
     fn start(dir: PathBuf, port: u16) -> Relay {
+        Self::start_with(dir, port, "")
+    }
+
+    /// `store` is extra lines for the `[store]` section.
+    fn start_with(dir: PathBuf, port: u16, store: &str) -> Relay {
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("relay.toml");
         std::fs::write(
             &cfg,
-            format!("[relay]\nbind = \"127.0.0.1:{port}\"\nthreads = 2\n[limits]\nevents_per_minute_per_ip = 0\n[store]\ndata = \"{}\"\n", dir.join("data").display()),
+            format!("[relay]\nbind = \"127.0.0.1:{port}\"\nthreads = 2\n[limits]\nevents_per_minute_per_ip = 0\n[store]\ndata = \"{}\"\n{store}", dir.join("data").display()),
         )
         .unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_magnitude-relay"))
@@ -272,6 +277,51 @@ async fn vector_flows_end_to_end() {
     send(&mut c, json!(["REQ", "again", {"ids": [wrap["id"]], "kinds": [1059], "#p": [me.pk()]}])).await;
     let (evs, _) = collect(&mut c, "again").await;
     assert_eq!(evs.len(), 1);
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Every log file under the relay's data directory, read whole.
+fn log_bytes(dir: &std::path::Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.join("data").join("log")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            if e.path().is_dir() {
+                stack.push(e.path());
+            } else {
+                out.extend(std::fs::read(e.path()).unwrap());
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn deleted_content_leaves_the_disk_with_idle_reactors() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-zero-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    // Small log segments, so the files can be read whole while polling.
+    let relay = Relay::start_with(dir.clone(), port, "segment_mb = 16\n");
+    let host = format!("127.0.0.1:{port}");
+    let me = Signer::new(7);
+    let secret = "SECRET-SETTINGS-QQQQ";
+    let ev = me.event(now(), 30078, json!([["d", "vector/settings"]]), secret);
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    send(&mut c, json!(["EVENT", ev])).await;
+    assert!(ok_of(&mut c).await.0);
+    let del = me.event(now(), 5, json!([["e", ev["id"]]]), "");
+    send(&mut c, json!(["EVENT", del])).await;
+    assert!(ok_of(&mut c).await.0);
+    drop(c);
+    // Nothing else talks to the relay: its other reactor still holds the
+    // snapshot it took at startup, from before the deletion.
+    let t = Instant::now();
+    while log_bytes(&dir).windows(secret.len()).any(|w| w == secret.as_bytes()) {
+        assert!(t.elapsed() < Duration::from_secs(5), "deleted content still on disk after 5 s");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
