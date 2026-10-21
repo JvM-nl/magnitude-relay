@@ -25,7 +25,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Notify};
 
 /// A client silent this long gets a ping; silent twice as long, it is dropped.
@@ -154,21 +154,51 @@ impl Outbox for WsOut<'_> {
     }
 }
 
-/// Binds the listener for one reactor. On Linux every reactor binds the same
-/// port with SO_REUSEPORT and the kernel spreads connections across them.
+/// Binds the relay's one listener.
 pub fn listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     let s = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
     s.set_reuseaddr(true)?;
-    #[cfg(target_os = "linux")]
-    s.set_reuseport(true)?;
     s.set_nodelay(true)?;
     s.bind(addr)?;
     let l = s.listen(4096)?;
-    l.into_std()
+    let l = l.into_std()?;
+    // The acceptor thread blocks in accept(); connections become non-blocking
+    // when their reactor adopts them.
+    l.set_nonblocking(false)?;
+    Ok(l)
+}
+
+/// Accepts connections and deals them to reactors round-robin. SO_REUSEPORT
+/// hashing leaves reactors idle when connections are few (eight benchmark
+/// clients can land 3-3-1-1 or worse), and signature checks are per core, so an
+/// idle reactor is lost throughput; dealing in turn places them exactly.
+pub fn accept_loop(l: std::net::TcpListener, conns: Vec<mpsc::UnboundedSender<(std::net::TcpStream, SocketAddr)>>) {
+    let mut next = 0usize;
+    loop {
+        match l.accept() {
+            Ok((s, peer)) => {
+                let _ = s.set_nodelay(true);
+                if s.set_nonblocking(true).is_ok() {
+                    let _ = conns[next % conns.len()].send((s, peer));
+                    next = next.wrapping_add(1);
+                }
+            }
+            Err(e) => {
+                // Out of descriptors and the like: back off instead of spinning.
+                eprintln!("accept failed: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 /// Runs reactor `idx` on the current thread until the process exits.
-pub fn run(idx: usize, shared: Arc<Shared>, listener: Option<std::net::TcpListener>, rx: mpsc::UnboundedReceiver<ReactorMsg>) {
+pub fn run(
+    idx: usize,
+    shared: Arc<Shared>,
+    mut conns: mpsc::UnboundedReceiver<(std::net::TcpStream, SocketAddr)>,
+    rx: mpsc::UnboundedReceiver<ReactorMsg>,
+) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
@@ -182,24 +212,12 @@ pub fn run(idx: usize, shared: Arc<Shared>, listener: Option<std::net::TcpListen
             scratch: vec![0; READ_CHUNK],
         }));
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
-        let Some(l) = listener else {
-            // No listener of its own (non-Linux): this reactor only fans out.
-            std::future::pending::<()>().await;
-            return;
-        };
-        l.set_nonblocking(true).expect("nonblocking listener");
-        let l = TcpListener::from_std(l).expect("listener");
-        loop {
-            match l.accept().await {
-                Ok((s, peer)) => {
-                    let _ = s.set_nodelay(true);
+        while let Some((s, peer)) = conns.recv().await {
+            match TcpStream::from_std(s) {
+                Ok(s) => {
                     tokio::task::spawn_local(connection(s, peer, st.clone(), shared.clone()));
                 }
-                Err(e) => {
-                    // Out of descriptors and the like: back off instead of spinning.
-                    eprintln!("accept failed: {e}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                Err(e) => eprintln!("cannot adopt connection: {e}"),
             }
         }
     });
@@ -472,6 +490,9 @@ async fn plain_http(s: &mut TcpStream, req: &OwnedRequest, shared: &Shared) -> i
     let path = req.path.split('?').next().unwrap_or("");
     if req.method == "OPTIONS" {
         write_response(&mut out, 204, "No Content", "text/plain", &cors, b"", true);
+    } else if path == "/dashboard" {
+        // Same-origin with /stats, which is all it reads.
+        write_response(&mut out, 200, "OK", "text/html; charset=utf-8", &[], include_str!("dashboard.html").as_bytes(), true);
     } else if path == "/stats" {
         write_response(&mut out, 200, "OK", "application/json", &cors, crate::stats::json(shared).as_bytes(), true);
     } else if path == "/metrics" {

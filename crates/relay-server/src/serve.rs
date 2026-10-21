@@ -59,22 +59,20 @@ pub fn run(cfg: Config) -> Result<(), String> {
         .spawn(move || ingest::run(w, store, wrx, sinks))
         .map_err(|e| e.to_string())?;
 
-    // Sockets are set up through tokio, which needs a runtime in scope; each
-    // reactor then adopts its listener into its own runtime.
-    let setup = tokio::runtime::Builder::new_current_thread().enable_io().build().map_err(|e| e.to_string())?;
-    let _enter = setup.enter();
+    // The socket is set up through tokio, which needs a runtime in scope.
+    let l = {
+        let setup = tokio::runtime::Builder::new_current_thread().enable_io().build().map_err(|e| e.to_string())?;
+        let _enter = setup.enter();
+        reactor::listener(bind).map_err(|e| format!("cannot listen on {bind}: {e}"))?
+    };
+    let mut conn_txs = Vec::with_capacity(threads);
     for (i, rx) in rxs.into_iter().enumerate() {
-        // Linux spreads connections over every reactor's own SO_REUSEPORT
-        // listener; elsewhere reactor 0 accepts for everyone.
-        let l = if cfg!(target_os = "linux") || i == 0 {
-            Some(reactor::listener(bind).map_err(|e| format!("cannot listen on {bind}: {e}"))?)
-        } else {
-            None
-        };
+        let (ctx, crx) = tmpsc::unbounded_channel();
+        conn_txs.push(ctx);
         let sh = shared.clone();
-        std::thread::Builder::new().name(format!("reactor-{i}")).spawn(move || reactor::run(i, sh, l, rx)).map_err(|e| e.to_string())?;
+        std::thread::Builder::new().name(format!("reactor-{i}")).spawn(move || reactor::run(i, sh, crx, rx)).map_err(|e| e.to_string())?;
     }
-    drop(_enter);
+    std::thread::Builder::new().name("acceptor".into()).spawn(move || reactor::accept_loop(l, conn_txs)).map_err(|e| e.to_string())?;
     eprintln!(
         "{} {} listening on {bind}: {threads} reactors, {events} events, ready in {:.2}s",
         crate::brand::NAME,
