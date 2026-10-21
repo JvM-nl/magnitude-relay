@@ -279,6 +279,10 @@ struct Committed {
 /// at once (live delivery does not wait for the disk; only the answers do).
 fn commit(w: &mut Writer, recs: &[&[u8]], received: Instant, sinks: &[Sink]) -> Committed {
     let failed = |stage_secs| Committed { outcomes: vec![None; recs.len()], ticket: None, stage_secs, finish_secs: 0.0 };
+    // After a failed sync nothing more is written (see `health::writes_stopped`).
+    if crate::health::writes_stopped() {
+        return failed(0.0);
+    }
     let t_stage = Instant::now();
     let staged = w.stage(recs);
     let stage_secs = t_stage.elapsed().as_secs_f64();

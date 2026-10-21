@@ -33,11 +33,12 @@ pub fn json(shared: &Shared) -> String {
     let mut o = String::with_capacity(1024);
     let _ = write!(
         o,
-        "{{\"software\":\"{}\",\"version\":\"{}\",\"uptime_secs\":{},\"connections_open\":{}",
+        "{{\"software\":\"{}\",\"version\":\"{}\",\"uptime_secs\":{},\"connections_open\":{},\"neg_items_held\":{}",
         crate::brand::NAME,
         crate::brand::VERSION,
         shared.metrics.uptime_secs(),
-        shared.metrics.open.load(Ordering::Relaxed)
+        shared.metrics.open.load(Ordering::Relaxed),
+        crate::session::NEG_ITEMS.load(Ordering::Relaxed)
     );
     for (k, v) in t.fields() {
         let _ = write!(o, ",\"{k}\":{v}");
@@ -120,6 +121,7 @@ pub fn prometheus(shared: &Shared) -> String {
     };
     gauge("uptime_seconds", shared.metrics.uptime_secs());
     gauge("connections_open", shared.metrics.open.load(Ordering::Relaxed));
+    gauge("neg_items_held", crate::session::NEG_ITEMS.load(Ordering::Relaxed));
     gauge("store_events", st.events);
     gauge("store_dead", st.dead);
     gauge("store_index_keys", st.index_keys);

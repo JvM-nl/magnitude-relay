@@ -235,6 +235,12 @@ pub fn check(dir: &Path, eseed: u64, shape: Shape, ops: u64) -> ! {
         }
     };
     let v = store.snapshot();
+    // Records as the store keeps them: base64 content decoded (`record::compact_into`).
+    let kept = |rec: &[u8]| {
+        let mut out = Vec::new();
+        relay_proto::record::compact_into(rec, &mut out);
+        out
+    };
     let mut wrong: Vec<String> = Vec::new();
     let mut lost = 0u64;
     for s in &m.slots {
@@ -244,7 +250,7 @@ pub fn check(dir: &Path, eseed: u64, shape: Shape, ops: u64) -> ! {
         if let Some(rec) = rec {
             if !s.alive {
                 wrong.push(format!("seq {} (removed) is live again", s.seq));
-            } else if rec != s.rec.as_slice() {
+            } else if rec != kept(&s.rec) {
                 wrong.push(format!("seq {} reads as other bytes", s.seq));
             }
         } else if s.alive {
@@ -268,7 +274,7 @@ pub fn check(dir: &Path, eseed: u64, shape: Shape, ops: u64) -> ! {
     for _ in 0..30 {
         let f = parse_filter(&work::filter_json(eseed, &mut rng));
         for h in v.query(&f, 500, NOW) {
-            let ok = m.slots.get(h.seq as usize).is_some_and(|s| s.alive && v.record(h.seq).is_some_and(|r| r.0 == s.rec.as_slice() && f.matches(r)));
+            let ok = m.slots.get(h.seq as usize).is_some_and(|s| s.alive && v.record(h.seq).is_some_and(|r| r.0 == kept(&s.rec).as_slice() && f.matches(r)));
             if !ok {
                 wrong.push(format!("a query returned seq {}, which is not a live stored event matching it", h.seq));
                 break;

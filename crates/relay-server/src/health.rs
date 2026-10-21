@@ -10,7 +10,7 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Syncs, their total time (µs), and how many failed.
@@ -23,9 +23,18 @@ pub static SYNC_SLOWEST_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Batches the store could not write, and how many of those for want of space.
 pub static WRITES_FAILED: AtomicU64 = AtomicU64::new(0);
 pub static WRITES_NO_SPACE: AtomicU64 = AtomicU64::new(0);
+/// Set by the first failed sync, for the rest of the process: on Linux a
+/// failed fsync may already have dropped the pages it could not write, so a
+/// later sync that succeeds proves nothing about them. Writes stop (reads go
+/// on) until a restart replays the log from what is really on disk.
+static WRITES_STOPPED: AtomicBool = AtomicBool::new(false);
+
+pub fn writes_stopped() -> bool {
+    WRITES_STOPPED.load(Ordering::Relaxed)
+}
+
 /// When each kind of incident last happened (unix seconds, 0: never).
 static LAST_SLOW_SYNC: AtomicU64 = AtomicU64::new(0);
-static LAST_SYNC_FAILURE: AtomicU64 = AtomicU64::new(0);
 static LAST_WRITE_FAILURE: AtomicU64 = AtomicU64::new(0);
 static LAST_NO_SPACE: AtomicU64 = AtomicU64::new(0);
 
@@ -51,7 +60,9 @@ pub fn note_sync(took: Duration, ok: bool) {
     }
     if !ok {
         SYNCS_FAILED.fetch_add(1, Ordering::Relaxed);
-        LAST_SYNC_FAILURE.store(now(), Ordering::Relaxed);
+        if !WRITES_STOPPED.swap(true, Ordering::Relaxed) {
+            eprintln!("a sync failed: new events are refused from now on; restart the relay once the disk is healthy");
+        }
     }
 }
 
@@ -210,8 +221,12 @@ pub fn warnings(h: &Host, damaged_reads: u64) -> Vec<Warning> {
     } else if recent(&LAST_WRITE_FAILURE) {
         warn(Level::Critical, "writes", "events could not be written to disk in the last 5 minutes (see the log)".into());
     }
-    if recent(&LAST_SYNC_FAILURE) {
-        warn(Level::Critical, "sync", "the disk refused a sync in the last 5 minutes: events may not have reached it (see the log)".into());
+    if writes_stopped() {
+        warn(
+            Level::Critical,
+            "sync",
+            "a sync failed, so new events are refused: restart the relay once the disk is healthy (it then reads back what really reached the disk)".into(),
+        );
     }
     if let (Some(total), Some(avail)) = (h.disk_total, h.disk_available) {
         let share = avail as f64 / total.max(1) as f64;

@@ -223,7 +223,12 @@ impl Version {
         // damaged on disk is missing, never served as other bytes.
         if !self.verified.contains(seq) {
             if !log::record_crc_ok(&self.segs, self.seg_size, off, rec) {
-                log::report_damaged(seq);
+                // A dead record's bytes are zeroed under its old checksum: that
+                // is the zeroing, not damage (the writer's rules and the open's
+                // repair read dead records too).
+                if !self.dead.is_dead(seq) && !log::frame_dead(&self.segs, self.seg_size, off) {
+                    log::report_damaged(seq);
+                }
                 return None;
             }
             self.verified.insert(seq);

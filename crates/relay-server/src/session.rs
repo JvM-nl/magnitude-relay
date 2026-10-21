@@ -257,6 +257,27 @@ pub fn closed_too_big(out: &mut dyn Outbox, sub_id: &str, max_outbound: usize) {
     closed(out, sub_id, &format!("error: the answer is larger than {} MB; ask for fewer events at a time", max_outbound >> 20));
 }
 
+/// Items held by every open negentropy session, relay-wide (each ~90 bytes).
+pub static NEG_ITEMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// What open sessions may hold together, about 1 GB: one session may hold
+/// `MAX_NEG_ITEMS`, and sixteen connections of eight whole-store sessions
+/// each took a 50k-event relay from 470 MB to 1 GB. Vector's syncs hold a
+/// mailbox each, thousands of items.
+const NEG_ITEMS_BUDGET: u64 = 12_000_000;
+
+/// An open negentropy session; dropped, it gives its items back to the budget.
+struct NegSession {
+    sub: Box<str>,
+    storage: VecStorage,
+    items: u64,
+}
+
+impl Drop for NegSession {
+    fn drop(&mut self) {
+        NEG_ITEMS.fetch_sub(self.items, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Open negentropy sessions per connection (Vector runs one per relay at a time).
 const MAX_NEG_SESSIONS: usize = 8;
 /// Largest set a NEG-OPEN may reconcile, as strfry's `maxSyncEvents`.
@@ -296,7 +317,7 @@ pub struct Session {
     pub conn: ConnId,
     /// Events queued to the writer and not yet answered.
     pub pending: usize,
-    neg: Vec<(Box<str>, VecStorage)>,
+    neg: Vec<NegSession>,
     /// One of our own relays (a `[[peer]]`): gift wraps are listed to it like
     /// any other event, and events this relay took from clients are marked so.
     trusted: bool,
@@ -331,7 +352,7 @@ impl Session {
             }
             Ok(ClientMsg::NegOpen { sub_id, filter, msg }) => self.on_neg_open(sub_id, filter, &msg, cx, out),
             Ok(ClientMsg::NegMsg { sub_id, msg }) => self.on_neg_msg(sub_id, &msg, out),
-            Ok(ClientMsg::NegClose { sub_id }) => self.neg.retain(|(s, _)| &**s != sub_id),
+            Ok(ClientMsg::NegClose { sub_id }) => self.neg.retain(|n| &*n.sub != sub_id),
             Err(MsgError::Filter { sub_id, err }) => closed(out, &sub_id, &format!("error: {err}")),
             Err(e) => notice(out, &e.to_string()),
         }
@@ -549,7 +570,7 @@ impl Session {
 
     fn on_neg_open(&mut self, sub_id: &str, filter: Filter, msg: &[u8], cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
         metrics::inc(&cx.m.neg_opens);
-        self.neg.retain(|(s, _)| &**s != sub_id);
+        self.neg.retain(|n| &*n.sub != sub_id);
         let mut fs = [filter];
         if let Err(m) = self.check_filters(&mut fs, cx) {
             return neg_err(out, sub_id, &m);
@@ -573,25 +594,31 @@ impl Session {
         if items.len() > MAX_NEG_ITEMS {
             return neg_err(out, sub_id, "blocked: too many records to reconcile, narrow the filter");
         }
-        let storage = VecStorage::new(items);
-        match negentropy::reconcile(&storage, msg, NEG_FRAME_LIMIT) {
+        // Reserved before the set is built; given back if it is refused.
+        let n = items.len() as u64;
+        if NEG_ITEMS.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n > NEG_ITEMS_BUDGET {
+            NEG_ITEMS.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+            return neg_err(out, sub_id, "rate-limited: too many records held by open sync sessions, try again shortly");
+        }
+        let session = NegSession { sub: sub_id.into(), storage: VecStorage::new(items), items: n };
+        match negentropy::reconcile(&session.storage, msg, NEG_FRAME_LIMIT) {
             Ok(resp) => {
                 neg_msg(out, sub_id, &resp);
-                self.neg.push((sub_id.into(), storage));
+                self.neg.push(session);
             }
             Err(e) => neg_err(out, sub_id, &format!("error: {e}")),
         }
     }
 
     fn on_neg_msg(&mut self, sub_id: &str, msg: &[u8], out: &mut dyn Outbox) {
-        let Some((_, storage)) = self.neg.iter().find(|(s, _)| &**s == sub_id) else {
+        let Some(storage) = self.neg.iter().find(|n| &*n.sub == sub_id).map(|n| &n.storage) else {
             return neg_err(out, sub_id, "closed: no open negentropy session with this id");
         };
         match negentropy::reconcile(storage, msg, NEG_FRAME_LIMIT) {
             Ok(resp) => neg_msg(out, sub_id, &resp),
             Err(e) => {
                 neg_err(out, sub_id, &format!("error: {e}"));
-                self.neg.retain(|(s, _)| &**s != sub_id);
+                self.neg.retain(|n| &*n.sub != sub_id);
             }
         }
     }

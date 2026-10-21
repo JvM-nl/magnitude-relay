@@ -219,56 +219,68 @@ Tests named without a crate are in `crates/relay-store` (`tests/store.rs`, or
 `src/fault_tests.rs` for those that need the fault hooks); "e2e" ones in
 `crates/relay-server/tests/e2e.rs`.
 
-## Open
+## Open: every finding's verdict (2026-10-21, night)
 
-Found, measured or reasoned about, and left for a decision:
+Each is fixed, mitigated, accepted with its reason, or not a defect.
 
 - **A flipped bit inside a record is served**: fixed (5766a68). A record's
   frame CRC is checked the first time a process reads it (one bit per seq,
   `relay_store::verified`), a damaged one is skipped and counted
-  (`store.damaged_reads` in /stats). Cost on the box: read CPU +2-3% on a fresh
-  store, where every read is a first read; once per record per process after.
-- **A flipped dead flag in a frame header is unseen** (medium, damage). The
-  header (length, flags, seq) is not covered by the CRC: a flag flipped on
-  makes replay drop an acknowledged event; flipped off, it brings a dead one
-  back (if its bytes were not zeroed yet). Needs a header check, a format
-  change.
+  (`store.damaged_reads` in /stats). A dead record (zeroed under its old
+  checksum) is skipped without being reported. Cost on the box: read CPU
+  +2-3% on a fresh store, where every read is a first read; once per record
+  per process after.
 - **A damaged index block aborts the relay**: fixed (5766a68, d865cb1).
   Opening checks every block of every listed segment (8 MB reads, threads
   side by side: a cold 1.46 GB index in 0.52-0.58 s, warm 0.27-0.30 s, against
   0.04-0.19 s before) and refuses a damaged one, naming the file and how to
-  rebuild (`export`, which reads by seq without the index, then `import`). CI
-  damage runs: panics 10 -> 0. Still open: about five index-damage cases a run
-  give wrong query hits. The one examined (finding-57: a bit flipped in a
-  segment written after the last checkpoint) is not a block-check gap: the
-  checkpoint does not list that segment, opening deletes it and replays the
-  log, so the wrong hits come from replay and repair. To investigate.
-- **NIP-77 sessions** (medium, memory): each open NEG session holds its item
-  list, about 90 bytes per item: 650 KB on a 5k-event store, 4.4 MB on a 50k
-  one (16 connections x 8 whole-store sessions took the relay from 470 MB
-  to 1 GB). Bounded by the connection and session limits, not by memory.
+  rebuild (`export`, which reads by seq without the index, then `import`).
+  A damaged segment written after the last checkpoint is not listed: opening
+  deletes it and replays the log, so it is harmless.
 - **Expensive REQs run on the reactor threads**: fixed (5766a68). A REQ over
   256 index ranges or ~20 000 entries to read goes to the query workers; its
   subscription is held (live events buffered, sent after the stored ones and
   EOSE). The same attack: canary p99 672 ms -> 0.8 ms.
-- **Write cost per tag** (low): an event with 880 distinct `p` tags costs
-  about 2.5 ms of writer time (476 a second from one flood; the canary's p99
-  rose to 26 ms).
-- **fsync errors are not fatal** (design). A failed `fdatasync` is returned
-  and the next sync is tried; on Linux a failed fsync may already have
-  dropped the dirty pages, so a later successful sync proves nothing. Some
-  databases stop on the first fsync error for that reason.
-- **Damage in the unflushed log tail truncates** (design, since finding 26).
-  A torn or out-of-sequence frame ends the log wherever it is, because a
-  power cut produces exactly that and nothing after it was acknowledged.
-  Bit rot there, which used to refuse the store, now drops the frames after
-  it (said on stderr). The tail is at most a flush's worth of log.
-- **`panic = "abort"`** makes any reader panic a relay outage. Fixes 7, 15,
-  17 and 23 removed every panic the suite reached except the index-block
-  check above.
+- **fsync errors are not fatal**: fixed. The first failed sync stops writes
+  for the rest of the process (reads go on) with a critical warning on
+  /stats, /metrics and the dashboard: on Linux a failed fsync may drop the
+  pages it could not write, so a later successful sync proves nothing. A
+  restart replays the log from what really reached the disk.
+- **NIP-77 sessions** (memory): mitigated. Open sessions share a budget of
+  12M items (about 1 GB at ~90 bytes each); a NEG-OPEN past it is refused
+  with `rate-limited` and may retry. `neg_items_held` in /stats and /metrics.
+  Vector's syncs hold a mailbox each, thousands of items.
+- **Write cost per tag** (low): mitigated, not changed. 880 distinct `p` tags
+  cost ~2.5 ms of writer time, and every tag must be indexed to be found.
+  Per-IP event limits (1200 a minute) bound one client to ~5% of the writer,
+  and Concord member lists legitimately carry many `p` tags, so a lower tag
+  limit would break them.
+- **A cut log segment undoes recent deletions** (damage, accepted). After a
+  log segment is cut short in the middle, the log ends there and the store is
+  what it was at that point: consistent, but a deletion recorded after the
+  cut, whose target was not yet zeroed on disk, is undone with everything else
+  after the cut. 24 of 600 damaged stores (all cut log segments; the rest of
+  the 600: refused 205, loss 155, unharmed 216, panics 0, other wrong answers
+  0). It needs a truncated log file, it reaches only deletions not yet zeroed,
+  and refusing to open instead would mean downtime. A persistent "synced up
+  to" marker would let recovery tell a torn tail from damage further back.
+- **A flipped dead flag in a frame header is unseen** (damage, accepted for
+  now). The header (length, flags, seq) is not covered by the CRC; length and
+  seq damage is caught (`record_of` checks both, the record CRC catches a wrong
+  length), the flag is not: on, log compaction drops a live record; off, a
+  dead record not yet zeroed comes back. The fix (compaction trusting only the
+  checksummed dead set, relink zeroing cold copies of records that died
+  meanwhile) changes the crash-safe exchange, and is not for a night before a
+  deploy.
+- **Damage in the unflushed log tail truncates** (design, not a defect): a
+  torn or out-of-sequence frame ends the log, because a power cut produces
+  exactly that and nothing after it was acknowledged.
+- **`panic = "abort"`** (mitigated): every panic the suite reached is fixed
+  (index blocks were the last; 0 panics in 600 damaged stores), and the
+  cut-over's systemd unit restarts the relay, which opens in under a second.
 - Not run: loom on the store's primitives (see Concurrency), and a power
-  model for the files written whole (segments, checkpoints: they are
-  synced and renamed before use, which the crash torture exercises).
+  model for the files written whole (segments, checkpoints: they are synced
+  and renamed before use, which the crash torture exercises). Future work.
 
 ## For review (hot paths)
 
