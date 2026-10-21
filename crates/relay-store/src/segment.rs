@@ -220,6 +220,20 @@ pub struct Segment {
     /// Set once a compaction has replaced it: the file goes when the last
     /// snapshot holding it does.
     obsolete: AtomicBool,
+    /// The first 8 bytes of each block's first key, big-endian: the block
+    /// search runs on these in memory and reads the index only among blocks
+    /// whose heads tie. Built on first use, so opening stays O(1).
+    heads: std::sync::OnceLock<Box<[u64]>>,
+}
+
+/// A key's first 8 bytes as a big-endian number, zero-padded: ordered as the
+/// keys are (a shorter key that is a prefix of another sorts first or ties).
+#[inline]
+fn head(k: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = k.len().min(8);
+    b[..n].copy_from_slice(&k[..n]);
+    u64::from_be_bytes(b)
 }
 
 /// Up to `RESTART` decoded keys of one interval of a block.
@@ -374,7 +388,7 @@ impl Segment {
         }
         map.advise(Advice::Random);
         let verified = (0..nblocks.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
-        Ok(Segment { id, path: path.to_path_buf(), map, nblocks, keys, index_off, bloom_off, bloom_blocks, bytes: len as u64, verified, obsolete: AtomicBool::new(false) })
+        Ok(Segment { id, path: path.to_path_buf(), map, nblocks, keys, index_off, bloom_off, bloom_blocks, bytes: len as u64, verified, obsolete: AtomicBool::new(false), heads: std::sync::OnceLock::new() })
     }
 
     #[inline]
@@ -434,7 +448,12 @@ impl Segment {
 
     /// The last block whose first key is `<= k` (0 if `k` sorts first).
     fn block_for(&self, k: &[u8]) -> usize {
-        let (mut lo, mut hi) = (0usize, self.nblocks);
+        let heads = self.heads.get_or_init(|| (0..self.nblocks).map(|i| head(self.meta(i).4)).collect());
+        // A block whose head is below the key's starts below the key; one whose
+        // head is above starts above it. Only ties need their first keys read.
+        let h = head(k);
+        let mut lo = heads.partition_point(|&x| x < h);
+        let mut hi = lo + heads[lo..].partition_point(|&x| x == h);
         while lo < hi {
             let mid = (lo + hi) / 2;
             if !keys::key_lt(k, self.meta(mid).4) {
@@ -724,6 +743,53 @@ mod tests {
             fp += usize::from(seg.may_contain(&k));
         }
         assert!(fp < 300, "false positive rate {fp}/10000");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn block_search_with_tied_heads_and_short_keys() {
+        // Thousands of keys per 8-byte head, spread over many blocks, and keys
+        // shorter than 8 bytes: the searches must match a sorted vector.
+        let path = tmp("heads");
+        let mut ks: Vec<Vec<u8>> = Vec::new();
+        for a in 0..12u8 {
+            ks.push(vec![keys::T_AUTHOR, a]);
+            ks.push(vec![keys::T_AUTHOR, a, 0]);
+            for i in 0..3000u32 {
+                let mut k = vec![keys::T_AUTHOR, a, a, a, a, a, a, a];
+                k.extend_from_slice(&[a; 24]);
+                k.extend_from_slice(&(u64::from(i) * 3).to_be_bytes());
+                k.extend_from_slice(&u64::from(i).to_be_bytes());
+                ks.push(k);
+            }
+        }
+        ks.sort();
+        ks.dedup();
+        let mut w = SegmentWriter::create(&path).unwrap();
+        for k in &ks {
+            w.add(k).unwrap();
+        }
+        w.finish().unwrap();
+        let seg = Segment::open(1, &path).unwrap();
+        assert!(seg.nblocks > 50, "{} blocks", seg.nblocks);
+        let check = |k: &[u8]| {
+            let want = ks.partition_point(|x| x.as_slice() < k) as u64;
+            assert_eq!(seg.lower_bound(k), want, "{k:?}");
+            assert_eq!(seg.contains(k), ks.binary_search_by(|x| x.as_slice().cmp(k)).is_ok(), "{k:?}");
+        };
+        for (i, k) in ks.iter().enumerate().step_by(7) {
+            check(k);
+            let mut changed = k.clone();
+            *changed.last_mut().unwrap() ^= 0x01;
+            check(&changed);
+            check(&k[..(i % k.len()).max(1)]);
+            let mut longer = k.clone();
+            longer.push(0);
+            check(&longer);
+        }
+        for k in [&[][..], &[0][..], &[keys::T_AUTHOR][..], &[keys::T_AUTHOR, 99][..], &[0xFF; 40][..]] {
+            check(k);
+        }
         let _ = std::fs::remove_file(&path);
     }
 
