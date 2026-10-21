@@ -89,11 +89,15 @@ pub struct GenParams {
     pub planes: usize,
     pub authors: usize,
     pub threads: usize,
+    /// Gift-wrap content is the exact base64 of random bytes, as a NIP-44
+    /// payload is, rather than base64-alphabet text of any length (which is
+    /// the default, kept so existing datasets stay byte-identical).
+    pub nip44: bool,
 }
 
 impl GenParams {
     pub fn new(events: u64, seed: u64) -> GenParams {
-        GenParams { events, seed, rate_milli: 2000, end: DEFAULT_END, recipients: 10_000, planes: 2_000, authors: 5_000, threads: cpus() }
+        GenParams { events, seed, rate_milli: 2000, end: DEFAULT_END, recipients: 10_000, planes: 2_000, authors: 5_000, threads: cpus(), nip44: false }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -208,7 +212,7 @@ impl Generator {
         let (recipient, created_at) = self.wrap_attrs(if cloned { leader } else { w });
         let mut r = Rng::for_item(self.p.seed, n, STREAM_BODY);
         let len = 1024 + r.below(1025) as usize;
-        let content = payload(&mut r, len);
+        let content = payload(&mut r, len, self.p.nip44);
         let mut tags = String::from("[");
         push_tag(&mut tags, &["p", &self.recipients[recipient]]);
         tags.push(']');
@@ -230,7 +234,7 @@ impl Generator {
         let (plane, created_at) = self.plane_attrs(if cloned { leader } else { u });
         let mut r = Rng::for_item(self.p.seed, n, STREAM_BODY);
         let len = 512 + r.below(1025) as usize;
-        let content = payload(&mut r, len);
+        let content = payload(&mut r, len, self.p.nip44);
         let recipient = hex::encode_string(&r.bytes32());
         let mut tags = String::from("[");
         push_tag(&mut tags, &["p", &recipient]);
@@ -328,8 +332,18 @@ impl Generator {
 
 /// 6 bits of entropy per character from the base64 alphabet, 10 characters per RNG
 /// word. What a NIP-44 payload looks like to a relay: opaque, incompressible text.
-fn payload(rng: &mut Rng, len: usize) -> String {
+/// With `nip44`, exactly what it is: the padded base64 of about `len * 3 / 4`
+/// random bytes.
+fn payload(rng: &mut Rng, len: usize, nip44: bool) -> String {
     const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if nip44 {
+        let mut bytes = vec![0u8; len * 3 / 4];
+        rng.fill(&mut bytes);
+        let mut text = Vec::new();
+        relay_proto::base64::encode_into(&bytes, &mut text);
+        // The alphabet is ASCII.
+        return String::from_utf8(text).expect("base64 is ASCII");
+    }
     let mut s = String::with_capacity(len);
     let (mut word, mut left) = (0u64, 0);
     for _ in 0..len {
