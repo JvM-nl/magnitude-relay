@@ -539,17 +539,19 @@ async fn a_forged_address_header_counts_for_nothing_on_the_https_port() {
     let relay = start(&dir, ports, "real_ip_header = \"x-forwarded-for\"", "max_connections_per_ip = 1", &tls, &[]);
     let root = ca.root_der();
 
-    // Plain port: two claimed addresses are two clients, both kept.
+    // Plain port: the header names the client. Two claims of one address are one
+    // client, and the second is over the limit.
     let mut a = TcpStream::connect(relay.plain).await.unwrap();
     let mut b = TcpStream::connect(relay.plain).await.unwrap();
     assert!(!turned_away(&upgrade_as(&mut a, "203.0.113.1").await));
-    assert!(!turned_away(&upgrade_as(&mut b, "203.0.113.2").await), "the plain port honours the header");
+    assert!(turned_away(&upgrade_as(&mut b, "203.0.113.1").await), "the plain port honours the header");
 
-    // HTTPS: it is the relay's own front door, so the header is ignored. Both clients are
-    // 127.0.0.1, and the second is over the limit.
+    // HTTPS: it is the relay's own front door, so the header is ignored. Both clients
+    // are 127.0.0.1, which has no limit; had the header counted, the second would be
+    // turned away as the same address.
     let (mut s1, _) =
         until("a certificate", 30, || async { tls_connect(relay.https, "relay.test", std::slice::from_ref(&root)).await.ok() }).await;
     let (mut s2, _) = tls_connect(relay.https, "relay.test", &[root]).await.unwrap();
     assert!(!turned_away(&upgrade_as(&mut s1, "203.0.113.1").await));
-    assert!(turned_away(&upgrade_as(&mut s2, "203.0.113.2").await), "a forged header must not make this a different client");
+    assert!(!turned_away(&upgrade_as(&mut s2, "203.0.113.1").await), "a forged header must not name the client");
 }

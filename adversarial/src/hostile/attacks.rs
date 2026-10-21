@@ -909,10 +909,10 @@ pub fn churn(env: &mut Env) -> Outcome {
             }
         }
     };
-    // Per-IP: 64 connections are allowed from one address (the default).
+    // Per-IP: 256 connections are allowed from one address (the default).
     let mut held = Vec::new();
     let mut refused = None;
-    for k in 0..70 {
+    for k in 0..262 {
         match connect("10.250.0.1") {
             Ok(mut c) => {
                 c.s.set_read_timeout(Some(Duration::from_millis(100))).ok();
@@ -930,8 +930,8 @@ pub fn churn(env: &mut Env) -> Outcome {
         }
     }
     match refused {
-        Some((64, Some(1008))) => out.note("65th connection from one address refused with 1008"),
-        other => out.finding(format!("per-IP limit: refused at {other:?}, expected the 65th with 1008")),
+        Some((256, Some(1008))) => out.note("257th connection from one address refused with 1008"),
+        other => out.finding(format!("per-IP limit: refused at {other:?}, expected the 257th with 1008")),
     }
     drop(held);
     std::thread::sleep(Duration::from_millis(500));

@@ -456,7 +456,7 @@ impl Default for LimitsCfg {
             max_filter_values: 5000,
             default_limit: 500,
             max_limit: 5000,
-            max_connections_per_ip: 64,
+            max_connections_per_ip: 256,
             events_per_minute_per_ip: 1200,
             outbound_buffer_bytes: 33_554_432,
         }
@@ -1468,8 +1468,11 @@ const TEMPLATE: &str = r##"# {name} settings
 # max_limit = 5000
 
 # Per IP address: simultaneous connections, and events accepted per minute.
-# 0 turns a limit off, for example when testing from a single machine.
-# max_connections_per_ip = 64
+# 0 turns a limit off. Loopback addresses have no limit: they are services on
+# this machine, or everyone who arrives through Tor or I2P (cap those in the
+# web server or the onion service instead). 256 connections leaves room for
+# many phones behind one carrier address.
+# max_connections_per_ip = 256
 # events_per_minute_per_ip = 1200
 
 # Memory one connection may use for messages waiting to be sent. A client that
@@ -1612,7 +1615,7 @@ mod tests {
         let l = &c.limits;
         assert_eq!((l.max_message_bytes, l.max_subscriptions, l.max_filters, l.max_filter_values), (262_144, 200, 50, 5000));
         assert_eq!((l.default_limit, l.max_limit), (500, 5000));
-        assert_eq!((l.max_connections_per_ip, l.events_per_minute_per_ip, l.outbound_buffer_bytes), (64, 1200, 33_554_432));
+        assert_eq!((l.max_connections_per_ip, l.events_per_minute_per_ip, l.outbound_buffer_bytes), (256, 1200, 33_554_432));
         assert_eq!((c.store.data.as_path(), c.store.sync, c.store.segment_mb), (Path::new("./data"), true, 1024));
         assert_eq!(c.store.options().segment_size, 1 << 30);
         assert!(c.store.options().sync);

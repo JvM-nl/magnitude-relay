@@ -88,6 +88,13 @@ impl Shared {
 
     /// Counts a connection from `ip`, unless that IP is at its limit.
     fn admit(&self, ip: IpAddr) -> bool {
+        // Loopback is never a client's own address: it is a service on this
+        // machine (a push server, the operator's tools), or everyone who came
+        // through Tor or I2P, which nginx caps per listener. One allowance
+        // shared by all of them would turn the 257th Tor user away.
+        if ip.is_loopback() {
+            return true;
+        }
         let max = self.cfg.limits.max_connections_per_ip;
         let mut ips = self.ips.lock().unwrap();
         let burst = u64::from(self.cfg.limits.events_per_minute_per_ip) * 1000;
@@ -113,7 +120,7 @@ impl Shared {
     /// refilled continuously).
     fn take_event(&self, ip: IpAddr) -> bool {
         let per_min = u64::from(self.cfg.limits.events_per_minute_per_ip);
-        if per_min == 0 {
+        if per_min == 0 || ip.is_loopback() {
             return true;
         }
         let mut ips = self.ips.lock().unwrap();

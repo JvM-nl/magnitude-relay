@@ -1358,3 +1358,52 @@ async fn costly_reqs_are_answered_off_the_reactors_in_order() {
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Loopback is never one client: everyone through Tor or I2P arrives as
+/// 127.0.0.1 (the onion services connect from it), and so do a push server
+/// and the operator's tools. Per-IP limits leave it alone; the one-address
+/// limits still apply to every other address (see tls.rs for the header).
+#[tokio::test]
+async fn loopback_is_not_held_to_per_address_limits() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-loopback-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port = free_port();
+    let cfg = dir.join("relay.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[relay]\nbind = \"127.0.0.1:{port}\"\nthreads = 2\n[limits]\nmax_connections_per_ip = 1\nevents_per_minute_per_ip = 2\n[store]\ndata = \"{}\"\n",
+            dir.join("data").display()
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magnitude-relay")).arg("--config").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let t = Instant::now();
+    while std::net::TcpStream::connect(addr).is_err() {
+        assert!(t.elapsed() < Duration::from_secs(10), "relay did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let host = addr.to_string();
+    // Three connections against a limit of one, each answering.
+    let mut conns = Vec::new();
+    for i in 0..3 {
+        let mut c = client_connect(addr, &host, "/").await.unwrap();
+        send(&mut c, json!(["REQ", format!("s{i}"), {"kinds": [30078], "limit": 1}])).await;
+        assert_eq!(collect(&mut c, &format!("s{i}")).await.1[0], "EOSE", "connection {i} was turned away");
+        conns.push(c);
+    }
+    // Five events against two a minute, all taken.
+    let me = Signer::new(52);
+    let c = &mut conns[0];
+    for i in 0..5u64 {
+        send(c, json!(["EVENT", me.event(now() - i, 30078, json!([["d", format!("k{i}")]]), "x")])).await;
+        let (ok, msg) = ok_of(c).await;
+        assert!(ok, "event {i}: {msg}");
+    }
+    drop(conns);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(dir);
+}
