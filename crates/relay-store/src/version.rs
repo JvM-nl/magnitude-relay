@@ -409,6 +409,51 @@ impl Version {
         hits
     }
 
+    /// Every live, unexpired event matching any of `filters`, newest first
+    /// (`created_at` descending, ties latest stored first), each once however
+    /// many filters match it. With `older_than`, only events created strictly
+    /// before it. A filter's `limit` is not applied.
+    ///
+    /// Lazy, unlike [`query`](Self::query): memory is bounded by the number of
+    /// filters, not of matches, so an operator can walk millions of events.
+    pub fn matching(&self, filters: &[Filter], older_than: Option<u64>, now: u64) -> Matching<'_> {
+        let mut filters = filters.to_vec();
+        if let Some(cutoff) = older_than {
+            for f in &mut filters {
+                match cutoff.checked_sub(1) {
+                    Some(last) => f.until = Some(f.until.map_or(last, |u| u.min(last))),
+                    // Nothing is older than the epoch: an inverted window matches nothing.
+                    None => (f.since, f.until) = (Some(1), Some(0)),
+                }
+            }
+        }
+        let mut sources = Vec::with_capacity(filters.len());
+        for f in &filters {
+            let (feed, exact) = match self.plan(f) {
+                Plan::Nothing => (Feed::List(Vec::new().into_iter()), true),
+                Plan::Ids => {
+                    let mut found = Vec::new();
+                    for id in f.ids.as_deref().unwrap_or(&[]) {
+                        let Some(seq) = self.lookup_id(id) else { continue };
+                        let rec = self.record_unchecked(seq);
+                        if f.matches(rec) {
+                            found.push((rec.created_at(), seq));
+                        }
+                    }
+                    found.sort_unstable_by(|a, b| b.cmp(a));
+                    (Feed::List(found.into_iter()), true)
+                }
+                Plan::Scan { prefixes, exact } => {
+                    (Feed::Scan(Merge::new(self, &prefixes, f.since.unwrap_or(0), f.until.unwrap_or(u64::MAX))), exact)
+                }
+            };
+            let mut s = Source { feed, exact, last: u64::MAX, head: None };
+            s.advance(self, f, now);
+            sources.push(s);
+        }
+        Matching { v: self, now, filters, sources }
+    }
+
     /// The NIP-77 set for `kinds:[k...] #name:[values...]` within `[since, until]`,
     /// read from covering NEG keys alone. `None` when the shape is not covered
     /// (the caller falls back to a query). Live, unexpired events only: the set
@@ -492,6 +537,74 @@ impl Version {
                 (n, false)
             }
         }
+    }
+}
+
+/// The walk [`Version::matching`] returns.
+pub struct Matching<'a> {
+    v: &'a Version,
+    now: u64,
+    filters: Vec<Filter>,
+    sources: Vec<Source<'a>>,
+}
+
+/// One filter's share of a [`Matching`] walk.
+struct Source<'a> {
+    feed: Feed<'a>,
+    /// Every key in range matches the filter, so a record is read only to check expiry.
+    exact: bool,
+    /// The last seq taken from the feed: an event listed under several prefixes
+    /// comes up once per prefix, side by side.
+    last: u64,
+    /// What this filter yields next, read ahead so the filters can be merged.
+    head: Option<Hit>,
+}
+
+enum Feed<'a> {
+    Scan(Merge<'a>),
+    /// Already matched and ordered (an `ids` filter names a handful of events).
+    List(std::vec::IntoIter<(u64, u64)>),
+}
+
+impl Source<'_> {
+    /// Moves `head` to the next live, unexpired event the filter matches.
+    fn advance(&mut self, v: &Version, f: &Filter, now: u64) {
+        self.head = None;
+        loop {
+            let next = match &mut self.feed {
+                Feed::Scan(m) => m.next(),
+                Feed::List(l) => l.next(),
+            };
+            let Some((created_at, seq)) = next else { return };
+            if seq == self.last {
+                continue;
+            }
+            self.last = seq;
+            if !v.is_live(seq) {
+                continue;
+            }
+            let rec = v.record_unchecked(seq);
+            if expired(rec, now) || (!self.exact && !f.matches(rec)) {
+                continue;
+            }
+            self.head = Some(Hit { created_at, seq, id: *rec.id() });
+            return;
+        }
+    }
+}
+
+impl Iterator for Matching<'_> {
+    type Item = Hit;
+
+    fn next(&mut self) -> Option<Hit> {
+        let hit = self.sources.iter().filter_map(|s| s.head).max_by_key(|h| (h.created_at, h.seq))?;
+        // Every filter that matched this event moves past it.
+        for (s, f) in self.sources.iter_mut().zip(&self.filters) {
+            if s.head.is_some_and(|h| h.seq == hit.seq) {
+                s.advance(self.v, f, self.now);
+            }
+        }
+        Some(hit)
     }
 }
 
