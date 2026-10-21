@@ -263,6 +263,12 @@ pub struct Interval {
 }
 
 impl Interval {
+    /// Room for a whole interval of typical keys, so the first decode does not
+    /// grow the buffers step by step.
+    fn with_capacity() -> Interval {
+        Interval { data: Vec::with_capacity(RESTART * 64), offs: Vec::with_capacity(RESTART) }
+    }
+
     #[inline]
     fn len(&self) -> usize {
         self.offs.len()
@@ -582,7 +588,7 @@ impl Segment {
     pub fn range(&self, lo: &[u8], hi: &[u8]) -> SegCursor<'_> {
         let a = self.lower_bound(lo);
         let b = self.lower_bound(hi);
-        SegCursor { seg: self, iv: Interval::default(), cur: None, front: a, back: b.max(a) }
+        SegCursor { seg: self, iv: Interval::with_capacity(), cur: None, front: a, back: b.max(a) }
     }
 
     pub fn path(&self) -> &Path {
