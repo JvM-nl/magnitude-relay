@@ -31,7 +31,10 @@ pub enum Source {
 /// The clocks of the background work. The defaults are the policy; tests shorten them.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
-    /// First wait after a failed attempt.
+    /// First wait after a failed attempt. An attempt may fail two validations
+    /// (TLS-ALPN-01, then HTTP-01), and Let's Encrypt allows 5 failures per name
+    /// an hour before refusing to validate: 20 minutes keeps a broken setup (DNS
+    /// not pointing here, a closed port) to two attempts in any hour.
     pub retry_initial: Duration,
     /// Each further failure doubles the wait, up to this.
     pub retry_max: Duration,
@@ -45,8 +48,8 @@ pub struct Timing {
 impl Default for Timing {
     fn default() -> Self {
         Timing {
-            retry_initial: Duration::from_secs(60),
-            retry_max: Duration::from_secs(3600),
+            retry_initial: Duration::from_secs(20 * 60),
+            retry_max: Duration::from_secs(6 * 3600),
             check: Duration::from_secs(24 * 3600),
             files_poll: Duration::from_secs(60),
             acme: acme::Timing::default(),
@@ -438,14 +441,20 @@ mod tests {
     }
 
     #[test]
-    fn failures_back_off_from_a_minute_to_an_hour() {
+    fn failures_back_off_from_twenty_minutes_to_six_hours() {
         let t = Timing::default();
         let mut waits = vec![t.retry_initial];
         while *waits.last().unwrap() < t.retry_max {
             waits.push(next_backoff(*waits.last().unwrap(), &t));
         }
         let minutes: Vec<u64> = waits.iter().map(|d| d.as_secs() / 60).collect();
-        assert_eq!(minutes, [1, 2, 4, 8, 16, 32, 60]);
+        assert_eq!(minutes, [20, 40, 80, 160, 320, 360]);
+        // Never more than two attempts (four validations) in any hour.
+        let starts: Vec<u64> = std::iter::once(0).chain(waits.iter().scan(0, |at, w| {
+            *at += w.as_secs();
+            Some(*at)
+        })).collect();
+        assert!(starts.windows(3).all(|w| w[2] - w[0] >= 3600), "{starts:?}");
         assert_eq!(next_backoff(t.retry_max, &t), t.retry_max, "and stays there");
         assert_eq!(next_backoff(Duration::MAX, &t), t.retry_max, "without overflowing");
     }
@@ -463,6 +472,6 @@ mod tests {
     #[test]
     fn defaults_are_the_policy() {
         let t = Timing::default();
-        assert_eq!((t.retry_initial.as_secs(), t.retry_max.as_secs(), t.check.as_secs(), t.files_poll.as_secs()), (60, 3600, 86_400, 60));
+        assert_eq!((t.retry_initial.as_secs(), t.retry_max.as_secs(), t.check.as_secs(), t.files_poll.as_secs()), (1200, 21_600, 86_400, 60));
     }
 }
