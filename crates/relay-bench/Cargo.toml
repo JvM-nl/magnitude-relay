@@ -19,3 +19,6 @@ secp256k1.workspace = true
 sha2.workspace = true
 # The reference client, as Vector uses it: the relay is judged against the real thing.
 negentropy = { version = "0.5", default-features = false, features = ["std"] }
+# wss://, for measuring a relay behind TLS (its own, or a web server's in front).
+rustls.workspace = true
+tokio-rustls.workspace = true

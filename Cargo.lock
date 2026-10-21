@@ -282,9 +282,11 @@ dependencies = [
  "negentropy",
  "relay-net",
  "relay-proto",
+ "rustls",
  "secp256k1",
  "sha2",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

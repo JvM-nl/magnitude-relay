@@ -337,7 +337,7 @@ mod tests {
         let body: String = (0..300).map(|i| format!("{{\"n\":{i}}}\n\n")).collect();
         std::fs::write(&path, body).unwrap();
         let mk = |skip, count| Shared {
-            target: Target { addr: "127.0.0.1:1".parse().unwrap(), unix: None, host: String::new(), path: "/".into(), url: String::new() },
+            target: Target { addr: "127.0.0.1:1".parse().unwrap(), unix: None, tls: false, host: String::new(), path: "/".into(), url: String::new() },
             src: Mutex::new(Source { rd: BufReader::new(File::open(&path).unwrap()), to_skip: skip, left: count }),
             window: 1,
             batch_ack: false,

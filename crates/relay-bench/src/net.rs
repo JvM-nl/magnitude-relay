@@ -8,15 +8,17 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream, UnixStream};
 
-/// A connection to the relay: TCP, or the Unix socket a web server in front of
-/// it would use (`unix:/path` URLs).
+/// A connection to the relay: TCP, TLS over TCP (`wss://`), or the Unix socket a
+/// web server in front of it would use (`unix:/path` URLs).
 pub enum Stream {
     Tcp(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
     Unix(UnixStream),
 }
 
@@ -26,6 +28,7 @@ impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Stream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
             Stream::Unix(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -35,6 +38,7 @@ impl AsyncWrite for Stream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Stream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Stream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
             Stream::Unix(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -42,6 +46,7 @@ impl AsyncWrite for Stream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Stream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Stream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
             Stream::Unix(s) => Pin::new(s).poll_flush(cx),
         }
     }
@@ -49,6 +54,7 @@ impl AsyncWrite for Stream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Stream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Stream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
             Stream::Unix(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -61,27 +67,30 @@ pub struct Target {
     pub addr: SocketAddr,
     /// A Unix socket to connect to instead.
     pub unix: Option<PathBuf>,
+    /// TLS over the TCP connection (`wss://`).
+    pub tls: bool,
     /// `Host` header value.
     pub host: String,
     pub path: String,
     pub url: String,
 }
 
-/// `ws://host[:port][/path]`, or `unix:/path/to/socket`. TLS is out of scope:
-/// every relay under test is local, and a TLS handshake per connection would
-/// measure the TLS library.
+/// `ws://` or `wss://host[:port][/path]`, or `unix:/path/to/socket`. With
+/// `wss://` any certificate is accepted: the point is what serving TLS costs the
+/// machine under test (a relay's own TLS, or a web server's in front of it), and
+/// a bench certificate is self-signed.
 pub async fn resolve(url: &str) -> Result<Target, String> {
     if let Some(path) = url.strip_prefix("unix:") {
         if path.is_empty() {
             return Err(format!("no socket path in '{url}'"));
         }
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        return Ok(Target { addr, unix: Some(path.into()), host: "localhost".into(), path: "/".into(), url: url.to_owned() });
+        return Ok(Target { addr, unix: Some(path.into()), tls: false, host: "localhost".into(), path: "/".into(), url: url.to_owned() });
     }
-    let rest = match url.strip_prefix("ws://") {
-        Some(r) => r,
-        None if url.starts_with("wss://") => return Err("wss:// is not supported: point the bench at the relay's plain ws:// port".into()),
-        None => return Err(format!("expected a ws:// URL, got '{url}'")),
+    let (rest, tls) = match (url.strip_prefix("ws://"), url.strip_prefix("wss://")) {
+        (Some(r), _) => (r, false),
+        (_, Some(r)) => (r, true),
+        _ => return Err(format!("expected a ws:// or wss:// URL, got '{url}'")),
     };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -89,7 +98,7 @@ pub async fn resolve(url: &str) -> Result<Target, String> {
     };
     let (name, port) = match authority.rsplit_once(':') {
         Some((n, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (n, p.parse::<u16>().map_err(|_| format!("bad port in '{url}'"))?),
-        _ => (authority, 80),
+        _ => (authority, if tls { 443 } else { 80 }),
     };
     if name.is_empty() {
         return Err(format!("no host in '{url}'"));
@@ -100,7 +109,7 @@ pub async fn resolve(url: &str) -> Result<Target, String> {
         .map_err(|e| format!("cannot resolve '{name}': {e}"))?
         .next()
         .ok_or_else(|| format!("'{name}' resolved to nothing"))?;
-    Ok(Target { addr, unix: None, host: authority.to_owned(), path: path.to_owned(), url: url.to_owned() })
+    Ok(Target { addr, unix: None, tls, host: authority.to_owned(), path: path.to_owned(), url: url.to_owned() })
 }
 
 /// The loopback source address for connection number `i` when spreading over `k`
@@ -113,6 +122,62 @@ pub fn source_ip(i: usize, k: usize) -> Option<IpAddr> {
     }
     let j = (i % k.min(60_000)) as u32;
     Some(IpAddr::V4(Ipv4Addr::new(127, 0, (j / 250) as u8, 2 + (j % 250) as u8)))
+}
+
+/// TLS 1.2 or 1.3 as a client would negotiate it, trusting whatever the server shows.
+fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+                .with_no_client_auth();
+            Arc::new(config)
+        })
+        .clone()
+}
+
+/// Accepts any certificate, still checking the handshake's signatures.
+#[derive(Debug)]
+struct AnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -131,6 +196,12 @@ pub async fn connect(t: &Target, src: Option<IpAddr>) -> io::Result<Conn> {
         let stream = sock.connect(t.addr).await?;
         // Small request/response frames: Nagle plus delayed ACK would add 40 ms each.
         stream.set_nodelay(true)?;
+        if t.tls {
+            let name = t.host.rsplit_once(':').map_or(t.host.as_str(), |(n, _)| n).trim_start_matches('[').trim_end_matches(']');
+            let name = rustls::pki_types::ServerName::try_from(name.to_owned()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let s = tokio_rustls::TlsConnector::from(tls_config()).connect(name, stream).await?;
+            return client_handshake(Stream::Tls(Box::new(s)), &t.host, &t.path).await;
+        }
         client_handshake(Stream::Tcp(stream), &t.host, &t.path).await
     };
     match tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
@@ -269,7 +340,8 @@ mod tests {
         assert_eq!((t.addr.port(), t.path.as_str()), (9, "/nostr?x=1"));
         let t = resolve("ws://localhost/").await.unwrap();
         assert_eq!(t.addr.port(), 80);
-        assert!(resolve("wss://127.0.0.1").await.unwrap_err().contains("not supported"));
+        let t = resolve("wss://127.0.0.1").await.unwrap();
+        assert!(t.tls && t.addr.port() == 443);
         assert!(resolve("http://127.0.0.1").await.is_err());
         assert!(resolve("ws://:80").await.is_err());
         assert!(resolve("ws://127.0.0.1:99999").await.is_err());
