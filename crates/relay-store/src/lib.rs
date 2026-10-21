@@ -102,6 +102,31 @@ pub(crate) struct Shared {
     /// Every seq below this is on disk. Published events above it are visible
     /// (and relayed live) but their sync is still in flight.
     pub(crate) durable: Arc<AtomicU64>,
+    /// Held for as long as the store is open: one process per directory.
+    _lock: std::fs::File,
+}
+
+/// Takes the directory's lock, or says which process holds it. Two writers on
+/// one log would corrupt it, and even a read-only command opens the writer
+/// (opening repairs and sweeps).
+fn lock_dir(dir: &Path) -> io::Result<std::fs::File> {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsRawFd;
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("LOCK"))?;
+    // SAFETY: plain flock on a descriptor we own.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let mut who = String::new();
+        let _ = f.read_to_string(&mut who);
+        let who = who.trim();
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("{} is in use by another process{}", dir.display(), if who.is_empty() { String::new() } else { format!(" (pid {who})") }),
+        ));
+    }
+    f.set_len(0)?;
+    f.seek(io::SeekFrom::Start(0))?;
+    write!(f, "{}", std::process::id())?;
+    Ok(f)
 }
 
 /// Format version of the data directory.
@@ -145,6 +170,7 @@ impl Store {
     /// the one writer.
     pub fn open(dir: &Path, opts: Options) -> io::Result<(Store, Writer)> {
         std::fs::create_dir_all(dir)?;
+        let lock = lock_dir(dir)?;
         check_meta(dir, &opts)?;
         let idx = dir.join("idx");
         std::fs::create_dir_all(&idx)?;
@@ -247,7 +273,7 @@ impl Store {
             dead: dead.clone(),
             runs: Arc::new(runs),
         });
-        let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0), durable: Arc::new(AtomicU64::new(next_seq)) });
+        let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0), durable: Arc::new(AtomicU64::new(next_seq)), _lock: lock });
         let finish_intent = !ck.intent_cold.is_empty();
         let mut w = Writer::new(
             shared.clone(),

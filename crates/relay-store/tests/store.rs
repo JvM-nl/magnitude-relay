@@ -857,3 +857,15 @@ fn interrupted_log_compaction_finishes_at_open() {
         wl.check(&store, "reopen after finishing");
     }
 }
+
+#[test]
+fn one_process_per_directory() {
+    let dir = tmpdir("lock");
+    let (store, w) = Store::open(&dir, opts()).unwrap();
+    let err = Store::open(&dir, opts()).err().expect("a second open must be refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(err.to_string().contains(&format!("pid {}", std::process::id())), "{err}");
+    drop((store, w));
+    // Released with the store.
+    assert!(Store::open(&dir, opts()).is_ok());
+}
