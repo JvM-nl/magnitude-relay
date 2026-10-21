@@ -297,6 +297,10 @@ impl<'a> ColdOut<'a> {
         if self.cur.as_ref().is_none_or(|c| c.2 + len > self.seg_size) {
             self.seal()?;
             let f = Arc::new(MappedFile::open(&log::cold_path(self.log_dir, self.next), self.seg_size as usize)?);
+            // A job that failed may have left a file of this number behind (its
+            // numbers are taken again): what it wrote must not show past the end
+            // of what this one writes.
+            f.zero_from(0)?;
             self.cur = Some((self.next, f, 0));
             self.next += 1;
         }

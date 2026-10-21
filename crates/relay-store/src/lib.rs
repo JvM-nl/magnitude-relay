@@ -314,7 +314,9 @@ impl Store {
         }
 
         dead.grow_to(next_seq);
-        for s in dead_seqs {
+        // A dead frame naming a seq past the end names no record (a damaged
+        // frame whose checksum could not be checked): nothing to kill.
+        for s in dead_seqs.into_iter().filter(|&s| s < next_seq) {
             dead.set(s);
         }
         // The tail's rule-bearing keys: replaying them re-derives any kill a
