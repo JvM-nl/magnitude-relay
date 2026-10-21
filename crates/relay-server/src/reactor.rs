@@ -818,6 +818,11 @@ async fn serve(
                 metrics::inc(&shared.metrics.of(st.borrow().idx).slow_drops);
                 return Ok(());
             }
+            // The overflow watch may have taken the wakeup for what was queued
+            // during the write: give it back, or that waits for the next one.
+            if !out.buf.borrow().is_empty() {
+                out.notify.notify_one();
+            }
             wspliced.clear();
             wbuf.clear();
             // Idle connections keep no output buffer; a busy one keeps a modest one.
