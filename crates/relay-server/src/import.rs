@@ -4,7 +4,7 @@
 //! applies chunks strictly in file order, so seqs follow the file and strfry's
 //! tie order (levId ascending within a second) is preserved.
 
-use relay_proto::event::{parse_event_json, Reject};
+use relay_proto::event::{parse_event_json, BulkVerifier, EventInfo, Reject};
 use relay_proto::{kind, EventParser};
 use relay_store::{Outcome, Writer};
 use std::collections::{BTreeMap, HashMap};
@@ -105,6 +105,7 @@ pub fn run(input: impl Read + Send, w: &mut Writer, opts: ImportOptions, mut pro
             let verify = opts.verify;
             scope.spawn(move || {
                 let mut parser = EventParser::new();
+                let mut bulk = BulkVerifier::new();
                 let mut rec = Vec::new();
                 loop {
                     let chunk = match work_rx.lock().unwrap().recv() {
@@ -120,19 +121,27 @@ pub fn run(input: impl Read + Send, w: &mut Writer, opts: ImportOptions, mut pro
                         skipped_kind: 0,
                         invalid: Vec::new(),
                     };
-                    for line in &chunk.lines {
-                        if line.trim().is_empty() {
-                            out.lines -= 1;
-                            continue;
+                    let lines: Vec<&str> = chunk.lines.iter().map(String::as_str).filter(|l| !l.trim().is_empty()).collect();
+                    out.lines = lines.len() as u64;
+                    let take = |r: &Result<EventInfo, Reject>, rec: &[u8], out: &mut Parsed| match r {
+                        Ok(info) if kind::is_ephemeral(info.kind) => out.ephemeral += 1,
+                        Ok(info) if skip_kind.as_ref().is_some_and(|f| f(info.kind)) => out.skipped_kind += 1,
+                        Ok(_) => {
+                            out.data.extend_from_slice(rec);
+                            out.ends.push(out.data.len());
                         }
-                        match parse_event_json(line, &mut parser, &mut rec, verify) {
-                            Ok(info) if kind::is_ephemeral(info.kind) => out.ephemeral += 1,
-                            Ok(info) if skip_kind.as_ref().is_some_and(|f| f(info.kind)) => out.skipped_kind += 1,
-                            Ok(_) => {
-                                out.data.extend_from_slice(&rec);
-                                out.ends.push(out.data.len());
-                            }
-                            Err(e) => out.invalid.push(reason(&e)),
+                        Err(e) => out.invalid.push(reason(e)),
+                    };
+                    if verify {
+                        // Ids hashed several at a time, signatures in one batch.
+                        bulk.verify(&lines);
+                        for (i, r) in bulk.results().iter().enumerate() {
+                            take(r, bulk.record(i), &mut out);
+                        }
+                    } else {
+                        for line in &lines {
+                            let r = parse_event_json(line, &mut parser, &mut rec, false);
+                            take(&r, &rec, &mut out);
                         }
                     }
                     if done_tx.send(out).is_err() {
