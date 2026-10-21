@@ -187,6 +187,8 @@ impl Store {
         check_meta(dir, &opts)?;
         let idx = dir.join("idx");
         std::fs::create_dir_all(&idx)?;
+        // Which step of opening failed, for an error an operator can act on.
+        let step = |what: &'static str| move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
         let ck = checkpoint::read(dir)?;
         let have_ck = ck.is_some();
         let ck = ck.unwrap_or_default();
@@ -196,12 +198,12 @@ impl Store {
             segments.push(Arc::new(Segment::open(id, &bg::seg_path(&idx, id))?));
         }
         // Leftovers of a flush or compaction that never reached a checkpoint.
-        for e in std::fs::read_dir(&idx)?.flatten() {
+        for e in std::fs::read_dir(&idx).map_err(step("listing the index"))?.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
             let listed = name.strip_suffix(".seg").and_then(|n| n.parse::<u64>().ok()).is_some_and(|id| ck.segments.contains(&id));
             if !listed && (name.ends_with(".seg") || name.ends_with(".tmp")) {
-                std::fs::remove_file(e.path())?;
+                std::fs::remove_file(e.path()).map_err(step("removing an unfinished index segment"))?;
             }
         }
 
@@ -213,7 +215,7 @@ impl Store {
         }
 
         let vanish = VanishCfg::new(&opts.vanish_urls);
-        let mut locs = LocsWriter::open(&dir.join("locs"))?;
+        let mut locs = LocsWriter::open(&dir.join("locs")).map_err(step("opening locs"))?;
         let mut kb = KeyBuf::default();
         let mut scratch = Vec::new();
         let mut dead_seqs = Vec::new();
@@ -252,7 +254,8 @@ impl Store {
             } else if fr.seq >= ck.covered {
                 keys::index_keys(Record(fr.record), fr.seq, &mut kb, &mut scratch, &vanish);
             }
-        })?;
+        })
+        .map_err(step("replaying the log"))?;
         if let Some(e) = loc_err {
             return Err(e);
         }
@@ -276,7 +279,7 @@ impl Store {
                     return Err(e);
                 }
             }
-            locs.sync()?;
+            locs.sync().map_err(step("finishing an interrupted log compaction"))?;
         }
 
         dead.grow_to(next_seq);
@@ -332,7 +335,7 @@ impl Store {
         // Expiry kills are not re-derived from the tail like rule kills are:
         // one that was not checkpointed is redone before anything is served.
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        w.sweep_expired(now)?;
+        w.sweep_expired(now).map_err(step("removing expired events"))?;
         Ok((Store { shared }, w))
     }
 

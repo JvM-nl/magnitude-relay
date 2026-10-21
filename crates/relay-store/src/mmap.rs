@@ -31,7 +31,13 @@ impl MappedFile {
     /// Opens (creating if needed) `path`, extends it to at least `len` bytes,
     /// and maps the first `len` bytes.
     pub fn open(path: &Path, len: usize) -> io::Result<MappedFile> {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
         if file.metadata()?.len() < len as u64 {
             file.set_len(len as u64)?;
         }

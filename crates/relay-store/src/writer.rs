@@ -390,6 +390,18 @@ impl Writer {
         })
     }
 
+    /// Lets the background worker finish what it is doing, then stop, so the
+    /// directory is quiet when this returns (dropping the writer instead
+    /// stops the job in progress part way, which the next open finishes or
+    /// discards).
+    pub fn close(mut self) {
+        let (tx, _) = std::sync::mpsc::channel();
+        drop(std::mem::replace(&mut self.jobs, tx));
+        if let Some(h) = self.bg.take() {
+            let _ = h.join();
+        }
+    }
+
     pub fn current(&self) -> Arc<Version> {
         self.shared.current.read().unwrap().clone()
     }

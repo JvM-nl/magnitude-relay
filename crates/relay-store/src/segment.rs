@@ -366,7 +366,7 @@ impl<'a> BlockRef<'a> {
 
 impl Segment {
     pub fn open(id: u64, path: &Path) -> io::Result<Segment> {
-        let len = std::fs::metadata(path)?.len() as usize;
+        let len = std::fs::metadata(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?.len() as usize;
         if len < FOOTER_LEN {
             return Err(io::Error::other(format!("{}: too short for a segment", path.display())));
         }
