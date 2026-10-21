@@ -21,6 +21,7 @@
 pub mod alloc;
 pub mod fuzz;
 pub mod gen;
+pub mod hostile;
 pub mod mutate;
 pub mod rng;
 pub mod sign;

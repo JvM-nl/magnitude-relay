@@ -193,6 +193,34 @@ fn run(mut args: Vec<String>) -> Result<bool, String> {
             }
             Ok(ok)
         }
+        "hostile" => {
+            use relay_adversarial::hostile;
+            let bin = opt(&mut args, "--bin")?.map(PathBuf::from).unwrap_or_else(hostile::relay::default_binary);
+            let cfg = hostile::Cfg {
+                dir: PathBuf::from(opt(&mut args, "--dir")?.ok_or("hostile needs --dir")?),
+                seed: num(&mut args, "--seed")?.unwrap_or(1),
+                secs: opt(&mut args, "--secs")?.map(|s| s.parse().map_err(|_| "--secs: not a number")).transpose()?.unwrap_or(10.0),
+                threads: num(&mut args, "--threads")?.unwrap_or(4) as usize,
+                prefill: num(&mut args, "--prefill")?.unwrap_or(20_000) as usize,
+                scenarios: opt(&mut args, "--scenario")?.map(|s| s.split(',').map(String::from).collect()).unwrap_or_default(),
+                latency: Duration::from_millis(num(&mut args, "--latency-ms")?.unwrap_or(500)),
+                silent: num(&mut args, "--silent")?.unwrap_or(2000) as usize,
+                noread: num(&mut args, "--noread")?.unwrap_or(8),
+                bigreq: num(&mut args, "--bigreq")?.unwrap_or(8),
+                neg_conns: num(&mut args, "--neg-conns")?.unwrap_or(16),
+                bin,
+            };
+            let verdicts = hostile::run(&cfg)?;
+            let mut ok = true;
+            for v in &verdicts {
+                println!("{} {}", if v.ok { "PASS" } else { "FAIL" }, v.name);
+                for l in &v.lines {
+                    println!("    {l}");
+                }
+                ok &= v.ok;
+            }
+            Ok(ok)
+        }
         "open" => {
             // Opens a store as the torture does (for a failure left on disk).
             let dir = PathBuf::from(opt(&mut args, "--dir")?.ok_or("--dir")?);

@@ -41,6 +41,7 @@ pub const CRASH_POINTS: &[&str] = &[
     "reclaim.zeroing",
     "log.flushing",
     "log.zeroing",
+    "log.scrubbing",
     "log.preparing",
     "checkpoint.dead_bits",
     "checkpoint.tmp_written",
