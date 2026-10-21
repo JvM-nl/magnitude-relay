@@ -251,6 +251,7 @@ dependencies = [
 name = "relay-net"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "miniz_oxide",
  "rustls",
  "tokio",
