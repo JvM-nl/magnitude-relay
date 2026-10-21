@@ -48,7 +48,11 @@ async fn backfill(from: &str, to: &str, since: u64) -> Result<BTreeMap<String, u
     let mut until = now();
     let mut page = 0u64;
     let drain = |text: &str, tally: &mut BTreeMap<String, u64>| {
-        if let RelayMsg::Ok { accepted, msg, .. } = parse_relay_msg(text) {
+        if let RelayMsg::Ok { accepted, msg, id } = parse_relay_msg(text) {
+            if accepted && msg.is_empty() {
+                // Something the live feed did not bring: worth knowing which.
+                println!("{} backfill stored {}", now(), relay_proto::hex::encode_string(&id));
+            }
             let prefix = msg.split(':').next().unwrap_or("").to_string();
             *tally.entry(format!("{}{}", if accepted { "ok " } else { "refused " }, if prefix.is_empty() { "stored".into() } else { prefix })).or_default() += 1;
         }
