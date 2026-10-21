@@ -7,7 +7,8 @@
 //! waiting, up to `MAX_BATCH` signatures, and checks them as one batch. Nothing
 //! waits for more to arrive: one verifier works while it has jobs, and the
 //! batch it takes next is whatever came in meanwhile, so batches grow with the
-//! load. Another verifier wakes only when a full batch is still waiting.
+//! load. Another verifier wakes only when `WAKE_AT` signatures are still
+//! waiting.
 //! Reactors never stall their other connections behind a long batch.
 
 use relay_proto::secp::{self, SigRef, Verifier};
@@ -18,6 +19,10 @@ use tokio::sync::oneshot;
 
 /// Most signatures checked as one batch: ~2 ms of work at 16 µs each.
 const MAX_BATCH: usize = 128;
+/// Signatures waiting that wake another verifier while one is busy. At 128
+/// one verifier ran flat out before a second woke, and ingest lost 6-8%; at
+/// 1 batches stayed small (CPU -8% instead of -17%). 48 kept both.
+const WAKE_AT: usize = 48;
 
 /// One read's queued EVENTs: their records end to end, and back from the
 /// verifier with a verdict each.
@@ -156,9 +161,9 @@ impl Pool {
         let mut q = self.inner.q.lock().unwrap();
         q.sigs += job.len();
         q.jobs.push_back((job, tx));
-        // An idle pool gets one verifier; a busy one another, only once a full
-        // batch is waiting beyond what the working ones will take.
-        if q.busy == 0 || (q.sigs >= MAX_BATCH && q.busy < self.inner.threads) {
+        // An idle pool gets one verifier; a busy one another, only once enough
+        // is waiting beyond what the working ones will take.
+        if q.busy == 0 || (q.sigs >= WAKE_AT && q.busy < self.inner.threads) {
             self.inner.ready.notify_one();
         }
         rx
@@ -196,7 +201,7 @@ fn work(inner: &Inner) {
             }
             q.sigs -= n;
             q.busy += 1;
-            if q.sigs >= MAX_BATCH && q.busy < inner.threads {
+            if q.sigs >= WAKE_AT && q.busy < inner.threads {
                 inner.ready.notify_one();
             }
         }

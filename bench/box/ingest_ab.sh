@@ -6,6 +6,8 @@
 # relay-bench, and the relay's CPU time per thread group (writer, reactor-*,
 # syncer, store-bg, ...), in microseconds per event. CPU per thread is what a
 # noisy box disturbs least; the writer's is the ingest ceiling.
+# A binary may be given as VAR=value@path: the relay then runs with VAR set,
+# for comparing one build at two settings.
 set -uo pipefail
 export RELAY_CPUS=${RELAY_CPUS:-0,1,4,5}
 export LOADGEN_CPUS=${LOADGEN_CPUS:-2,3}
@@ -26,10 +28,12 @@ threads() {
     done | awk '{u[$1] += $2; s[$1] += $3} END {for (k in u) print k, u[k], s[k]}' | sort
 }
 
-run() { # binary
-    export BIN_OURS=$1
-    local tag pid before after
-    tag=$(basename "$1")
+run() { # [VAR=value@]binary
+    local tag pid before after setting=
+    case "$1" in *@*) setting=${1%%@*} ;; esac
+    export BIN_OURS=${1#*@}
+    tag=$(basename "$BIN_OURS")${setting:+ $setting}
+    [ -n "$setting" ] && export "${setting?}"
     ./stop.sh ours >/dev/null 2>&1 || true
     ./wipe.sh ours >/dev/null
     ./start.sh ours >/dev/null || { echo "$tag did not start"; return; }
@@ -44,6 +48,7 @@ run() { # binary
           if (u + k >= 0.05) line = line sprintf("  %s %.1f (sys %.1f)", $1, u + k, k) }
         END { printf "%-24s cpu us/event: total %.1f (sys %.1f) |%s\n", tag, tot, sys, line }'
     ./stop.sh ours >/dev/null
+    [ -n "$setting" ] && unset "${setting%%=*}"
 }
 
 for r in $(seq 1 "$rounds"); do
