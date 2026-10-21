@@ -267,7 +267,10 @@ impl Session {
         }
         match cx.sigs.verify(!self.no_batch) {
             Checked::OneByOne => {}
-            Checked::Batch => metrics::add(&cx.m.sigs_batched, cx.sigs.len() as u64),
+            Checked::Batch => {
+                metrics::add(&cx.m.sigs_batched, cx.sigs.len() as u64);
+                metrics::inc(&cx.m.sig_batches);
+            }
             Checked::BatchFailed => {
                 metrics::inc(&cx.m.sig_batches_failed);
                 self.no_batch = true;

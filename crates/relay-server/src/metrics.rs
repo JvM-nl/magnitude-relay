@@ -59,6 +59,8 @@ counters! {
     events_ephemeral,
     /// Signatures accepted by a batch check (a read that brought several EVENTs).
     sigs_batched,
+    /// Batch checks that passed (`sigs_batched` / this is the mean batch size).
+    sig_batches,
     /// Batch checks that failed, so each signature in them was checked alone.
     sig_batches_failed,
     /// EVENT messages sent to subscribers (stored replies and live delivery).
