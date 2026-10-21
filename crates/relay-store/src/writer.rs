@@ -52,6 +52,9 @@ pub struct SyncTicket {
     files: Vec<Arc<crate::mmap::MappedFile>>,
     seq_end: u64,
     durable: Arc<std::sync::atomic::AtomicU64>,
+    /// The batch's number: once synced, its dead flags are on disk.
+    epoch: u64,
+    synced: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SyncTicket {
@@ -63,6 +66,7 @@ impl SyncTicket {
             }
         }
         self.seq_end = self.seq_end.max(later.seq_end);
+        self.epoch = self.epoch.max(later.epoch);
     }
 
     /// Syncs, then advances the durability horizon.
@@ -71,6 +75,7 @@ impl SyncTicket {
             f.sync()?;
         }
         self.durable.fetch_max(self.seq_end, Ordering::AcqRel);
+        self.synced.fetch_max(self.epoch, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -80,6 +85,18 @@ pub struct Staged {
     b: Batch,
     offs: Vec<u64>,
     base_count: u64,
+}
+
+/// Where a log compaction stands.
+enum LogState {
+    Idle,
+    /// The background worker is writing cold segments.
+    Writing,
+    /// Cold segments registered (checkpointed as an intent); waiting until no
+    /// reader can hold a version without them before `locs` points at them.
+    Waiting { reg_gen: u64, moves: Vec<(u64, u64)>, retire: Vec<u64> },
+    /// The background worker is relinking `locs`.
+    Relinking { retire: Vec<u64> },
 }
 
 /// A segment tier: segments within a factor of 4 in size share a level, and a
@@ -109,10 +126,24 @@ pub struct Writer {
     pub(crate) replay_from: u64,
     jobs: Sender<Job>,
     done: Receiver<Done>,
-    segs: (usize, Segs),
-    /// Per published version, the dead records to zero once it (and every
-    /// older version) has no readers left.
-    pending_zero: VecDeque<(Weak<Version>, Vec<u64>)>,
+    segs: ((usize, usize, usize, usize), Segs),
+    /// Every replaced version (gen, handle) with the dead records to zero once
+    /// it, and every older version, has no readers left.
+    /// The fourth field is the batch whose sync must land first: a record's
+    /// bytes may only go once the flag marking it dead is on disk, or a crash
+    /// could leave zeros where a live event is expected.
+    pending_zero: VecDeque<(u64, Weak<Version>, Vec<u64>, u64)>,
+    /// Batches published so far, and the latest whose sync has completed.
+    epoch: u64,
+    synced: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) next_cold: u64,
+    pub(crate) cold_list: Vec<u64>,
+    pub(crate) retired: Vec<u64>,
+    log_state: LogState,
+    /// A log compaction's cold segments and the hot segments they replace,
+    /// from registration until the relink is done: every checkpoint in between
+    /// records it, so a restart finishes the exchange.
+    intent: (Vec<u64>, Vec<u64>),
     scratch: Vec<u8>,
 }
 
@@ -255,12 +286,14 @@ impl Writer {
         next_seg_id: u64,
         covered: u64,
         replay_from: u64,
+        log_lists: (u64, Vec<u64>, Vec<u64>),
     ) -> io::Result<Writer> {
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let idx = dir.join("idx");
         std::thread::Builder::new().name("store-bg".into()).spawn(move || bg::worker(idx, job_rx, done_tx))?;
         let segs = log.segments();
+        let shape = log.shape();
         let vanish = VanishCfg::new(&opts.vanish_urls);
         Ok(Writer {
             shared,
@@ -281,8 +314,15 @@ impl Writer {
             replay_from,
             jobs: job_tx,
             done: done_rx,
-            segs: (segs.len(), segs),
+            segs: (shape, segs),
             pending_zero: VecDeque::new(),
+            epoch: 0,
+            synced: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            next_cold: log_lists.0,
+            cold_list: log_lists.1,
+            retired: log_lists.2,
+            log_state: LogState::Idle,
+            intent: (Vec::new(), Vec::new()),
             scratch: Vec::new(),
         })
     }
@@ -443,8 +483,9 @@ impl Writer {
     pub fn publish_staged(&mut self, s: Staged) -> io::Result<SyncTicket> {
         let Staged { b, offs, base_count } = s;
         if b.new.is_empty() && b.kills.is_empty() {
-            return Ok(SyncTicket { files: Vec::new(), seq_end: self.next_seq, durable: self.shared.durable.clone() });
+            return Ok(self.ticket(Vec::new()));
         }
+        self.epoch += 1;
         let mut zero = Vec::with_capacity(b.kills.len());
         for &seq in &b.kills {
             let off = if seq >= base_count { offs[(seq - base_count) as usize] } else { locs::get(&b.base.locs, seq) };
@@ -465,24 +506,28 @@ impl Writer {
             self.merge_mem();
             lap(2, &mut t);
         }
-        let old = self.publish();
-        self.pending_zero.push_back((Arc::downgrade(&old), zero));
-        drop(old);
+        drop(self.publish());
+        self.defer_zero(zero);
         self.reclaim()?;
         self.maybe_flush()?;
         lap(3, &mut t);
-        Ok(SyncTicket { files, seq_end: self.next_seq, durable: self.shared.durable.clone() })
+        Ok(self.ticket(files))
+    }
+
+    fn ticket(&self, files: Vec<Arc<crate::mmap::MappedFile>>) -> SyncTicket {
+        SyncTicket { files, seq_end: self.next_seq, durable: self.shared.durable.clone(), epoch: self.epoch, synced: self.synced.clone() }
     }
 
     /// Makes everything written durable now, whatever tickets are outstanding:
     /// required before anything persistent (a segment flush, a checkpoint) may
     /// rely on it.
     fn barrier(&mut self) -> io::Result<()> {
-        if self.shared.durable.load(Ordering::Acquire) >= self.next_seq {
+        if self.shared.durable.load(Ordering::Acquire) >= self.next_seq && self.synced.load(Ordering::Acquire) >= self.epoch {
             return Ok(());
         }
         self.log.sync_all()?;
         self.shared.durable.fetch_max(self.next_seq, Ordering::AcqRel);
+        self.synced.fetch_max(self.epoch, Ordering::AcqRel);
         Ok(())
     }
 
@@ -595,7 +640,105 @@ impl Writer {
         while let Ok(d) = self.done.try_recv() {
             self.finish_job(d)?;
         }
+        self.reclaim()?;
+        self.step_log_compaction();
         Ok(())
+    }
+
+    /// Log compaction, one step at a time: start it when enough sealed hot
+    /// segments have built up; relink once no reader can hold a version that
+    /// lacks the new cold segments.
+    fn step_log_compaction(&mut self) {
+        match &self.log_state {
+            LogState::Idle => {
+                let min = self.opts.log_compact_segments;
+                if min == 0 {
+                    return;
+                }
+                let sealed = self.log.sealed(self.replay_from);
+                if sealed.len() >= min {
+                    self.start_log_compaction(sealed);
+                }
+            }
+            LogState::Waiting { reg_gen, .. } => {
+                let reg_gen = *reg_gen;
+                if self.pending_zero.front().is_none_or(|f| f.0 >= reg_gen) {
+                    let LogState::Waiting { moves, retire, .. } = std::mem::replace(&mut self.log_state, LogState::Idle) else { unreachable!() };
+                    let job = Job::LogRelink { moves, dead: self.dead.clone(), locs: self.locs.map() };
+                    if self.jobs.send(job).is_ok() {
+                        self.log_state = LogState::Relinking { retire };
+                    }
+                }
+            }
+            LogState::Writing | LogState::Relinking { .. } => {}
+        }
+    }
+
+    fn start_log_compaction(&mut self, hot: Vec<(u64, Arc<crate::mmap::MappedFile>)>) {
+        if hot.is_empty() {
+            return;
+        }
+        let job = Job::LogCompact {
+            hot,
+            first_cold: self.next_cold,
+            seg_size: self.log.seg_size(),
+            log_dir: self.log.dir().to_path_buf(),
+            dead: self.dead.clone(),
+            version: self.current(),
+        };
+        if self.jobs.send(job).is_ok() {
+            self.log_state = LogState::Writing;
+        }
+    }
+
+    /// Rewrites every sealed hot segment into clustered cold ones and waits for
+    /// the whole exchange to finish (after a bulk import).
+    pub fn compact_log_all(&mut self) -> io::Result<()> {
+        // The rewrite may only take segments a restart would not replay, so the
+        // replay point must first move past them: flush_all checkpoints it.
+        self.flush_all()?;
+        self.settle_log_compaction()?;
+        let sealed = self.log.sealed(self.replay_from);
+        if sealed.is_empty() {
+            return Ok(());
+        }
+        self.start_log_compaction(sealed);
+        self.settle_log_compaction()
+    }
+
+    /// Drives the log compaction in flight to its end without starting another.
+    /// Polls: while waiting for old readers to go there is no job to hear from.
+    fn settle_log_compaction(&mut self) -> io::Result<()> {
+        while !matches!(self.log_state, LogState::Idle) {
+            match self.done.recv_timeout(std::time::Duration::from_millis(5)) {
+                Ok(d) => self.finish_job(d)?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return Err(io::Error::other("store worker stopped")),
+            }
+            self.reclaim()?;
+            if !matches!(self.log_state, LogState::Idle) {
+                self.step_log_compaction();
+            }
+        }
+        Ok(())
+    }
+
+    /// Queues dead records for zeroing once no reader of an older version is left.
+    fn defer_zero(&mut self, offs: Vec<u64>) {
+        if offs.is_empty() {
+            return;
+        }
+        let epoch = self.epoch;
+        match self.pending_zero.back_mut() {
+            Some(b) => {
+                b.2.extend(offs);
+                b.3 = b.3.max(epoch);
+            }
+            None => {
+                let cur = self.current();
+                self.pending_zero.push_back((cur.gen, Arc::downgrade(&cur), offs, epoch));
+            }
+        }
     }
 
     fn finish_job(&mut self, d: Done) -> io::Result<()> {
@@ -626,11 +769,59 @@ impl Writer {
                 }
                 self.maybe_compact();
             }
+            Done::LogCompacted { cold, moves, retire } => {
+                // 1. The cold segments join the table; every version from here on can read them.
+                let mut intent_cold = Vec::with_capacity(cold.len());
+                for (n, f) in cold {
+                    self.log.register_cold(n, f);
+                    self.cold_list.push(n);
+                    intent_cold.push(n);
+                    self.next_cold = self.next_cold.max(n + 1);
+                }
+                drop(self.publish());
+                let reg_gen = self.current().gen;
+                // 2. Record the intent: a crash from here on finishes the exchange at open.
+                self.intent = (intent_cold, retire.clone());
+                self.write_checkpoint()?;
+                // 3. Relink once no reader can hold a version without them.
+                self.log_state = LogState::Waiting { reg_gen, moves, retire };
+                self.step_log_compaction();
+            }
+            Done::LogRelinked { moves } => {
+                let LogState::Relinking { retire } = std::mem::replace(&mut self.log_state, LogState::Idle) else {
+                    return Ok(());
+                };
+                // Events that died while their copy was being written: the cold
+                // copy dies too, and its bytes go like any other dead record's.
+                let mut zero = Vec::new();
+                for (seq, off) in moves {
+                    if self.dead.is_dead(seq) {
+                        self.log.mark_dead(off)?;
+                        zero.push(off);
+                    }
+                }
+                for n in &retire {
+                    self.log.retire_hot(*n);
+                    self.retired.push(*n);
+                }
+                self.intent = (Vec::new(), Vec::new());
+                drop(self.publish());
+                self.defer_zero(zero);
+                self.write_checkpoint()?;
+            }
             Done::Failed(msg) => {
                 eprintln!("store: background job failed: {msg}");
                 self.flushing = false;
                 self.frozen = 0;
                 self.compacting = false;
+            }
+            Done::LogFailed(msg) => {
+                eprintln!("store: background job failed: {msg}");
+                // An unfinished exchange is finished at the next open from its
+                // recorded intent (kept in every checkpoint until then), or never
+                // happened if it failed before registering. No retries until then.
+                self.log_state = LogState::Idle;
+                self.opts.log_compact_segments = 0;
             }
         }
         Ok(())
@@ -675,7 +866,7 @@ impl Writer {
     /// Records that every key below `covered` is in the listed segments, so a
     /// restart replays only the log after `replay_from`. Order matters: `locs`
     /// and the dead set are made durable before the checkpoint that relies on them.
-    fn write_checkpoint(&mut self) -> io::Result<()> {
+    pub(crate) fn write_checkpoint(&mut self) -> io::Result<()> {
         // The dead set may hold kills by batches whose sync is still in flight.
         self.barrier()?;
         self.locs.sync()?;
@@ -684,13 +875,26 @@ impl Writer {
         std::fs::File::open(&dead_tmp)?.sync_all()?;
         std::fs::rename(&dead_tmp, self.dir.join("dead.bits"))?;
         let ids: Vec<u64> = self.segments.iter().map(|s| s.id).collect();
-        crate::checkpoint::write(&self.dir, &crate::checkpoint::Checkpoint { covered: self.covered, replay_from: self.replay_from, next_seg_id: self.next_seg_id, segments: ids })
+        crate::checkpoint::write(
+            &self.dir,
+            &crate::checkpoint::Checkpoint {
+                covered: self.covered,
+                replay_from: self.replay_from,
+                next_seg_id: self.next_seg_id,
+                segments: ids,
+                next_cold: self.next_cold,
+                cold: self.cold_list.clone(),
+                retired: self.retired.clone(),
+                intent_cold: self.intent.0.clone(),
+                intent_retire: self.intent.1.clone(),
+            },
+        )
     }
 
     fn publish(&mut self) -> Arc<Version> {
-        let segs = self.log.segments();
-        if segs.len() != self.segs.0 {
-            self.segs = (segs.len(), segs);
+        let shape = self.log.shape();
+        if shape != self.segs.0 {
+            self.segs = (shape, self.log.segments());
         }
         let mut runs: Vec<Run> = self.segments.iter().map(|s| Run::Disk(s.clone())).collect();
         runs.extend(self.mem.iter().map(|m| Run::Mem(m.clone())));
@@ -706,16 +910,20 @@ impl Writer {
         });
         let old = std::mem::replace(&mut *self.shared.current.write().unwrap(), v);
         self.shared.gen.store(gen, Ordering::Release);
+        // Tracked until no reader holds it: dead records are zeroed, and old log
+        // segments relinked, only once every older version is gone.
+        self.pending_zero.push_back((old.gen, Arc::downgrade(&old), Vec::new(), 0));
         old
     }
 
     /// Zeroes dead records that no live snapshot can reach any more.
     fn reclaim(&mut self) -> io::Result<()> {
-        while let Some((w, _)) = self.pending_zero.front() {
-            if w.strong_count() > 0 {
+        let synced = self.synced.load(Ordering::Acquire);
+        while let Some((_, w, _, epoch)) = self.pending_zero.front() {
+            if w.strong_count() > 0 || *epoch > synced {
                 break;
             }
-            let (_, offs) = self.pending_zero.pop_front().unwrap();
+            let (_, _, offs, _) = self.pending_zero.pop_front().unwrap();
             for off in offs {
                 self.log.zero_record(off)?;
             }

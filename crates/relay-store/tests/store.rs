@@ -19,7 +19,7 @@ fn opts() -> Options {
     // Small log segments so tests cross segment boundaries, and a tiny flush
     // threshold so every test runs through segment files, background flushes,
     // compactions and checkpoints, not just memory runs.
-    Options { segment_size: 64 * 1024, sync: true, flush_bytes: 4096, vanish_urls: vec!["wss://relay.example/nostr".into()] }
+    Options { segment_size: 64 * 1024, sync: true, flush_bytes: 4096, vanish_urls: vec!["wss://relay.example/nostr".into()], log_compact_segments: 2 }
 }
 
 fn hex32(b: u8, n: u64) -> String {
@@ -506,4 +506,350 @@ fn torn_tail_with_precreated_next_segment() {
     drop((store, w));
     let (store, _w) = Store::open(&dir, opts()).unwrap();
     assert_eq!(ids(&store, "{}", 10).len(), 3);
+}
+
+/// Like `ev`, with any pubkey (gift wraps are signed by one-off keys).
+fn ev_by(n: u64, pubkey: &str, created_at: u64, kind: u64, tags: &str, content: &str) -> Vec<u8> {
+    let json = format!(
+        r#"{{"id":"{}","pubkey":"{pubkey}","created_at":{created_at},"kind":{kind},"tags":{tags},"content":"{content}","sig":"{}"}}"#,
+        hex32(0xEE, n),
+        "00".repeat(64)
+    );
+    let mut p = EventParser::new();
+    let mut rec = Vec::new();
+    parse_event_json(&json, &mut p, &mut rec, false).unwrap();
+    rec
+}
+
+fn log_opts(compact_after: usize) -> Options {
+    Options { log_compact_segments: compact_after, ..opts() }
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            copy_dir(&p, &to.join(e.file_name()));
+        } else {
+            std::fs::copy(&p, to.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+/// The live frames of a log segment file: (flags, record).
+fn frames(path: &std::path::Path) -> Vec<(u32, Vec<u8>)> {
+    let data = std::fs::read(path).unwrap();
+    let mut out = Vec::new();
+    let mut o = 0usize;
+    while o + 20 <= data.len() {
+        let len = u32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as usize;
+        if len == 0 {
+            break;
+        }
+        let flags = u32::from_le_bytes(data[o + 4..o + 8].try_into().unwrap());
+        out.push((flags, data[o + 20..o + 20 + len].to_vec()));
+        o += 20 + len;
+    }
+    out
+}
+
+/// A mixed Vector-like workload: DM gift wraps (one-off keys), Concord plane
+/// wraps (one key, many wraps), chat messages and profiles; with deletions by
+/// authors and by wrap recipients, and replaced profiles. Returns the records
+/// that must be live at the end. Every record that dies carries "SECRET".
+struct Workload {
+    rng: Rng,
+    n: u64,
+    live: std::collections::BTreeMap<u64, Vec<u8>>,
+    /// Records that will be deleted later: (n, deleter author byte).
+    doomed: Vec<(u64, u8)>,
+    profile: std::collections::HashMap<u8, u64>,
+}
+
+const PLANE: u8 = 0xA0;
+
+impl Workload {
+    fn new() -> Self {
+        Workload { rng: Rng(0xD1B5_4A32_D192_ED03), n: 0, live: Default::default(), doomed: Vec::new(), profile: Default::default() }
+    }
+
+    fn batch(&mut self, size: u64) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for _ in 0..size {
+            self.n += 1;
+            let n = self.n;
+            let ca = 10_000 + n;
+            let doom = self.rng.below(4) == 0;
+            let content = if doom { format!("SECRET{n}") } else { format!("keep{n}") };
+            let body = format!("{content}-{}", "x".repeat(200 + self.rng.below(300) as usize));
+            let to = self.rng.below(12) as u8 + 1;
+            let rec = match self.rng.below(5) {
+                0 | 1 => {
+                    // A DM wrap from a one-off key; the recipient may delete it.
+                    let tags = format!(r#"[["p","{}"]]"#, pk(to));
+                    if doom {
+                        self.doomed.push((n, to));
+                    }
+                    ev_by(n, &hex32(0xC0, n), ca, 1059, &tags, &body)
+                }
+                2 => {
+                    let tags = format!(r#"[["p","{}"]]"#, pk(to));
+                    if doom {
+                        self.doomed.push((n, to));
+                    }
+                    ev_by(n, &pk(PLANE), ca, 1059, &tags, &body)
+                }
+                3 => {
+                    if doom {
+                        self.doomed.push((n, to));
+                    }
+                    ev(n, to, ca, 14, "[]", &body)
+                }
+                _ => {
+                    // A new profile replaces the author's last one.
+                    if let Some(old) = self.profile.insert(to, n) {
+                        self.live.remove(&old);
+                    }
+                    ev(n, to, ca, 0, "[]", &format!("SECRET-profile-{n}"))
+                }
+            };
+            self.live.insert(n, rec.clone());
+            out.push(rec);
+        }
+        // Deletions of some earlier doomed records, each signed by who may delete it.
+        let k = (self.doomed.len() / 3).min(8);
+        for (target, by) in self.doomed.drain(..k).collect::<Vec<_>>() {
+            self.n += 1;
+            let tags = format!(r#"[["e","{}"]]"#, hex32(0xEE, target));
+            out.push(ev(self.n, by, 10_000 + self.n, 5, &tags, ""));
+            self.live.remove(&target);
+            // The deletion itself stays (it is live too).
+            self.live.insert(self.n, out.last().unwrap().clone());
+        }
+        out
+    }
+
+    fn finish(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for (target, by) in std::mem::take(&mut self.doomed) {
+            self.n += 1;
+            let tags = format!(r#"[["e","{}"]]"#, hex32(0xEE, target));
+            out.push(ev(self.n, by, 10_000 + self.n, 5, &tags, ""));
+            self.live.remove(&target);
+            self.live.insert(self.n, out.last().unwrap().clone());
+        }
+        // The last profiles are live and must not count as secrets: rewrite them.
+        for (&author, &old) in self.profile.clone().iter() {
+            self.n += 1;
+            let r = ev(self.n, author, 10_000 + self.n, 0, "[]", "final");
+            self.live.remove(&old);
+            self.live.insert(self.n, r.clone());
+            self.profile.insert(author, self.n);
+            out.push(r);
+        }
+        out
+    }
+
+    /// Checks a store against the model with a spread of filters.
+    fn check(&self, store: &Store, what: &str) {
+        let snap = store.snapshot();
+        let mut filters = vec![
+            "{}".to_string(),
+            r#"{"kinds":[1059]}"#.to_string(),
+            r#"{"kinds":[0,14]}"#.to_string(),
+            format!(r#"{{"authors":["{}"],"kinds":[1059]}}"#, pk(PLANE)),
+        ];
+        for to in 1..=12u8 {
+            filters.push(format!(r##"{{"kinds":[1059],"#p":["{}"]}}"##, pk(to)));
+            filters.push(format!(r#"{{"authors":["{}"]}}"#, pk(to)));
+        }
+        for fj in &filters {
+            let f = filter(fj);
+            let mut expect: Vec<(u64, [u8; 32])> =
+                self.live.values().map(|r| Record(r)).filter(|r| f.matches(*r)).map(|r| (r.created_at(), *r.id())).collect();
+            expect.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let got: Vec<(u64, [u8; 32])> = snap.query(&f, usize::MAX, 0).iter().map(|h| (h.created_at, h.id)).collect();
+            assert_eq!(got.len(), expect.len(), "{what}: {fj}");
+            assert_eq!(got, expect, "{what}: {fj}");
+            // Every answer's record reads back intact from wherever it now lives.
+            for h in snap.query(&f, 50, 0) {
+                let r = snap.record(h.seq).expect("live");
+                assert_eq!(r.id(), &h.id);
+                assert_eq!(r.0, self.live.values().find(|x| Record(x).id() == &h.id).unwrap().as_slice(), "{what}: bytes of {fj}");
+            }
+        }
+    }
+}
+
+fn cluster_class(r: Record<'_>) -> (u8, [u8; 32], u64) {
+    use relay_proto::record::Field;
+    if r.kind() == 1059 {
+        if r.pubkey() == &hex::decode_32(pk(PLANE).as_bytes()).unwrap() {
+            return (0, *r.pubkey(), r.created_at());
+        }
+        let p = r.tags().find_map(|t| {
+            let mut f = t.fields();
+            match (f.next(), f.next()) {
+                (Some(n), Some(Field::Hex32(p))) if n.is_str(b"p") => Some(*p),
+                _ => None,
+            }
+        });
+        return (1, p.unwrap(), r.created_at());
+    }
+    (2, *r.pubkey(), r.created_at())
+}
+
+#[test]
+fn log_compaction_keeps_every_answer() {
+    let dir = tmpdir("logc");
+    let mut wl = Workload::new();
+    {
+        let (store, mut w) = Store::open(&dir, log_opts(2)).unwrap();
+        // Compactions run in the background while writes and deletions go on.
+        for round in 0..150 {
+            let b = wl.batch(12);
+            write(&mut w, &b);
+            if round % 50 == 49 {
+                wl.check(&store, &format!("round {round}"));
+            }
+        }
+        assert!(!files_under(&dir.join("log").join("cold")).is_empty(), "compactions ran in the background");
+        let b = wl.finish();
+        write(&mut w, &b);
+        w.compact_log_all().unwrap();
+        // A few more batches let the last dead records be zeroed.
+        for _ in 0..3 {
+            let b = wl.batch(2);
+            write(&mut w, &b);
+            w.maintain().unwrap();
+        }
+        let b = wl.finish();
+        write(&mut w, &b);
+        w.compact_log_all().unwrap();
+        write(&mut w, &[]);
+        w.maintain().unwrap();
+        wl.check(&store, "after compaction");
+
+        let log = dir.join("log");
+        let cold: Vec<PathBuf> = files_under(&log.join("cold"));
+        let hot: Vec<PathBuf> = std::fs::read_dir(&log).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "log")).collect();
+        let highest = hot.iter().filter_map(|p| p.file_stem()?.to_str()?.parse::<u64>().ok()).max().unwrap();
+        assert!(!cold.is_empty(), "cold segments written");
+        assert!((hot.len() as u64) < highest / 2, "retired hot segments removed: {} of {}", hot.len(), highest + 1);
+
+        // Each cold segment is in cluster order: plane traffic by author, DM
+        // wraps by recipient, the rest by author; then by time.
+        let mut checked = 0;
+        for c in &cold {
+            let keys: Vec<_> = frames(c).into_iter().filter(|f| f.0 == 0).map(|f| cluster_class(Record(&f.1))).collect();
+            assert!(keys.windows(2).all(|w| w[0] <= w[1]), "{} is out of cluster order", c.display());
+            checked += keys.len();
+        }
+        assert!(checked > 500, "most records live in cold segments ({checked})");
+
+        // Nothing that died is left readable on disk, hot or cold.
+        for f in files_under(&log) {
+            let data = std::fs::read(&f).unwrap();
+            assert!(!data.windows(6).any(|w| w == b"SECRET"), "deleted content left in {}", f.display());
+        }
+    }
+    let (store, mut w) = Store::open(&dir, log_opts(2)).unwrap();
+    wl.check(&store, "after reopen");
+    // And it keeps working: more writes, more compactions.
+    for _ in 0..40 {
+        let b = wl.batch(12);
+        write(&mut w, &b);
+    }
+    let b = wl.finish();
+    write(&mut w, &b);
+    w.compact_log_all().unwrap();
+    wl.check(&store, "after more compaction");
+    drop((store, w));
+    let (store, _w) = Store::open(&dir, log_opts(2)).unwrap();
+    wl.check(&store, "after second reopen");
+}
+
+#[test]
+fn interrupted_log_compaction_finishes_at_open() {
+    let dir = tmpdir("logc-crash");
+    let mut wl = Workload::new();
+    {
+        let (_s, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+        for _ in 0..60 {
+            let b = wl.batch(12);
+            write(&mut w, &b);
+        }
+        let b = wl.finish();
+        write(&mut w, &b);
+        w.flush_all().unwrap();
+    }
+    // The state just before a compaction.
+    let before = tmpdir("logc-before");
+    copy_dir(&dir, &before);
+    let ck_before = relay_store::checkpoint::read(&dir).unwrap().unwrap();
+    {
+        let (_s, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+        w.compact_log_all().unwrap();
+    }
+    let ck_after = relay_store::checkpoint::read(&dir).unwrap().unwrap();
+    let new_cold: Vec<u64> = ck_after.cold.iter().copied().filter(|n| !ck_before.cold.contains(n)).collect();
+    let retired: Vec<u64> = ck_after.retired.iter().copied().filter(|n| !ck_before.retired.contains(n)).collect();
+    assert!(!new_cold.is_empty() && !retired.is_empty());
+    assert!(ck_after.intent_cold.is_empty() && ck_after.intent_retire.is_empty());
+
+    // 1. Died while the cold segments were being written: they are leftovers.
+    let crash1 = tmpdir("logc-crash1");
+    copy_dir(&before, &crash1);
+    copy_dir(&dir.join("log").join("cold"), &crash1.join("log").join("cold"));
+    {
+        let (store, _w) = Store::open(&crash1, log_opts(0)).unwrap();
+        wl.check(&store, "crash while writing");
+        assert!(files_under(&crash1.join("log").join("cold")).is_empty(), "unregistered cold segments removed");
+    }
+
+    // 2. Died after the intent was recorded, before `locs` pointed at the cold
+    //    copies (and with the old hot segments gone or not): open finishes it.
+    for keep_hot in [true, false] {
+        let crash2 = tmpdir("logc-crash2");
+        copy_dir(&before, &crash2);
+        copy_dir(&dir.join("log").join("cold"), &crash2.join("log").join("cold"));
+        if !keep_hot {
+            for n in &retired {
+                std::fs::remove_file(crash2.join("log").join(format!("{n:08}.log"))).unwrap();
+            }
+        }
+        let mut ck = ck_before.clone();
+        ck.next_cold = ck_after.next_cold;
+        ck.cold = ck_after.cold.clone();
+        ck.intent_cold = new_cold.clone();
+        ck.intent_retire = retired.clone();
+        relay_store::checkpoint::write(&crash2, &ck).unwrap();
+        {
+            let (store, _w) = Store::open(&crash2, log_opts(0)).unwrap();
+            wl.check(&store, &format!("crash before relink (hot kept: {keep_hot})"));
+        }
+        let ck = relay_store::checkpoint::read(&crash2).unwrap().unwrap();
+        assert!(ck.intent_cold.is_empty() && ck.intent_retire.is_empty(), "intent finished");
+        for n in &retired {
+            assert!(ck.retired.contains(n));
+            assert!(!crash2.join("log").join(format!("{n:08}.log")).exists());
+        }
+        let (store, _w) = Store::open(&crash2, log_opts(0)).unwrap();
+        wl.check(&store, "reopen after finishing");
+    }
 }

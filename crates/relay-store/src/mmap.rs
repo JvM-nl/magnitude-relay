@@ -16,6 +16,10 @@ pub struct MappedFile {
     file: File,
     ptr: NonNull<u8>,
     len: usize,
+    path: std::path::PathBuf,
+    /// Set when the file has been retired: it is deleted when the last holder
+    /// (a published version) lets go of it.
+    obsolete: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: the mapping is read-only and lives as long as the struct; all
@@ -31,10 +35,10 @@ impl MappedFile {
         if file.metadata()?.len() < len as u64 {
             file.set_len(len as u64)?;
         }
-        Self::map(file, len)
+        Self::map(file, len, path)
     }
 
-    fn map(file: File, len: usize) -> io::Result<MappedFile> {
+    fn map(file: File, len: usize, path: &Path) -> io::Result<MappedFile> {
         assert!(len > 0, "cannot map an empty range");
         // SAFETY: a fresh shared read-only mapping of a file we keep open.
         let p = unsafe {
@@ -44,7 +48,7 @@ impl MappedFile {
             return Err(io::Error::last_os_error());
         }
         let ptr = NonNull::new(p.cast::<u8>()).ok_or_else(|| io::Error::other("mmap returned null"))?;
-        Ok(MappedFile { file, ptr, len })
+        Ok(MappedFile { file, ptr, len, path: path.to_path_buf(), obsolete: std::sync::atomic::AtomicBool::new(false) })
     }
 
     #[inline]
@@ -137,11 +141,21 @@ pub enum Advice {
     WillNeed,
 }
 
+impl MappedFile {
+    /// The file goes once nothing holds this mapping any more.
+    pub fn mark_obsolete(&self) {
+        self.obsolete.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl Drop for MappedFile {
     fn drop(&mut self) {
         // SAFETY: unmapping the exact range we mapped; no slices outlive `self`.
         unsafe {
             libc::munmap(self.ptr.as_ptr().cast(), self.len);
+        }
+        if self.obsolete.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }

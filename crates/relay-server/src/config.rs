@@ -262,6 +262,7 @@ impl StoreCfg {
             sync: self.sync,
             flush_bytes: (self.memory_mb as usize) << 20,
             vanish_urls: Vec::new(),
+            ..relay_store::Options::default()
         }
     }
 }

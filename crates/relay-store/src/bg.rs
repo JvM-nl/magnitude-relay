@@ -7,8 +7,14 @@
 
 use crate::dead::DeadSet;
 use crate::keys;
+use crate::log::{self, COLD_BASE, FRAME_HEADER};
 use crate::memrun::MemRun;
+use crate::mmap::MappedFile;
 use crate::segment::{SegCursor, Segment, SegmentWriter};
+use crate::version::Version;
+use relay_proto::record::{Field, Record};
+use relay_proto::kind;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -17,12 +23,20 @@ use std::sync::Arc;
 pub enum Job {
     Flush { id: u64, runs: Vec<Arc<MemRun>>, dead: DeadSet, covered: u64, replay_from: u64 },
     Compact { id: u64, segs: Vec<Arc<Segment>>, dead: DeadSet },
+    /// Rewrite sealed hot log segments into clustered cold ones.
+    LogCompact { hot: Vec<(u64, Arc<MappedFile>)>, first_cold: u64, seg_size: u64, log_dir: PathBuf, dead: DeadSet, version: Arc<Version> },
+    /// Point `locs` at the cold copies (once no reader can hold a version without them).
+    LogRelink { moves: Vec<(u64, u64)>, dead: DeadSet, locs: Arc<MappedFile> },
 }
 
 pub enum Done {
     Flushed { seg: Arc<Segment>, frozen: usize, covered: u64, replay_from: u64 },
     Compacted { seg: Arc<Segment>, replaced: Vec<u64> },
+    LogCompacted { cold: Vec<(u64, Arc<MappedFile>)>, moves: Vec<(u64, u64)>, retire: Vec<u64> },
+    LogRelinked { moves: Vec<(u64, u64)> },
     Failed(String),
+    /// A log compaction or relink failed.
+    LogFailed(String),
 }
 
 pub fn seg_path(dir: &Path, id: u64) -> PathBuf {
@@ -48,6 +62,14 @@ pub fn worker(dir: PathBuf, rx: Receiver<Job>, tx: Sender<Done>) {
                     Err(e) => Done::Failed(format!("compaction into segment {id}: {e}")),
                 }
             }
+            Job::LogCompact { hot, first_cold, seg_size, log_dir, dead, version } => match compact_log(&hot, first_cold, seg_size, &log_dir, &dead, &version) {
+                Ok((cold, moves)) => Done::LogCompacted { cold, moves, retire: hot.iter().map(|h| h.0).collect() },
+                Err(e) => Done::LogFailed(format!("log compaction: {e}")),
+            },
+            Job::LogRelink { moves, dead, locs } => match relink(&moves, &dead, &locs) {
+                Ok(()) => Done::LogRelinked { moves },
+                Err(e) => Done::LogFailed(format!("log relink: {e}")),
+            },
         };
         if tx.send(done).is_err() {
             return;
@@ -131,4 +153,130 @@ fn write(dir: &Path, id: u64, mut srcs: Vec<Src<'_>>, dead: &DeadSet) -> io::Res
 /// Makes a rename durable.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
+}
+
+/// Input bytes sorted together in one pass: bounds memory (~70 bytes per live
+/// record in flight) on small machines; clustering is within each group.
+const LOG_GROUP_BYTES: u64 = 2 << 30;
+
+/// Where a record belongs in a cold segment: who reads it. Concord plane traffic
+/// (a gift-wrap author with more than one wrap) by author; a DM gift wrap by its
+/// recipient; anything else by author. Then by time.
+fn cluster_key(r: Record<'_>, v: &Version, planes: &mut HashMap<[u8; 32], bool>) -> [u8; 41] {
+    let mut k = [0u8; 41];
+    let ca = r.created_at().to_be_bytes();
+    k[33..].copy_from_slice(&ca);
+    if r.kind() == kind::GIFT_WRAP {
+        let pk = *r.pubkey();
+        let plane = *planes.entry(pk).or_insert_with(|| v.prefix_has(&keys::prefix(keys::T_AUTHOR_KIND, &[&pk, &kind::GIFT_WRAP.to_be_bytes()]), 2));
+        if plane {
+            k[0] = 0;
+            k[1..33].copy_from_slice(&pk);
+        } else {
+            k[0] = 1;
+            let p = r.tags().find_map(|t| {
+                let mut f = t.fields();
+                match (f.next(), f.next()) {
+                    (Some(n), Some(Field::Hex32(p))) if n.is_str(b"p") => Some(*p),
+                    _ => None,
+                }
+            });
+            k[1..33].copy_from_slice(&p.unwrap_or([0; 32]));
+        }
+    } else {
+        k[0] = 2;
+        k[1..33].copy_from_slice(r.pubkey());
+    }
+    k
+}
+
+/// Writes the live records of `hot` into new cold segments numbered from
+/// `first_cold`, clustered, each synced. Returns the segments and every move
+/// as (seq, new global offset).
+#[allow(clippy::type_complexity)]
+fn compact_log(hot: &[(u64, Arc<MappedFile>)], first_cold: u64, seg_size: u64, log_dir: &Path, dead: &DeadSet, v: &Version) -> io::Result<(Vec<(u64, Arc<MappedFile>)>, Vec<(u64, u64)>)> {
+    let mut planes = HashMap::new();
+    let mut out: Vec<(u64, Arc<MappedFile>)> = Vec::new();
+    let mut moves = Vec::new();
+    let mut next_cold = first_cold;
+    let mut cur: Option<(u64, Arc<MappedFile>, u64)> = None; // (number, file, write position)
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
+    let mut buf_at = 0u64;
+
+    let mut groups: Vec<&[(u64, Arc<MappedFile>)]> = Vec::new();
+    let per_group = (LOG_GROUP_BYTES / seg_size).max(1) as usize;
+    for g in hot.chunks(per_group) {
+        groups.push(g);
+    }
+    for group in groups {
+        // (cluster key, segment index in `hot`, offset in segment, frame length, seq)
+        let mut recs: Vec<([u8; 41], u32, u32, u32, u64)> = Vec::new();
+        for (gi, (n, seg)) in group.iter().enumerate() {
+            let clean = log::scan_hot(seg, seg_size, *n, |fr| {
+                if fr.dead || dead.is_dead(fr.seq) {
+                    return;
+                }
+                let k = cluster_key(Record(fr.record), v, &mut planes);
+                let o = (fr.off % seg_size) as u32;
+                recs.push((k, gi as u32, o, (FRAME_HEADER + fr.record.len()) as u32, fr.seq));
+            });
+            if !clean {
+                return Err(io::Error::other(format!("log segment {n:08}.log has a damaged frame; not compacting it")));
+            }
+        }
+        recs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.4.cmp(&b.4)));
+        for (_, gi, o, len, seq) in recs {
+            let seg = &group[gi as usize].1;
+            let frame = seg.slice(o as usize, len as usize);
+            // Opening a new cold segment when the frame does not fit.
+            let fits = cur.as_ref().is_some_and(|c| c.2 + len as u64 <= seg_size);
+            if !fits {
+                if let Some((_, f, _)) = cur.take() {
+                    f.write_at(buf_at, &buf)?;
+                    buf.clear();
+                    f.sync()?;
+                    out.push((next_cold - 1, f));
+                }
+                let f = Arc::new(MappedFile::open(&log::cold_path(log_dir, next_cold), seg_size as usize)?);
+                cur = Some((next_cold, f, 0));
+                next_cold += 1;
+                buf_at = 0;
+            }
+            let c = cur.as_mut().unwrap();
+            moves.push((seq, (COLD_BASE + c.0) * seg_size + c.2));
+            buf.extend_from_slice(frame);
+            c.2 += len as u64;
+            if buf.len() >= 1 << 20 {
+                c.1.write_at(buf_at, &buf)?;
+                buf_at += buf.len() as u64;
+                buf.clear();
+            }
+        }
+    }
+    if let Some((n, f, _)) = cur.take() {
+        f.write_at(buf_at, &buf)?;
+        f.sync()?;
+        out.push((n, f));
+    }
+    sync_dir(&log_dir.join("cold"))?;
+    Ok((out, moves))
+}
+
+/// Points `locs` at the cold copies of every move whose event is still live,
+/// coalescing runs of consecutive seqs into one write, then syncs it.
+fn relink(moves: &[(u64, u64)], dead: &DeadSet, locs: &MappedFile) -> io::Result<()> {
+    let mut live: Vec<(u64, u64)> = moves.iter().copied().filter(|m| !dead.is_dead(m.0)).collect();
+    live.sort_unstable();
+    let mut i = 0;
+    let mut chunk = Vec::new();
+    while i < live.len() {
+        let start = live[i].0;
+        chunk.clear();
+        while i < live.len() && live[i].0 == start + (chunk.len() / 8) as u64 {
+            chunk.extend_from_slice(&live[i].1.to_le_bytes());
+            i += 1;
+        }
+        locs.write_at(start * 8, &chunk)?;
+    }
+    locs.sync()
 }

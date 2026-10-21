@@ -121,6 +121,11 @@ fn run() -> Result<(), String> {
             let tc = Instant::now();
             w.compact_all().map_err(|e| e.to_string())?;
             eprintln!("index flushed and compacted into {} segment(s) in {:.2}s", w.segment_count(), tc.elapsed().as_secs_f64());
+            // And the log laid out by reader: a conversation's events end up
+            // next to each other instead of scattered across arrival order.
+            let tl = Instant::now();
+            w.compact_log_all().map_err(|e| e.to_string())?;
+            eprintln!("log clustered in {:.2}s", tl.elapsed().as_secs_f64());
             eprintln!(
                 "imported {} lines ({:.1} MB) in {:.2}s: {:.0} lines/s, {:.1} MB/s",
                 stats.lines,

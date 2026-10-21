@@ -53,11 +53,14 @@ pub struct Options {
     /// This relay's own URLs (`wss://host/path`). A NIP-62 request to vanish is
     /// honoured when it names one of them or `ALL_RELAYS`.
     pub vanish_urls: Vec<String>,
+    /// Sealed hot log segments that trigger a log compaction (clustering and
+    /// space reclaim); 0 never compacts automatically.
+    pub log_compact_segments: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { segment_size: 1 << 30, sync: true, flush_bytes: 64 << 20, vanish_urls: Vec::new() }
+        Options { segment_size: 1 << 30, sync: true, flush_bytes: 64 << 20, vanish_urls: Vec::new(), log_compact_segments: 2 }
     }
 }
 
@@ -175,7 +178,11 @@ impl Store {
         let mut dead_seqs = Vec::new();
         let mut next_seq = ck.covered;
         let mut loc_err: Option<io::Error> = None;
-        let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, |fr| {
+        // A log compaction the last run did not finish: its old hot segments go
+        // (their records all have cold copies), and `locs` is re-derived below.
+        let mut retired = ck.retired.clone();
+        retired.extend(&ck.intent_retire);
+        let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, &retired, &ck.cold, |fr: log::Frame<'_>| {
             if loc_err.is_none() {
                 if let Err(e) = locs.set(fr.seq, fr.off) {
                     loc_err = Some(e);
@@ -190,6 +197,27 @@ impl Store {
         })?;
         if let Some(e) = loc_err {
             return Err(e);
+        }
+        if !ck.intent_cold.is_empty() {
+            let segs = log.segments();
+            for &n in &ck.intent_cold {
+                let Some(f) = segs.file(log::COLD_BASE + n) else { continue };
+                let mut err = None;
+                log::scan_cold(f, opts.segment_size, n, |fr| {
+                    if fr.dead {
+                        // Its hot copy is gone: whatever killed it must hold.
+                        dead_seqs.push(fr.seq);
+                    } else if err.is_none() && !dead.is_dead(fr.seq) {
+                        if let Err(e) = locs.set(fr.seq, fr.off) {
+                            err = Some(e);
+                        }
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
+            }
+            locs.sync()?;
         }
 
         dead.grow_to(next_seq);
@@ -218,8 +246,30 @@ impl Store {
             runs: Arc::new(runs),
         });
         let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0), durable: Arc::new(AtomicU64::new(next_seq)) });
-        let mut w = Writer::new(shared.clone(), log, locs, dead, segments, mem, next_seq, opts, dir.to_path_buf(), ck.next_seg_id, ck.covered, ck.replay_from)?;
+        let finish_intent = !ck.intent_cold.is_empty();
+        let mut w = Writer::new(
+            shared.clone(),
+            log,
+            locs,
+            dead,
+            segments,
+            mem,
+            next_seq,
+            opts,
+            dir.to_path_buf(),
+            ck.next_seg_id,
+            ck.covered,
+            ck.replay_from,
+            (ck.next_cold, ck.cold.clone(), retired),
+        )?;
+        if finish_intent {
+            w.write_checkpoint()?;
+        }
         w.repair(&tail)?;
+        // Expiry kills are not re-derived from the tail like rule kills are:
+        // one that was not checkpointed is redone before anything is served.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        w.sweep_expired(now)?;
         Ok((Store { shared }, w))
     }
 

@@ -253,6 +253,22 @@ impl Version {
         found
     }
 
+    /// True if at least `n` keys start with bloom prefix `p` (live or not).
+    pub fn prefix_has(&self, p: &[u8], n: usize) -> bool {
+        let end = prefix_end(p);
+        let mut seen = 0;
+        for r in self.runs.iter() {
+            r.scan(p, &end, Some(p), &mut |_| {
+                seen += 1;
+                seen < n
+            });
+            if seen >= n {
+                return true;
+            }
+        }
+        false
+    }
+
     /// True if exactly `key` exists in some run (tombstone lookups).
     pub fn has_key(&self, key: &[u8]) -> bool {
         self.runs.iter().any(|r| r.contains(key))
