@@ -9,7 +9,7 @@
 use crate::config::Config;
 use crate::ingest::{ReactorMsg, WriteReq};
 use crate::metrics::{self, Metrics};
-use crate::session::{self, Ctx, Outbox, Session, SessionCfg};
+use crate::session::{self, Ctx, Outbox, Session, SessionCfg, SigQueue};
 use crate::sock::{Incoming, Sock, TlsConfig};
 use crate::subs::{ConnId, FxMap, SubIndex};
 use relay_net::conn::{server_handshake_with, Handshake, OwnedRequest};
@@ -210,6 +210,7 @@ struct Reactor {
     conns: FxMap<ConnId, Rc<ConnOut>>,
     parser: EventParser,
     rec: Vec<u8>,
+    sigs: SigQueue,
     /// Read buffer shared by every connection on this reactor.
     scratch: Vec<u8>,
     /// Live batches relayed but not yet published, oldest first.
@@ -306,6 +307,7 @@ pub fn run(
             conns: FxMap::default(),
             parser: EventParser::new(),
             rec: Vec::new(),
+            sigs: SigQueue::default(),
             scratch: vec![0; READ_CHUNK],
             pending: std::collections::VecDeque::new(),
         }));
@@ -561,12 +563,47 @@ struct Pass {
     more: bool,
 }
 
-/// Decodes and answers whole frames in `data` until the buffer or the turn's
-/// time budget runs out.
-fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> Pass {
+/// Runs `f` with this reactor's context for a session, its replies going to `out`.
+fn with_cx(st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr, conn: ConnId, out: &ConnOut, f: impl FnOnce(&mut Ctx<'_>, &mut WsOut<'_>)) {
     let broadcast = |m: ReactorMsg| shared.broadcast(m);
     let allow_event = || shared.take_event(ip);
     let offload = |job: crate::ingest::CountJob| shared.counts.get().is_some_and(|q| q.try_send(job).is_ok());
+    let mut guard = st.borrow_mut();
+    let r = &mut *guard;
+    shared.store.refresh(&mut r.snap);
+    let mut cx = Ctx {
+        cfg: &shared.scfg,
+        store: &shared.store,
+        snap: &mut r.snap,
+        subs: &mut r.subs,
+        writer: &shared.writer,
+        reactor: r.idx,
+        broadcast: &broadcast,
+        allow_event: &allow_event,
+        parser: &mut r.parser,
+        rec: &mut r.rec,
+        sigs: &mut r.sigs,
+        now: crate::ingest::now(),
+        m: shared.metrics.of(r.idx),
+        pending: &r.pending,
+        offload: &offload,
+        conn,
+    };
+    out.write(|w| f(&mut cx, w));
+}
+
+/// Decodes and answers whole frames in `data` until the buffer or the turn's
+/// time budget runs out. EVENTs among them have their signatures checked
+/// together once the frames are done (or before any other kind of frame).
+fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> Pass {
+    let conn = session.conn;
+    let p = process_frames(data, dec, session, out, st, shared, ip);
+    with_cx(st, shared, ip, conn, out, |cx, w| session.flush_events(cx, w));
+    p
+}
+
+fn process_frames(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> Pass {
+    let conn = session.conn;
     let started = Instant::now();
     let mut off = 0;
     loop {
@@ -576,6 +613,7 @@ fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &Conn
         let d = match dec.decode(&mut data[off..]) {
             Ok(d) => d,
             Err(e) => {
+                with_cx(st, shared, ip, conn, out, |cx, w| session.flush_events(cx, w));
                 ws::write_close(&mut out.buf.borrow_mut(), e.close_code(), e.reason());
                 return Pass { used: off, closing: true, more: false };
             }
@@ -583,36 +621,20 @@ fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &Conn
         off += d.consumed;
         match d.event {
             Some(Event::Text(t)) => {
-                let mut guard = st.borrow_mut();
-                let r = &mut *guard;
-                let m = shared.metrics.of(r.idx);
-                metrics::inc(&m.messages_in);
-                shared.store.refresh(&mut r.snap);
-                let mut cx = Ctx {
-                    cfg: &shared.scfg,
-                    store: &shared.store,
-                    snap: &mut r.snap,
-                    subs: &mut r.subs,
-                    writer: &shared.writer,
-                    reactor: r.idx,
-                    broadcast: &broadcast,
-                    allow_event: &allow_event,
-                    parser: &mut r.parser,
-                    rec: &mut r.rec,
-                    now: crate::ingest::now(),
-                    m,
-                    pending: &r.pending,
-                    offload: &offload,
-                    conn: session.conn,
-                };
-                out.write(|w| session.on_text(t, &mut cx, w));
+                metrics::inc(&shared.metrics.of(st.borrow().idx).messages_in);
+                with_cx(st, shared, ip, conn, out, |cx, w| session.on_text(t, cx, w));
             }
             Some(Event::Binary(_)) => {
-                out.write(|w| session::notice(w, "error: binary messages are not supported"));
+                with_cx(st, shared, ip, conn, out, |cx, w| {
+                    session.flush_events(cx, w);
+                    session::notice(w, "error: binary messages are not supported");
+                });
             }
             Some(Event::Ping(p)) => ws::write_pong(&mut out.buf.borrow_mut(), p),
             Some(Event::Pong(_)) => {}
             Some(Event::Close(c)) => {
+                // Nothing may follow the close frame: answer queued EVENTs first.
+                with_cx(st, shared, ip, conn, out, |cx, w| session.flush_events(cx, w));
                 let mut b = out.buf.borrow_mut();
                 match c {
                     Some((code, _)) => ws::write_close(&mut b, code, ""),

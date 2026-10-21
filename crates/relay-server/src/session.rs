@@ -5,10 +5,11 @@
 use crate::ingest::{ReactorMsg, Reply, WriteReq};
 use crate::metrics::{self, Block};
 use crate::subs::{ConnId, SubIndex};
-use relay_proto::event::{verify_sig, EventInfo};
+use relay_proto::event::EventInfo;
 use relay_proto::json::{escape_str, Scanner};
 use relay_proto::message::{ClientMsg, MsgError};
 use relay_proto::negentropy::{self, VecStorage};
+use relay_proto::secp::{self, SigRef, Verifier};
 use relay_proto::{hex, kind, EventParser, Filter, Record};
 use relay_store::{Outcome, Store, Version};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -84,6 +85,8 @@ pub struct Ctx<'a> {
     pub allow_event: &'a dyn Fn() -> bool,
     pub parser: &'a mut EventParser,
     pub rec: &'a mut Vec<u8>,
+    /// Events from this read waiting for their signature check.
+    pub sigs: &'a mut SigQueue,
     pub now: u64,
     /// This reactor's counters.
     pub m: &'a Block,
@@ -107,21 +110,100 @@ const MAX_NEG_ITEMS: usize = 2_000_000;
 /// frame Vector's negentropy client assumes.
 const NEG_FRAME_LIMIT: usize = 50_000;
 
+/// Most events checked in one go: about 0.35 ms of verification at the
+/// batch's 22 us per signature, near the reactor's turn budget, so a burst
+/// still yields to the reactor's other connections.
+const MAX_QUEUED: usize = 16;
+
+/// EVENTs that passed every check but the signature, held until the frames of
+/// the current read are all parsed so their signatures can be checked as one
+/// batch. Nothing waits for more input: a read with one EVENT verifies one.
+/// One per reactor.
+#[derive(Default)]
+pub struct SigQueue {
+    pub verifier: Verifier,
+    recs: Vec<u8>,
+    ends: Vec<usize>,
+    kinds: Vec<u64>,
+    ok: Vec<bool>,
+}
+
+impl SigQueue {
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    fn push(&mut self, rec: &[u8], kind: u64) {
+        self.recs.extend_from_slice(rec);
+        self.ends.push(self.recs.len());
+        self.kinds.push(kind);
+    }
+
+    /// Checks every queued signature, verdicts in `ok`.
+    fn verify(&mut self, batch: bool) -> Checked {
+        let mut start = 0;
+        let refs: Vec<SigRef<'_>> = self
+            .ends
+            .iter()
+            .map(|&end| {
+                let r = Record(&self.recs[start..end]);
+                start = end;
+                SigRef { pubkey: r.pubkey(), msg: r.id(), sig: r.sig() }
+            })
+            .collect();
+        if batch && refs.len() >= secp::MIN_BATCH {
+            return if self.verifier.verify_batch(&refs, &mut self.ok) { Checked::Batch } else { Checked::BatchFailed };
+        }
+        self.ok.clear();
+        for r in &refs {
+            let v = self.verifier.verify_one(r);
+            self.ok.push(v);
+        }
+        Checked::OneByOne
+    }
+}
+
+/// How a queue's signatures were checked.
+enum Checked {
+    OneByOne,
+    Batch,
+    /// The batch failed, and the signatures were then checked alone.
+    BatchFailed,
+}
+
 pub struct Session {
     pub conn: ConnId,
     /// Events queued to the writer and not yet answered.
     pub pending: usize,
     neg: Vec<(Box<str>, VecStorage)>,
+    /// A batch of this connection's signatures failed once: check the rest
+    /// one at a time (a client mixing bad signatures into bursts would
+    /// otherwise make every batch pay twice).
+    no_batch: bool,
 }
 
 impl Session {
     pub fn new(conn: ConnId) -> Session {
-        Session { conn, pending: 0, neg: Vec::new() }
+        Session { conn, pending: 0, neg: Vec::new(), no_batch: false }
     }
 
     pub fn on_text(&mut self, text: &str, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
-        match ClientMsg::parse(text, cx.parser, cx.rec) {
-            Ok(ClientMsg::Event { info, at }) => self.on_event(text, info, at, cx, out),
+        let msg = ClientMsg::parse(text, cx.parser, cx.rec);
+        if !matches!(msg, Ok(ClientMsg::Event { .. })) {
+            // Replies keep the order the messages came in.
+            self.flush_events(cx, out);
+        }
+        match msg {
+            Ok(ClientMsg::Event { info, at }) => {
+                self.on_event(text, info, at, cx, out);
+                if cx.sigs.len() >= MAX_QUEUED {
+                    self.flush_events(cx, out);
+                }
+            }
             Ok(ClientMsg::Req { sub_id, filters }) => self.on_req(sub_id, filters, cx, out),
             Ok(ClientMsg::Count { sub_id, filters }) => self.on_count(sub_id, filters, cx, out),
             Ok(ClientMsg::Close { sub_id }) => {
@@ -164,17 +246,54 @@ impl Session {
             metrics::inc(&cx.m.events_refused);
             return ok(out, &id, false, "invalid: bad event id");
         }
-        if !verify_sig(Record(cx.rec)) {
+        // The signature last, together with any other EVENTs from this read.
+        cx.sigs.push(cx.rec, info.kind);
+    }
+
+    /// Verifies the queued signatures and finishes each event in arrival
+    /// order. The reactor calls this when a read's frames are done, and
+    /// `on_text` before anything that is not an EVENT.
+    pub fn flush_events(&mut self, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
+        if cx.sigs.is_empty() {
+            return;
+        }
+        match cx.sigs.verify(!self.no_batch) {
+            Checked::OneByOne => {}
+            Checked::Batch => metrics::add(&cx.m.sigs_batched, cx.sigs.len() as u64),
+            Checked::BatchFailed => {
+                metrics::inc(&cx.m.sig_batches_failed);
+                self.no_batch = true;
+            }
+        }
+        // The buffers come out of the queue while the events finish (finishing
+        // needs the whole context), and go back empty for the next read.
+        let (recs, ends, kinds) = (std::mem::take(&mut cx.sigs.recs), std::mem::take(&mut cx.sigs.ends), std::mem::take(&mut cx.sigs.kinds));
+        let ok = std::mem::take(&mut cx.sigs.ok);
+        let mut start = 0;
+        for ((&end, &kind), &valid) in ends.iter().zip(&kinds).zip(&ok) {
+            self.finish_event(&recs[start..end], kind, valid, cx, out);
+            start = end;
+        }
+        let q = &mut *cx.sigs;
+        (q.recs, q.ends, q.kinds, q.ok) = (recs, ends, kinds, ok);
+        q.recs.clear();
+        q.ends.clear();
+        q.kinds.clear();
+    }
+
+    fn finish_event(&mut self, rec: &[u8], kind: u64, valid: bool, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
+        let id = *Record(rec).id();
+        if !valid {
             metrics::inc(&cx.m.events_refused);
             return ok(out, &id, false, "invalid: bad signature");
         }
-        if kind::is_ephemeral(info.kind) {
+        if kind::is_ephemeral(kind) {
             metrics::inc(&cx.m.events_ephemeral);
-            (cx.broadcast)(ReactorMsg::Ephemeral(Arc::from(cx.rec.as_slice())));
+            (cx.broadcast)(ReactorMsg::Ephemeral(Arc::from(rec)));
             // Even with nobody listening: Vector's relay check treats a refusal as fatal.
             return ok(out, &id, true, "");
         }
-        match cx.writer.try_send(WriteReq { reactor: cx.reactor, conn: self.conn, rec: cx.rec.clone(), at: std::time::Instant::now() }) {
+        match cx.writer.try_send(WriteReq { reactor: cx.reactor, conn: self.conn, rec: rec.to_vec(), at: std::time::Instant::now() }) {
             Ok(()) => self.pending += 1,
             Err(TrySendError::Full(_)) => ok(out, &id, false, "rate-limited: the relay is busy, try again shortly"),
             Err(TrySendError::Disconnected(_)) => ok(out, &id, false, "error: the relay is shutting down"),
