@@ -43,3 +43,33 @@ pub mod brand;
 pub mod config;
 #[path = "../../crates/relay-server/src/toml.rs"]
 pub mod toml;
+
+/// What the settings code uses of the relay's operator module (which needs
+/// the rest of the binary): its filter parsing, the same rules.
+pub mod operator {
+    use relay_proto::filter::FilterError;
+    use relay_proto::json::Scanner;
+    use relay_proto::Filter;
+
+    pub fn parse_filters(text: &str) -> Result<Vec<Filter>, String> {
+        let mut s = Scanner::new(text);
+        let mut filters = Vec::new();
+        if s.peek() == Some(b'[') {
+            s.array(|s| -> Result<(), FilterError> {
+                filters.push(Filter::parse(s)?);
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        } else {
+            filters.push(Filter::parse(&mut s).map_err(|e| e.to_string())?);
+        }
+        s.end().map_err(|e| e.to_string())?;
+        if filters.is_empty() {
+            return Err("no filters: an empty list matches nothing".into());
+        }
+        if filters.iter().any(|f| f.limit.is_some()) {
+            return Err("\"limit\" inside a filter is not supported: query takes --limit".into());
+        }
+        Ok(filters)
+    }
+}

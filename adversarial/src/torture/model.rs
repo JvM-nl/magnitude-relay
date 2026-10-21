@@ -42,7 +42,7 @@ impl Out {
             Outcome::Stored(s) => Out::Stored(*s),
             Outcome::Duplicate => Out::Duplicate,
             Outcome::Superseded => Out::Superseded,
-            Outcome::Deleted => Out::Deleted,
+            Outcome::Deleted | Outcome::Vanished => Out::Deleted,
             Outcome::Rejected(_) => Out::Rejected,
         }
     }
