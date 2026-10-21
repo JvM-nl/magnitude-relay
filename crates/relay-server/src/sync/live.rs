@@ -19,7 +19,7 @@
 //! backoff, and the reconcile that follows a reconnect catches up whatever
 //! the stream missed.
 
-use super::local::{carries, Inbound, InServer, Local};
+use super::local::{carries, Inbound, InServer, Local, Refused};
 use super::remote::Remote;
 use super::{filter_text, slow_down, sync_filter, verdict_of_ok, Backoff, Opts, Report, PUSH_WINDOW};
 use crate::config::SyncCfg;
@@ -76,6 +76,8 @@ pub struct Stats {
     /// refused by policy, invalid; not counting ones already here).
     pub events_in: AtomicU64,
     pub events_in_refused: AtomicU64,
+    /// Theirs not fetched again because an earlier pass turned them away.
+    pub events_in_skipped: AtomicU64,
     /// Events of ours they stored, and turned away.
     pub events_out: AtomicU64,
     pub events_out_refused: AtomicU64,
@@ -112,6 +114,7 @@ impl Stats {
             ("last_have", g(&self.last_have)),
             ("events_in", g(&self.events_in)),
             ("events_in_refused", g(&self.events_in_refused)),
+            ("events_in_skipped", g(&self.events_in_skipped)),
             ("events_out", g(&self.events_out)),
             ("events_out_refused", g(&self.events_out_refused)),
             ("reconnects", g(&self.reconnects)),
@@ -175,6 +178,8 @@ struct Entry {
     policy: Arc<SessionCfg>,
     stats: Arc<Stats>,
     mine: RefCell<Mine>,
+    /// What this entry turned away, so later passes do not fetch it again.
+    refused: Rc<RefCell<Refused>>,
     /// The live loop asks for a reconcile after a gap.
     wake: Notify,
 }
@@ -184,6 +189,7 @@ impl Entry {
         let mut l = InServer::new(self.store.clone(), self.ctl.clone(), self.policy.clone());
         let me = self.clone();
         l.on_stored = Box::new(move |seq| me.mine.borrow_mut().insert(seq));
+        l.refused = self.refused.clone();
         l
     }
 
@@ -214,6 +220,7 @@ pub fn start(entries: Vec<SyncCfg>, stats: Vec<Arc<Stats>>, store: Store, ctl: S
                     policy: policy.clone(),
                     stats,
                     mine: RefCell::new(Mine::default()),
+                    refused: Rc::new(RefCell::new(Refused::new(Refused::CAP))),
                     wake: Notify::new(),
                 });
                 tokio::task::spawn_local(reconciler(e.clone()));
@@ -266,6 +273,7 @@ async fn reconcile_once(e: &Rc<Entry>) -> Result<Report, String> {
         let mut r = Report::default();
         let result = sync_filter(&mut remote, &mut local, f, &opts, &mut r).await;
         e.stats.count_in(&r.down);
+        e.stats.events_in_skipped.fetch_add(r.refused_before, Ordering::Relaxed);
         e.stats.count_out_all(&r.up);
         total.merge(&r);
         result?;

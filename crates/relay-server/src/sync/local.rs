@@ -84,6 +84,46 @@ pub trait Local {
     fn events(&mut self, ids: &[[u8; 32]]) -> Result<Vec<String>, String>;
     /// Checks and stores events another relay sent; a verdict for each.
     async fn ingest(&mut self, batch: &[Inbound]) -> Result<Vec<Verdict>, String>;
+    /// True for an event this side turned away on an earlier pass, which the
+    /// other relay still holds: no use fetching it again.
+    fn refused_before(&self, _id: &[u8; 32]) -> bool {
+        false
+    }
+    fn remember_refused(&mut self, _id: [u8; 32]) {}
+}
+
+/// Ids a running sync turned away (deleted, vanished, refused by policy,
+/// superseded, invalid), oldest forgotten first. Without it every reconcile
+/// would fetch them all again: against strfry, about 52 000 events a pass.
+pub struct Refused {
+    ids: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    cap: usize,
+}
+
+impl Refused {
+    /// About 100 bytes an id.
+    pub const CAP: usize = 250_000;
+
+    pub fn new(cap: usize) -> Refused {
+        Refused { ids: Default::default(), order: Default::default(), cap }
+    }
+
+    pub fn contains(&self, id: &[u8; 32]) -> bool {
+        self.ids.contains(id)
+    }
+
+    pub fn insert(&mut self, id: [u8; 32]) {
+        if self.cap == 0 || !self.ids.insert(id) {
+            return;
+        }
+        self.order.push_back(id);
+        if self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.ids.remove(&old);
+            }
+        }
+    }
 }
 
 /// Checks `batch` and returns the verdicts so far (`None` where an event
@@ -198,11 +238,13 @@ pub struct InServer {
     /// Called with the seq of every event this sync stores, so its own pushes
     /// can leave them out.
     pub on_stored: Box<dyn FnMut(u64)>,
+    /// What this sync turned away, kept from one pass to the next.
+    pub refused: std::rc::Rc<std::cell::RefCell<Refused>>,
 }
 
 impl InServer {
     pub fn new(store: Store, ctl: Sender<Control>, policy: Arc<SessionCfg>) -> InServer {
-        InServer { store, ctl, policy, on_stored: Box::new(|_| {}) }
+        InServer { store, ctl, policy, on_stored: Box::new(|_| {}), refused: std::rc::Rc::new(std::cell::RefCell::new(Refused::new(0))) }
     }
 }
 
@@ -241,10 +283,41 @@ impl Local for InServer {
         };
         Ok(merge(verdicts, stored))
     }
+
+    fn refused_before(&self, id: &[u8; 32]) -> bool {
+        self.refused.borrow().contains(id)
+    }
+
+    fn remember_refused(&mut self, id: [u8; 32]) {
+        self.refused.borrow_mut().insert(id);
+    }
 }
 
 /// True when `rec` is one of the events a sync of `filters` carries, given
 /// whether gift wraps are left out of broad filters.
 pub fn carries(filters: &[Filter], rec: Record<'_>, hide_wraps: bool) -> bool {
     filters.iter().any(|f| f.matches(rec) && !(hide_wraps && rec.kind() == kind::GIFT_WRAP && session::broad(f)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Refused;
+
+    #[test]
+    fn refused_ids_are_bounded_oldest_first() {
+        let id = |n: u8| [n; 32];
+        let mut r = Refused::new(3);
+        for n in 1..=4 {
+            r.insert(id(n));
+        }
+        // A repeat does not count twice or refresh anything.
+        r.insert(id(4));
+        assert!(!r.contains(&id(1)) && r.contains(&id(2)) && r.contains(&id(4)));
+        r.insert(id(5));
+        assert!(!r.contains(&id(2)) && r.contains(&id(3)) && r.contains(&id(5)));
+        // Capacity 0 remembers nothing (the one-shot command).
+        let mut none = Refused::new(0);
+        none.insert(id(1));
+        assert!(!none.contains(&id(1)));
+    }
 }

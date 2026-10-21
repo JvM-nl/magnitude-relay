@@ -24,11 +24,12 @@ struct Relay {
 }
 
 impl Relay {
-    /// Writes `dir/relay.toml`: every kind accepted, no rate limits, plus `extra`.
-    fn configure(dir: &Path, port: u16, extra: &str) -> Relay {
+    /// Writes `dir/relay.toml`: every kind accepted (less what `policy` lines
+    /// say), no rate limits, plus `extra` sections.
+    fn configure(dir: &Path, port: u16, policy: &str, extra: &str) -> Relay {
         std::fs::create_dir_all(dir).unwrap();
         let cfg = format!(
-            "[relay]\nbind = \"127.0.0.1:{port}\"\nthreads = 2\n[policy]\nkinds = \"all\"\n[limits]\nevents_per_minute_per_ip = 0\nmax_connections_per_ip = 0\n[store]\ndata = \"{}\"\n{extra}",
+            "[relay]\nbind = \"127.0.0.1:{port}\"\nthreads = 2\n[policy]\nkinds = \"all\"\n{policy}\n[limits]\nevents_per_minute_per_ip = 0\nmax_connections_per_ip = 0\n[store]\ndata = \"{}\"\n{extra}",
             dir.join("data").display()
         );
         std::fs::write(dir.join("relay.toml"), cfg).unwrap();
@@ -217,8 +218,8 @@ fn wraps_filter() -> String {
 #[tokio::test]
 async fn one_shot_sync_every_way() {
     let (da, db) = (tmp("a"), tmp("b"));
-    let mut a = Relay::configure(&da, free_port(), "");
-    let mut b = Relay::configure(&db, free_port(), "");
+    let mut a = Relay::configure(&da, free_port(), "", "");
+    let mut b = Relay::configure(&db, free_port(), "", "");
     let t = Instant::now();
     let data = dataset(120_000);
     eprintln!("signed {} events in {:.1}s", data.len(), t.elapsed().as_secs_f64());
@@ -313,18 +314,22 @@ async fn stats(relay: &Relay) -> Value {
 async fn continuous_sync_keeps_two_relays_in_step() {
     let (da, db) = (tmp("ca"), tmp("cb"));
     let pa = free_port();
-    let mut a = Relay::configure(&da, pa, "");
-    let mut b = Relay::configure(&db, free_port(), &format!("[[sync]]\nurl = \"ws://127.0.0.1:{pa}\"\ndirection = \"both\"\nreconcile_seconds = 3600\n"));
-    let first = dataset(3000);
+    let mut a = Relay::configure(&da, pa, "", "");
+    // B refuses reactions, which A holds ten of.
+    let mut b = Relay::configure(&db, free_port(), "deny_kinds = [7]", &format!("[[sync]]\nurl = \"ws://127.0.0.1:{pa}\"\ndirection = \"both\"\nreconcile_seconds = 3600\n"));
+    let mut first = dataset(3000);
+    let r = Signer::new(82);
+    first.extend((0..10).map(|i| r.event(now() - 1000 - i, 7, json!([]), "+")));
     a.import(&first);
     a.start();
     let held = a.count("{}");
     b.start();
 
     // The first reconcile copies everything A has (wraps included only when a
-    // filter names them; this one is {}, and A hides wraps from it).
+    // filter names them; this one is {}, and A hides wraps from it), less the
+    // reactions B refuses.
     let wraps = a.count(&wraps_filter());
-    wait_for("the first reconcile", || b.count("{}") == held - wraps).await;
+    wait_for("the first reconcile", || b.count("{}") == held - wraps - 10).await;
 
     // Live, both ways.
     let (x, y) = (Signer::new(80), Signer::new(81));
@@ -353,8 +358,11 @@ async fn continuous_sync_keeps_two_relays_in_step() {
     assert!(e["reconciles"].as_u64().unwrap() >= 2, "a reconcile at start and one after the restart: {s}");
     assert!(e["reconnects"].as_u64().unwrap() >= 1, "{s}");
     assert_eq!(e["connected"], 1, "{s}");
-    assert!(e["events_in"].as_u64().unwrap() >= held - wraps + 31, "{s}");
+    assert!(e["events_in"].as_u64().unwrap() >= held - wraps - 10 + 31, "{s}");
     assert!(e["events_out"].as_u64().unwrap() >= 21, "{s}");
+    // The reactions were fetched and refused once; later passes skip them.
+    assert_eq!(e["events_in_refused"], 10, "{s}");
+    assert!(e["events_in_skipped"].as_u64().unwrap() >= 10, "{s}");
 
     a.stop();
     b.stop();

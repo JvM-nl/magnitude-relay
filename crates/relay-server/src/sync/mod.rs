@@ -74,6 +74,8 @@ pub struct Report {
     pub have: u64,
     pub need: u64,
     pub rounds: u64,
+    /// Not asked for: turned away on an earlier pass of the same sync.
+    pub refused_before: u64,
     /// Events received for what we asked.
     pub fetched: u64,
     /// Asked for and never sent: deleted there in the meantime, or hidden from us.
@@ -101,6 +103,7 @@ impl Report {
         self.have += o.have;
         self.need += o.need;
         self.rounds += o.rounds;
+        self.refused_before += o.refused_before;
         self.fetched += o.fetched;
         self.not_returned += o.not_returned;
         self.unrequested += o.unrequested;
@@ -225,9 +228,13 @@ pub fn filter_text(f: &Filter) -> String {
 
 /// Asks for `need` by id and stores what comes back.
 async fn fetch(remote: &mut Remote, local: &mut impl Local, need: &[[u8; 32]], report: &mut Report) -> Result<(), String> {
-    let mut chunks = need.chunks(FETCH_CHUNK);
+    // Turned away on an earlier pass and still there: not asked for again.
+    let asking: Vec<[u8; 32]> = need.iter().filter(|id| !local.refused_before(id)).copied().collect();
+    report.refused_before += (need.len() - asking.len()) as u64;
+    let mut chunks = asking.chunks(FETCH_CHUNK);
     let mut asked: HashMap<String, HashSet<[u8; 32]>> = HashMap::new();
     let mut batch: Vec<Inbound> = Vec::new();
+    let mut ids: Vec<[u8; 32]> = Vec::new();
     let mut batch_bytes = 0;
     let mut parser = EventParser::new();
     let mut rec = Vec::new();
@@ -262,6 +269,7 @@ async fn fetch(remote: &mut Remote, local: &mut impl Local, need: &[[u8; 32]], r
                 report.fetched += 1;
                 batch_bytes += text.len();
                 batch.push(Inbound { text, at });
+                ids.push(id);
             }
             Ok(RelayMsg::Eose { sub_id }) | Ok(RelayMsg::Closed { sub_id, .. }) => closed = Some(sub_id.to_string()),
             Ok(_) => {}
@@ -275,18 +283,23 @@ async fn fetch(remote: &mut Remote, local: &mut impl Local, need: &[[u8; 32]], r
             }
         }
         if batch.len() >= INGEST_BATCH || batch_bytes >= INGEST_BATCH_BYTES || (asked.is_empty() && !batch.is_empty()) {
-            store(local, std::mem::take(&mut batch), &mut report.down).await?;
+            store(local, std::mem::take(&mut batch), std::mem::take(&mut ids), &mut report.down).await?;
             batch_bytes = 0;
         }
     }
     if !batch.is_empty() {
-        store(local, batch, &mut report.down).await?;
+        store(local, batch, ids, &mut report.down).await?;
     }
     Ok(())
 }
 
-async fn store(local: &mut impl Local, batch: Vec<Inbound>, tally: &mut Tally) -> Result<(), String> {
-    for v in local.ingest(&batch).await? {
+/// Stores a batch and remembers what was turned away for good (a failed
+/// write may succeed another time; everything else will be refused again).
+async fn store(local: &mut impl Local, batch: Vec<Inbound>, ids: Vec<[u8; 32]>, tally: &mut Tally) -> Result<(), String> {
+    for (v, id) in local.ingest(&batch).await?.into_iter().zip(ids) {
+        if !matches!(v, Verdict::Stored | Verdict::Duplicate | Verdict::Failed) {
+            local.remember_refused(id);
+        }
         tally.add(&v);
     }
     Ok(())
