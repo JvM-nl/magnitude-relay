@@ -256,6 +256,7 @@ dependencies = [
 name = "relay-net"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tokio",
 ]
 
@@ -263,6 +264,7 @@ dependencies = [
 name = "relay-proto"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "secp256k1",
  "sha2",
 ]
