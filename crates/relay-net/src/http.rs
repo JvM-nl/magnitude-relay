@@ -14,6 +14,7 @@
 
 use crate::base64;
 use crate::sha1::Sha1;
+use crate::ws::pmd::{self, DeflateParams, DeflatePolicy};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -417,23 +418,46 @@ pub fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-/// Which extensions the server agreed to for this connection.
-///
-/// Always empty today: offers in `Sec-WebSocket-Extensions` are ignored, which the
-/// protocol allows (the client then runs without them). This is the seam for
-/// permessage-deflate: negotiation will fill it from the request, the 101 response
-/// will echo it, and the frame decoder will be told whether to expect RSV1.
+/// Which extensions a server is willing to run. Offers for anything not listed
+/// here are ignored, which the protocol allows (the client then runs without them).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Extensions {}
+pub struct ExtensionPolicy {
+    /// permessage-deflate (RFC 7692) under this policy, or `None` to decline it.
+    pub deflate: Option<DeflatePolicy>,
+}
+
+impl ExtensionPolicy {
+    /// Declines every extension: what [`Extensions::negotiate`] did before compression existed.
+    pub const NONE: ExtensionPolicy = ExtensionPolicy { deflate: None };
+
+    /// Accepts permessage-deflate under `policy`.
+    pub fn with_deflate(policy: DeflatePolicy) -> ExtensionPolicy {
+        ExtensionPolicy { deflate: Some(policy) }
+    }
+}
+
+/// Which extensions the server agreed to for this connection: the result of
+/// [`negotiate`](Extensions::negotiate), echoed by the 101 response and then used to
+/// configure the frame [`Decoder`](crate::ws::Decoder) and the
+/// [`Compressor`](crate::ws::Compressor).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Extensions {
+    /// The negotiated permessage-deflate parameters, if the extension is on.
+    pub deflate: Option<DeflateParams>,
+}
 
 impl Extensions {
     /// No extensions.
-    pub const NONE: Extensions = Extensions {};
+    pub const NONE: Extensions = Extensions { deflate: None };
 
-    /// Chooses extensions from a handshake request. Currently declines everything.
-    pub fn negotiate(_req: &Request<'_>) -> Extensions {
-        Extensions::NONE
+    /// Chooses extensions from a handshake request under `policy`. Never fails: an
+    /// offer that cannot be accepted just means the connection runs without it.
+    pub fn negotiate(req: &Request<'_>, policy: &ExtensionPolicy) -> Extensions {
+        let deflate =
+            policy.deflate.as_ref().and_then(|p| pmd::negotiate(req.headers.get_all("sec-websocket-extensions"), p));
+        Extensions { deflate }
     }
 }
 
@@ -457,8 +481,11 @@ pub fn write_upgrade_response(out: &mut Vec<u8>, accept: &[u8; 28], extensions: 
     );
     out.extend_from_slice(accept);
     out.extend_from_slice(b"\r\n");
-    // Seam: with permessage-deflate this is where `Sec-WebSocket-Extensions:` goes.
-    let Extensions {} = *extensions;
+    if let Some(deflate) = &extensions.deflate {
+        out.extend_from_slice(b"Sec-WebSocket-Extensions: ");
+        deflate.write_response_value(out);
+        out.extend_from_slice(b"\r\n");
+    }
     out.extend_from_slice(b"\r\n");
 }
 
@@ -557,6 +584,7 @@ fn parse_ip(entry: &[u8]) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ws::pmd::DeflatePolicy;
 
     const FIREFOX: &[u8] = b"GET /nostr HTTP/1.1\r\n\
 Host: relay.example.com\r\n\
@@ -896,7 +924,11 @@ Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
     #[test]
     fn upgrade_response_parses_as_a_response() {
         let mut out = Vec::new();
-        write_upgrade_response(&mut out, &accept_key(b"k"), &Extensions::negotiate(&parse(FIREFOX).0));
+        write_upgrade_response(
+            &mut out,
+            &accept_key(b"k"),
+            &Extensions::negotiate(&parse(FIREFOX).0, &ExtensionPolicy::NONE),
+        );
         let (resp, n) = parse_response(&out, 4096).unwrap().unwrap();
         assert_eq!(n, out.len());
         assert_eq!(resp.status, 101);
@@ -904,6 +936,49 @@ Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
         assert!(resp.headers.has_token("upgrade", "websocket"));
         assert_eq!(resp.headers.get("sec-websocket-accept"), Some(&accept_key(b"k")[..]));
         assert!(resp.headers.get("sec-websocket-extensions").is_none(), "no extensions negotiated");
+    }
+
+    #[test]
+    fn negotiation_follows_the_policy() {
+        let (req, _) = parse(FIREFOX);
+        // The browser offered permessage-deflate; a server that does not run it ignores the offer.
+        assert_eq!(Extensions::negotiate(&req, &ExtensionPolicy::NONE), Extensions::NONE);
+        assert_eq!(Extensions::negotiate(&req, &ExtensionPolicy::default()), Extensions::NONE);
+        let on = ExtensionPolicy::with_deflate(DeflatePolicy::default());
+        let ext = Extensions::negotiate(&req, &on);
+        assert!(ext.deflate.is_some());
+        // A request that offers nothing gets nothing, whatever the policy.
+        let (plain, _) = parse(b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n");
+        assert_eq!(Extensions::negotiate(&plain, &on), Extensions::NONE);
+    }
+
+    #[test]
+    fn upgrade_response_carries_the_negotiated_extension() {
+        let mut head = b"GET /nostr HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            .to_vec();
+        head.extend_from_slice(b"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n");
+        head.extend_from_slice(b"Sec-WebSocket-Extensions: x-other\r\n\r\n");
+        let (req, _) = parse(&head);
+        assert!(req.websocket_key().is_some());
+        let policy = ExtensionPolicy::with_deflate(DeflatePolicy {
+            server_no_context_takeover: true,
+            max_client_window_bits: 12,
+            ..Default::default()
+        });
+        let ext = Extensions::negotiate(&req, &policy);
+        let mut out = Vec::new();
+        write_upgrade_response(&mut out, &accept_key(b"dGhlIHNhbXBsZSBub25jZQ=="), &ext);
+        assert_eq!(
+            String::from_utf8(out.clone()).unwrap(),
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_max_window_bits=12\r\n\r\n"
+        );
+        let (resp, n) = parse_response(&out, 4096).unwrap().unwrap();
+        assert_eq!(n, out.len());
+        assert_eq!(resp.status, 101);
+        assert!(resp.headers.get("sec-websocket-extensions").is_some());
     }
 
     #[test]

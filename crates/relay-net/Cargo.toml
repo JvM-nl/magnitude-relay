@@ -8,3 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 tokio.workspace = true
+
+[dev-dependencies]
+# Reference codec for tests and the benchmark example only: our own DEFLATE is
+# cross-checked against it in both directions and compared for speed and ratio.
+# Never a runtime dependency.
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

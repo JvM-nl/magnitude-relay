@@ -34,9 +34,20 @@
 //! **Fragmented messages** are the only thing copied: each fragment is appended to
 //! one reusable reassembly buffer and the finished message is returned from it.
 //! Control frames may arrive between fragments and are returned immediately.
+//!
+//! **permessage-deflate.** After [`Decoder::enable_deflate`], RSV1 on the first frame of
+//! a data message means its payload (reassembled first, if fragmented) is a compressed
+//! message; the decoder inflates it and returns the plain text or bytes, with UTF-8
+//! checked on the *decompressed* text. RSV1 on a control frame, on a continuation, or
+//! with the extension off is a protocol error. The size limit applies to the decompressed
+//! message (a bomb is cut off at `max_message`, close code 1009), and the compressed form
+//! gets a little headroom over it, because incompressible data genuinely grows by a few
+//! bytes. A message that fails to inflate is close code 1007, as in the `ws` library.
 
+use super::pmd::{DeflateParams, StreamConfig};
 use super::unmask::unmask;
 use super::{is_valid_close_code, Opcode, WsError};
+use crate::deflate::{InflateError, Inflater};
 
 const CONT: u8 = Opcode::Continuation as u8;
 const TEXT: u8 = Opcode::Text as u8;
@@ -49,6 +60,9 @@ const PONG: u8 = Opcode::Pong as u8;
 /// message starts, so one huge message does not pin its memory for the life of
 /// the connection.
 const RETAIN_CAP: usize = 256 * 1024;
+
+/// The same for the buffer decompressed messages are written to.
+const OUT_RETAIN_CAP: usize = 64 * 1024;
 
 /// Which end of the connection the decoder reads for. Clients must mask their
 /// frames and servers must not (RFC 6455 §5.1); each side rejects the other
@@ -101,10 +115,18 @@ pub struct Decoder {
     /// A close frame was delivered; everything after it is discarded.
     closed: bool,
     failed: Option<WsError>,
+    /// Present once permessage-deflate is enabled: the history of the peer's stream.
+    deflate: Option<Inflater>,
+    /// The fragmented message in progress had RSV1 on its first frame.
+    msg_compressed: bool,
+    /// Where a compressed message is inflated to; reused.
+    out: Vec<u8>,
 }
 
 struct Head {
     fin: bool,
+    /// RSV1 on a data frame that starts a message: the message is compressed.
+    compressed: bool,
     op: u8,
     mask: Option<[u8; 4]>,
     head_len: usize,
@@ -122,8 +144,8 @@ enum Parsed {
 /// borrowed across iterations.
 enum Plan {
     Stall,
-    Data { op: u8, start: usize, end: usize },
-    Assembled { op: u8 },
+    Data { op: u8, start: usize, end: usize, compressed: bool },
+    Assembled { op: u8, compressed: bool },
     Control { op: u8, start: usize, end: usize },
 }
 
@@ -142,7 +164,46 @@ impl Decoder {
             need: 2,
             closed: false,
             failed: None,
+            deflate: None,
+            msg_compressed: false,
+            out: Vec::new(),
         }
+    }
+
+    /// Accepts permessage-deflate messages from the peer, with this configuration for
+    /// the *peer's* sending stream (its context takeover and window). Call it once,
+    /// right after the handshake that negotiated the extension.
+    pub fn enable_deflate(&mut self, peer_stream: StreamConfig) {
+        self.deflate = Some(Inflater::new(peer_stream.window_bits, peer_stream.context_takeover));
+    }
+
+    /// Builder form of [`enable_deflate`](Self::enable_deflate) taking negotiated parameters:
+    /// this decoder reads the stream its own role *receives*.
+    pub fn with_deflate(mut self, params: &DeflateParams) -> Self {
+        let cfg = params.receive(self.role);
+        self.enable_deflate(cfg);
+        self
+    }
+
+    /// Whether RSV1 is currently legal.
+    #[inline]
+    pub fn deflate_enabled(&self) -> bool {
+        self.deflate.is_some()
+    }
+
+    /// Heap this decoder holds between calls: reassembly and inflate buffers and the
+    /// peer's compression history. For memory accounting.
+    pub fn heap_bytes(&self) -> usize {
+        self.msg.capacity() + self.out.capacity() + self.deflate.as_ref().map_or(0, Inflater::heap_bytes)
+    }
+
+    /// Drops the message buffers' memory (not the compression history, which the
+    /// peer's next message may need). For a connection that has gone idle.
+    pub fn trim(&mut self) {
+        if self.msg_op == 0 {
+            self.msg = Vec::new();
+        }
+        self.out = Vec::new();
     }
 
     pub fn server(max_frame: usize, max_message: usize) -> Self {
@@ -185,6 +246,11 @@ impl Decoder {
         if self.closed {
             return Ok(Decoded { consumed: buf.len(), event: None });
         }
+        // The previous event, which may have borrowed `out`, is gone by now: a big
+        // decompressed message must not stay allocated until the next compressed one.
+        if self.out.capacity() > OUT_RETAIN_CAP {
+            self.out = Vec::new();
+        }
 
         let mut off = 0usize;
         let plan = loop {
@@ -219,14 +285,15 @@ impl Decoder {
                     if head.fin {
                         let op = self.msg_op;
                         self.msg_op = 0;
-                        break Plan::Assembled { op };
+                        let compressed = std::mem::take(&mut self.msg_compressed);
+                        break Plan::Assembled { op, compressed };
                     }
                 }
                 TEXT | BINARY => {
                     if head.fin {
-                        break Plan::Data { op: head.op, start, end };
+                        break Plan::Data { op: head.op, start, end, compressed: head.compressed };
                     }
-                    self.begin_message(head.op);
+                    self.begin_message(head.op, head.compressed);
                     self.msg.extend_from_slice(&buf[start..end]);
                 }
                 op => break Plan::Control { op, start, end },
@@ -240,19 +307,21 @@ impl Decoder {
         let consumed = off;
         let built: Result<Option<Event<'a>>, WsError> = match plan {
             Plan::Stall => Ok(None),
-            Plan::Data { op, start, end } => {
+            Plan::Data { op, start, end, compressed } => {
                 let p = &buf[start..end];
-                if op == TEXT {
-                    text(p).map(|s| Some(Event::Text(s)))
+                if compressed {
+                    inflate_message(&mut self.deflate, &mut self.out, self.max_message, p)
+                        .and_then(|()| data_event(op, &self.out))
                 } else {
-                    Ok(Some(Event::Binary(p)))
+                    data_event(op, p)
                 }
             }
-            Plan::Assembled { op } => {
-                if op == TEXT {
-                    text(&self.msg).map(|s| Some(Event::Text(s)))
+            Plan::Assembled { op, compressed } => {
+                if compressed {
+                    inflate_message(&mut self.deflate, &mut self.out, self.max_message, &self.msg)
+                        .and_then(|()| data_event(op, &self.out))
                 } else {
-                    Ok(Some(Event::Binary(&self.msg)))
+                    data_event(op, &self.msg)
                 }
             }
             Plan::Control { op, start, end } => {
@@ -278,13 +347,14 @@ impl Decoder {
         }
     }
 
-    fn begin_message(&mut self, op: u8) {
+    fn begin_message(&mut self, op: u8, compressed: bool) {
         if self.msg.capacity() > RETAIN_CAP {
             self.msg = Vec::new();
         } else {
             self.msg.clear();
         }
         self.msg_op = op;
+        self.msg_compressed = compressed;
     }
 
     /// Parses and validates the frame header at the start of `b`, as far as `b`
@@ -296,8 +366,9 @@ impl Decoder {
             return Ok(Parsed::Need(2));
         }
         let (b0, b1) = (b[0], b[1]);
-        if b0 & 0x70 != 0 {
-            // No extensions are negotiated, so RSV1-3 have no meaning.
+        let rsv1 = b0 & 0x40 != 0;
+        // RSV2 and RSV3 have no meaning here, and RSV1 only with permessage-deflate.
+        if b0 & 0x30 != 0 || (rsv1 && self.deflate.is_none()) {
             return Err(WsError::Protocol("reserved bits set"));
         }
         let fin = b0 & 0x80 != 0;
@@ -305,6 +376,23 @@ impl Decoder {
         if !matches!(op, CONT | TEXT | BINARY | CLOSE | PING | PONG) {
             return Err(WsError::Protocol("reserved opcode"));
         }
+        if rsv1 {
+            // RFC 7692 section 6: only the first frame of a data message carries it.
+            if op & 0x8 != 0 {
+                return Err(WsError::Protocol("compressed control frame"));
+            }
+            if op == CONT {
+                return Err(WsError::Protocol("compressed continuation frame"));
+            }
+        }
+        // Whether the frame belongs to a compressed message decides its size allowance.
+        let compressed_msg = if op == CONT { self.msg_compressed } else { rsv1 };
+        let (max_frame, max_message) = if compressed_msg {
+            let slack = self.max_message / 64 + 64;
+            (self.max_frame.saturating_add(slack), self.max_message.saturating_add(slack))
+        } else {
+            (self.max_frame, self.max_message)
+        };
         let masked = b1 & 0x80 != 0;
         match (self.role, masked) {
             (Role::Server, false) => return Err(WsError::Protocol("client frame not masked")),
@@ -343,7 +431,7 @@ impl Decoder {
             }
             n => n as u64,
         };
-        if len64 > self.max_frame as u64 {
+        if len64 > max_frame as u64 {
             return Err(WsError::TooBig("frame too big"));
         }
 
@@ -352,7 +440,7 @@ impl Decoder {
                 if self.msg_op == 0 {
                     return Err(WsError::Protocol("continuation without a message"));
                 }
-                if self.msg.len() as u64 + len64 > self.max_message as u64 {
+                if self.msg.len() as u64 + len64 > max_message as u64 {
                     return Err(WsError::TooBig("message too big"));
                 }
             }
@@ -360,7 +448,7 @@ impl Decoder {
                 if self.msg_op != 0 {
                     return Err(WsError::Protocol("data frame inside a fragmented message"));
                 }
-                if len64 > self.max_message as u64 {
+                if len64 > max_message as u64 {
                     return Err(WsError::TooBig("message too big"));
                 }
             }
@@ -368,13 +456,46 @@ impl Decoder {
         }
 
         let mask = masked.then(|| [b[head_len - 4], b[head_len - 3], b[head_len - 2], b[head_len - 1]]);
-        Ok(Parsed::Head(Head { fin, op, mask, head_len, len: len64 as usize }))
+        Ok(Parsed::Head(Head { fin, compressed: rsv1, op, mask, head_len, len: len64 as usize }))
     }
 }
 
 #[inline]
 fn text(p: &[u8]) -> Result<&str, WsError> {
     std::str::from_utf8(p).map_err(|_| WsError::InvalidPayload("invalid UTF-8 in text message"))
+}
+
+/// The event for a complete data message.
+#[inline]
+fn data_event(op: u8, p: &[u8]) -> Result<Option<Event<'_>>, WsError> {
+    if op == TEXT {
+        text(p).map(|s| Some(Event::Text(s)))
+    } else {
+        Ok(Some(Event::Binary(p)))
+    }
+}
+
+/// Inflates one compressed message into `out` (cleared first, or replaced if an earlier
+/// message left it oversized), refusing to produce more than `max_message` bytes.
+fn inflate_message(
+    deflate: &mut Option<Inflater>,
+    out: &mut Vec<u8>,
+    max_message: usize,
+    compressed: &[u8],
+) -> Result<(), WsError> {
+    let Some(inflater) = deflate.as_mut() else {
+        return Err(WsError::Protocol("reserved bits set"));
+    };
+    if out.capacity() > OUT_RETAIN_CAP {
+        *out = Vec::new();
+    } else {
+        out.clear();
+    }
+    match inflater.inflate_message(compressed, out, max_message) {
+        Ok(_) => Ok(()),
+        Err(InflateError::LimitExceeded) => Err(WsError::TooBig("message too big")),
+        Err(_) => Err(WsError::InvalidPayload("invalid compressed data")),
+    }
 }
 
 /// Validates a close payload: empty, or a valid status code and a UTF-8 reason. A

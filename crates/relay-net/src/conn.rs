@@ -8,16 +8,18 @@
 //! * [`server_handshake`] reads a request head, answers a valid WebSocket upgrade
 //!   with `101` (or an error status), and otherwise hands the plain request back.
 //! * [`client_connect`] / [`client_handshake`] open a WebSocket and return a
-//!   [`ClientConn`] that sends masked frames and yields owned [`Message`]s.
+//!   [`ClientConn`] that sends masked frames and yields owned [`Message`]s. The `_with`
+//!   forms can offer permessage-deflate ([`ClientDeflate`]); the server side is
+//!   [`server_handshake_with`] and an [`ExtensionPolicy`].
 //!
 //! No timeouts are applied here; wrap calls in `tokio::time::timeout` where a
 //! stalled peer must not hold a task.
 
 use crate::http::{
-    accept_key, parse_request_with, parse_response, reason_phrase, write_response, write_upgrade_response, Extensions,
-    Request, DEFAULT_MAX_HEAD,
+    accept_key, parse_request_with, parse_response, reason_phrase, write_response, write_upgrade_response,
+    ExtensionPolicy, Extensions, Request, DEFAULT_MAX_HEAD,
 };
-use crate::ws::{close_code, ClientEncoder, Decoder, Event, Role, WsError};
+use crate::ws::{close_code, ClientEncoder, Compressor, Decoder, DeflateParams, Event, Opcode, Role, WsError};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -104,7 +106,25 @@ pub enum Handshake {
 /// * Anything else, including `Upgrade: h2c` from `curl --http2`: `PlainHttp`.
 ///
 /// `buf` may already hold bytes (a previous read); `max_head` caps the head size.
+///
+/// No extensions are negotiated: a client's permessage-deflate offer is ignored and the
+/// connection runs uncompressed. Use [`server_handshake_with`] to accept it.
 pub async fn server_handshake<S>(stream: &mut S, buf: &mut Vec<u8>, max_head: usize) -> io::Result<Handshake>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    server_handshake_with(stream, buf, max_head, &ExtensionPolicy::NONE).await.map(|(h, _)| h)
+}
+
+/// [`server_handshake`] that also negotiates extensions under `policy`, returning what
+/// was agreed (for an upgrade; `Extensions::NONE` otherwise). Configure the frame decoder
+/// with `Decoder::with_deflate` and the sender with `Compressor::for_role` from it.
+pub async fn server_handshake_with<S>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    max_head: usize,
+    policy: &ExtensionPolicy,
+) -> io::Result<(Handshake, Extensions)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -115,7 +135,7 @@ where
                 let owned = OwnedRequest::from_request(&req);
                 if !req.wants_websocket() {
                     buf.drain(..n);
-                    return Ok(Handshake::PlainHttp(owned));
+                    return Ok((Handshake::PlainHttp(owned), Extensions::NONE));
                 }
                 let Some(key) = req.websocket_key() else {
                     // Wrong version gets 426 so a client can retry with ours.
@@ -147,11 +167,12 @@ where
                     let _ = stream.shutdown().await;
                     return Err(invalid_data("invalid websocket handshake"));
                 };
-                write_upgrade_response(&mut reply, &accept_key(key), &Extensions::negotiate(&req));
+                let extensions = Extensions::negotiate(&req, policy);
+                write_upgrade_response(&mut reply, &accept_key(key), &extensions);
                 buf.drain(..n);
                 stream.write_all(&reply).await?;
                 stream.flush().await?;
-                return Ok(Handshake::Upgraded(owned));
+                return Ok((Handshake::Upgraded(owned), extensions));
             }
             Ok(None) => fill(stream, buf, 1024).await?,
             Err(e) => {
@@ -197,17 +218,88 @@ impl From<Event<'_>> for Message {
     }
 }
 
+/// How a client offers permessage-deflate (RFC 7692). The offer always carries
+/// `client_max_window_bits` (so a server may cap the client's window) and adds the
+/// other parameters on request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientDeflate {
+    /// Messages shorter than this are sent uncompressed (see [`Compressor`]).
+    pub min_len: usize,
+    pub client_no_context_takeover: bool,
+    pub server_no_context_takeover: bool,
+    /// Ask the server to compress with at most this window (8..=15).
+    pub server_max_window_bits: Option<u8>,
+    /// Promise to compress with at most this window (8..=15).
+    pub client_max_window_bits: Option<u8>,
+}
+
+impl Default for ClientDeflate {
+    fn default() -> Self {
+        ClientDeflate {
+            min_len: Compressor::DEFAULT_MIN_LEN,
+            client_no_context_takeover: false,
+            server_no_context_takeover: false,
+            server_max_window_bits: None,
+            client_max_window_bits: None,
+        }
+    }
+}
+
+impl ClientDeflate {
+    fn offer(&self) -> String {
+        let mut s = String::from("permessage-deflate");
+        match self.client_max_window_bits {
+            Some(b) => s.push_str(&format!("; client_max_window_bits={}", b.clamp(8, 15))),
+            None => s.push_str("; client_max_window_bits"),
+        }
+        if let Some(b) = self.server_max_window_bits {
+            s.push_str(&format!("; server_max_window_bits={}", b.clamp(8, 15)));
+        }
+        if self.client_no_context_takeover {
+            s.push_str("; client_no_context_takeover");
+        }
+        if self.server_no_context_takeover {
+            s.push_str("; server_no_context_takeover");
+        }
+        s
+    }
+}
+
 /// Connects to `addr` and performs the client handshake. `host` is the `Host`
 /// header value and `path` the request target (`"/"`, `"/nostr"`).
 pub async fn client_connect(addr: impl ToSocketAddrs, host: &str, path: &str) -> io::Result<ClientConn<TcpStream>> {
+    client_connect_with(addr, host, path, None).await
+}
+
+/// [`client_connect`] that offers permessage-deflate when `deflate` is given. Whether the
+/// server accepted is [`ClientConn::deflate_params`].
+pub async fn client_connect_with(
+    addr: impl ToSocketAddrs,
+    host: &str,
+    path: &str,
+    deflate: Option<ClientDeflate>,
+) -> io::Result<ClientConn<TcpStream>> {
     let stream = TcpStream::connect(addr).await?;
     // Small request/response frames: Nagle plus delayed ACK would add 40 ms each.
     stream.set_nodelay(true)?;
-    client_handshake(stream, host, path).await
+    client_handshake_with(stream, host, path, deflate).await
 }
 
 /// Performs the client handshake over an already connected stream.
-pub async fn client_handshake<S>(mut stream: S, host: &str, path: &str) -> io::Result<ClientConn<S>>
+pub async fn client_handshake<S>(stream: S, host: &str, path: &str) -> io::Result<ClientConn<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    client_handshake_with(stream, host, path, None).await
+}
+
+/// [`client_handshake`] that offers permessage-deflate when `deflate` is given.
+pub async fn client_handshake_with<S>(
+    mut stream: S,
+    host: &str,
+    path: &str,
+    deflate: Option<ClientDeflate>,
+) -> io::Result<ClientConn<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -228,7 +320,13 @@ where
     req.extend_from_slice(host.as_bytes());
     req.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
     req.extend_from_slice(&key);
-    req.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    req.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n");
+    if let Some(d) = &deflate {
+        req.extend_from_slice(b"Sec-WebSocket-Extensions: ");
+        req.extend_from_slice(d.offer().as_bytes());
+        req.extend_from_slice(b"\r\n");
+    }
+    req.extend_from_slice(b"\r\n");
     stream.write_all(&req).await?;
     stream.flush().await?;
 
@@ -243,23 +341,36 @@ where
                     ));
                 }
                 let h = &resp.headers;
+                // Only what we offered may come back: nothing, or one permessage-deflate.
+                let params = match (h.get("sec-websocket-extensions"), &deflate) {
+                    (None, _) => Some(None),
+                    (Some(v), Some(_)) if !v.contains(&b',') => DeflateParams::from_response(v).map(Some),
+                    _ => None,
+                };
                 let ok = h.has_token("upgrade", "websocket")
                     && h.has_token("connection", "upgrade")
-                    && h.get("sec-websocket-accept") == Some(&accept_key(&key)[..])
-                    // We offered no extensions, so the server may not use any.
-                    && h.get("sec-websocket-extensions").is_none();
-                if !ok {
+                    && h.get("sec-websocket-accept") == Some(&accept_key(&key)[..]);
+                let (true, Some(params)) = (ok, params) else {
                     return Err(invalid_data("bad websocket handshake response"));
-                }
+                };
                 // Frames the server sent right behind the 101 stay buffered.
                 rbuf.drain(..n);
+                let mut dec = Decoder::new(Role::Client, CLIENT_MAX_MESSAGE, CLIENT_MAX_MESSAGE);
+                let mut comp = None;
+                if let (Some(p), Some(d)) = (&params, &deflate) {
+                    dec = dec.with_deflate(p);
+                    comp = Some(Compressor::for_role(p, Role::Client, d.min_len));
+                }
                 return Ok(ClientConn {
                     stream,
                     rbuf,
                     rpos: 0,
                     wbuf: Vec::new(),
-                    dec: Decoder::new(Role::Client, CLIENT_MAX_MESSAGE, CLIENT_MAX_MESSAGE),
+                    dec,
                     enc,
+                    comp,
+                    params,
+                    scratch: Vec::new(),
                     sent_close: false,
                     peer_close: None,
                 });
@@ -282,17 +393,39 @@ pub struct ClientConn<S = TcpStream> {
     wbuf: Vec<u8>,
     dec: Decoder,
     enc: ClientEncoder,
+    /// Present when permessage-deflate was negotiated.
+    comp: Option<Compressor>,
+    params: Option<DeflateParams>,
+    /// Compressed payload under construction; reused.
+    scratch: Vec<u8>,
     sent_close: bool,
     peer_close: Option<Option<(u16, String)>>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> ClientConn<S> {
+    /// The permessage-deflate parameters the server accepted, if it did.
+    pub fn deflate_params(&self) -> Option<&DeflateParams> {
+        self.params.as_ref()
+    }
+
+    /// Queues one data message, compressed when the extension is on and the payload is
+    /// long enough to be worth it.
+    fn queue_data(&mut self, opcode: Opcode, payload: &[u8]) {
+        if let Some(c) = self.comp.as_mut().filter(|c| c.will_compress(payload.len())) {
+            self.scratch.clear();
+            c.deflate_payload(payload, &mut self.scratch);
+            self.enc.write_frame_ext(&mut self.wbuf, opcode, true, true, &self.scratch);
+        } else {
+            self.enc.write_frame(&mut self.wbuf, opcode, true, payload);
+        }
+    }
+
     pub fn queue_text(&mut self, text: &str) {
-        self.enc.write_text(&mut self.wbuf, text.as_bytes());
+        self.queue_data(Opcode::Text, text.as_bytes());
     }
 
     pub fn queue_binary(&mut self, data: &[u8]) {
-        self.enc.write_binary(&mut self.wbuf, data);
+        self.queue_data(Opcode::Binary, data);
     }
 
     pub fn queue_ping(&mut self, payload: &[u8]) {
@@ -799,5 +932,233 @@ Sec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n",
         let mut got = server.await.unwrap();
         let mut dec = Decoder::new(Role::Server, 4096, 4096);
         assert_eq!(dec.decode(&mut got).unwrap().event, Some(Event::Close(Some((1001, "")))));
+    }
+
+    // ---- permessage-deflate over real sockets ----
+
+    use crate::http::DEFAULT_MAX_HEAD as MAX_HEAD;
+    use crate::ws::{Compressor as Comp, DeflatePolicy};
+
+    /// What a deflate-aware echo server observed.
+    #[derive(Debug)]
+    struct Observed {
+        extensions: Extensions,
+        /// Bytes of frames received (headers, masks and compressed payloads).
+        wire_in: usize,
+        /// Bytes of message payload they decoded to.
+        plain_in: usize,
+        /// Frames the server sent with RSV1 set.
+        compressed_out: usize,
+    }
+
+    async fn deflate_echo_server(
+        listener: TcpListener,
+        policy: ExtensionPolicy,
+        min_len: usize,
+    ) -> io::Result<Observed> {
+        let (mut s, _) = listener.accept().await?;
+        s.set_nodelay(true)?;
+        let mut buf = Vec::new();
+        let (h, extensions) = server_handshake_with(&mut s, &mut buf, MAX_HEAD, &policy).await?;
+        assert!(matches!(h, Handshake::Upgraded(_)));
+        let mut dec = Decoder::new(Role::Server, 1 << 22, 1 << 22);
+        let mut comp = None;
+        if let Some(p) = &extensions.deflate {
+            dec = dec.with_deflate(p);
+            comp = Some(Comp::for_role(p, Role::Server, min_len));
+        }
+        let mut obs = Observed { extensions, wire_in: 0, plain_in: 0, compressed_out: 0 };
+        let mut out = Vec::new();
+        loop {
+            let mut off = 0;
+            let mut closing = false;
+            loop {
+                let d = dec.decode(&mut buf[off..]).expect("a valid stream");
+                off += d.consumed;
+                obs.wire_in += d.consumed;
+                let first_out = out.len();
+                match d.event {
+                    Some(Event::Text(t)) => {
+                        obs.plain_in += t.len();
+                        match comp.as_mut() {
+                            Some(c) => c.compress_text(&mut out, t.as_bytes()),
+                            None => write_text(&mut out, t.as_bytes()),
+                        }
+                    }
+                    Some(Event::Binary(b)) => {
+                        obs.plain_in += b.len();
+                        match comp.as_mut() {
+                            Some(c) => c.compress_binary(&mut out, b),
+                            None => write_binary(&mut out, b),
+                        }
+                    }
+                    Some(Event::Ping(p)) => write_pong(&mut out, p),
+                    Some(Event::Pong(_)) => {}
+                    Some(Event::Close(c)) => {
+                        match c {
+                            Some((code, _)) => write_close(&mut out, code, ""),
+                            None => write_close_empty(&mut out),
+                        }
+                        closing = true;
+                        break;
+                    }
+                    None => break,
+                }
+                if out.len() > first_out && out[first_out] & 0x40 != 0 {
+                    obs.compressed_out += 1;
+                }
+            }
+            buf.drain(..off);
+            if !out.is_empty() {
+                s.write_all(&out).await?;
+                out.clear();
+            }
+            if closing {
+                return Ok(obs);
+            }
+            let missing = dec.needed().saturating_sub(buf.len());
+            fill(&mut s, &mut buf, missing.max(4096)).await?;
+        }
+    }
+
+    async fn run_deflate_session(
+        policy: ExtensionPolicy,
+        client: Option<ClientDeflate>,
+        server_min_len: usize,
+    ) -> (Observed, Option<DeflateParams>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(deflate_echo_server(listener, policy, server_min_len));
+        let mut c = client_connect_with(addr, "localhost", "/", client).await.unwrap();
+        let params = c.deflate_params().copied();
+        let events = crate::deflate::testutil::nostr_corpus(5, 120);
+        for (i, e) in events.iter().enumerate() {
+            let t = String::from_utf8(e.clone()).unwrap();
+            // Pipeline a few messages per flush, as a benchmark client does.
+            c.queue_text(&t);
+            c.queue_text(&t[..t.len() / 2]);
+            c.queue_binary(&e[..e.len() / 3]);
+            c.flush().await.unwrap();
+            assert_eq!(c.recv().await.unwrap(), Message::Text(t.clone()), "message {i}");
+            assert_eq!(c.recv().await.unwrap(), Message::Text(t[..t.len() / 2].to_owned()));
+            assert_eq!(c.recv().await.unwrap(), Message::Binary(e[..e.len() / 3].to_vec()));
+        }
+        // Big ones, across the 16-bit and 64-bit length forms.
+        for n in [60_000usize, 70_000, 300_000] {
+            let t = text_of(n, n as u64);
+            c.send_text(&t).await.unwrap();
+            assert_eq!(c.recv().await.unwrap(), Message::Text(t));
+        }
+        assert_eq!(c.close().await.unwrap(), Some((1000, String::new())));
+        (server.await.unwrap().unwrap(), params)
+    }
+
+    #[tokio::test]
+    async fn negotiated_deflate_works_over_a_socket_in_every_mode() {
+        let on = ExtensionPolicy::with_deflate(DeflatePolicy::default());
+        let modes: Vec<(&str, ExtensionPolicy, ClientDeflate)> = vec![
+            ("default", on, ClientDeflate::default()),
+            ("min_len 0", on, ClientDeflate { min_len: 0, ..Default::default() }),
+            (
+                "no takeover (client asks)",
+                on,
+                ClientDeflate {
+                    client_no_context_takeover: true,
+                    server_no_context_takeover: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "no takeover (server insists)",
+                ExtensionPolicy::with_deflate(DeflatePolicy {
+                    server_no_context_takeover: true,
+                    client_no_context_takeover: true,
+                    ..Default::default()
+                }),
+                ClientDeflate::default(),
+            ),
+            (
+                "small windows",
+                on,
+                ClientDeflate {
+                    server_max_window_bits: Some(9),
+                    client_max_window_bits: Some(10),
+                    ..Default::default()
+                },
+            ),
+            (
+                "policy caps the client window",
+                ExtensionPolicy::with_deflate(DeflatePolicy { max_client_window_bits: 9, ..Default::default() }),
+                ClientDeflate::default(),
+            ),
+        ];
+        for (name, policy, client) in modes {
+            let (obs, params) = run_deflate_session(policy, Some(client), client.min_len).await;
+            assert!(params.is_some() && obs.extensions.deflate.is_some(), "{name}: negotiated");
+            assert!(obs.compressed_out > 100, "{name}: server compressed {} frames", obs.compressed_out.min(1000));
+            assert!(
+                obs.wire_in * 10 < obs.plain_in * 9,
+                "{name}: client frames should be smaller than their payloads ({} vs {})",
+                obs.wire_in,
+                obs.plain_in
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn without_agreement_the_connection_is_plain() {
+        let on = ExtensionPolicy::with_deflate(DeflatePolicy::default());
+        // Server declines (the default policy): the client's offer is ignored.
+        let (obs, params) = run_deflate_session(ExtensionPolicy::NONE, Some(ClientDeflate::default()), 0).await;
+        assert!(params.is_none() && obs.extensions.deflate.is_none());
+        assert_eq!(obs.compressed_out, 0);
+        assert!(obs.wire_in > obs.plain_in, "plain frames are payload plus headers and masks");
+        // Client does not offer: the server must not compress even though it would.
+        let (obs, params) = run_deflate_session(on, None, 0).await;
+        assert!(params.is_none() && obs.extensions.deflate.is_none());
+        assert_eq!(obs.compressed_out, 0);
+        // The old entry point behaves as before: offers ignored.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(echo_server(listener));
+        let mut c = client_connect_with(addr, "localhost", "/echo", Some(ClientDeflate::default())).await.unwrap();
+        assert!(c.deflate_params().is_none());
+        c.send_text("still works").await.unwrap();
+        assert_eq!(c.recv().await.unwrap(), Message::Text("still works".into()));
+        c.close().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_extension_the_client_did_not_offer_is_refused() {
+        for (offer, header) in [
+            (None, "permessage-deflate"),
+            (Some(ClientDeflate::default()), "permessage-deflate; bogus_param"),
+            (Some(ClientDeflate::default()), "permessage-deflate, x-other"),
+            (Some(ClientDeflate::default()), "x-other"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let value = header.to_owned();
+            tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                loop {
+                    fill(&mut s, &mut buf, 1024).await.unwrap();
+                    if let Some((req, _)) = parse_request_with(&buf, MAX_HEAD).unwrap() {
+                        let key = req.websocket_key().unwrap();
+                        let accept = String::from_utf8(accept_key(key).to_vec()).unwrap();
+                        let reply = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+Sec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Extensions: {value}\r\n\r\n"
+                        );
+                        s.write_all(reply.as_bytes()).await.unwrap();
+                        return;
+                    }
+                }
+            });
+            let r = client_connect_with(addr, "localhost", "/", offer).await;
+            assert!(r.is_err(), "{header:?} with offer {offer:?} must be refused");
+        }
     }
 }

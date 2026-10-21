@@ -37,7 +37,14 @@ pub const fn header_len(len: usize) -> usize {
 
 #[inline]
 const fn first_byte(opcode: Opcode, fin: bool) -> u8 {
-    (opcode as u8) | if fin { 0x80 } else { 0 }
+    first_byte_ext(opcode, fin, false)
+}
+
+/// RSV1 is the permessage-deflate "this message is compressed" bit (RFC 7692
+/// section 6): set on the first frame of a compressed message and nowhere else.
+#[inline]
+const fn first_byte_ext(opcode: Opcode, fin: bool, rsv1: bool) -> u8 {
+    (opcode as u8) | if fin { 0x80 } else { 0 } | if rsv1 { 0x40 } else { 0 }
 }
 
 /// Writes the unmasked header for `len` payload bytes into `h`, returning its size.
@@ -71,6 +78,18 @@ pub fn write_frame_header(out: &mut Vec<u8>, opcode: Opcode, fin: bool, payload_
 pub fn write_frame(out: &mut Vec<u8>, opcode: Opcode, fin: bool, payload: &[u8]) {
     out.reserve(MAX_HEADER + payload.len());
     write_frame_header(out, opcode, fin, payload.len());
+    out.extend_from_slice(payload);
+}
+
+/// Like [`write_frame`] with control over RSV1, the permessage-deflate "this message is
+/// compressed" bit (RFC 7692 section 6): the framing of a message whose `payload` is
+/// already compressed.
+#[inline]
+pub fn write_frame_ext(out: &mut Vec<u8>, opcode: Opcode, fin: bool, rsv1: bool, payload: &[u8]) {
+    out.reserve(MAX_HEADER + payload.len());
+    let mut h = [0u8; MAX_HEADER];
+    let n = encode_header(first_byte_ext(opcode, fin, rsv1), payload.len(), &mut h);
+    out.extend_from_slice(&h[..n]);
     out.extend_from_slice(payload);
 }
 
@@ -132,9 +151,16 @@ pub struct Mark {
 /// payload to `out`, then call [`finish_frame`] with the returned mark.
 #[inline]
 pub fn begin_frame(out: &mut Vec<u8>, opcode: Opcode, fin: bool) -> Mark {
+    begin_frame_ext(out, opcode, fin, false)
+}
+
+/// [`begin_frame`] with control over RSV1: for a message whose payload is about to be
+/// appended already compressed.
+#[inline]
+pub fn begin_frame_ext(out: &mut Vec<u8>, opcode: Opcode, fin: bool, rsv1: bool) -> Mark {
     let start = out.len();
     out.extend_from_slice(&[0; RESERVED]);
-    Mark { start, first: first_byte(opcode, fin) }
+    Mark { start, first: first_byte_ext(opcode, fin, rsv1) }
 }
 
 /// Completes a frame started with [`begin_frame`]: everything appended since is
@@ -245,9 +271,14 @@ impl ClientEncoder {
 
     /// Appends one masked frame.
     pub fn write_frame(&mut self, out: &mut Vec<u8>, opcode: Opcode, fin: bool, payload: &[u8]) {
+        self.write_frame_ext(out, opcode, fin, false, payload);
+    }
+
+    /// Appends one masked frame with control over RSV1 (a compressed message's first frame).
+    pub fn write_frame_ext(&mut self, out: &mut Vec<u8>, opcode: Opcode, fin: bool, rsv1: bool, payload: &[u8]) {
         let mask = self.next_mask();
         let mut h = [0u8; MAX_HEADER];
-        let n = encode_header(first_byte(opcode, fin), payload.len(), &mut h);
+        let n = encode_header(first_byte_ext(opcode, fin, rsv1), payload.len(), &mut h);
         h[1] |= 0x80;
         out.reserve(n + 4 + payload.len());
         out.extend_from_slice(&h[..n]);
@@ -305,6 +336,37 @@ mod tests {
         write_frame(&mut out, Opcode::Text, false, b"Hel");
         write_frame(&mut out, Opcode::Continuation, true, b"lo");
         assert_eq!(out, [0x01, 0x03, 0x48, 0x65, 0x6c, 0x80, 0x02, 0x6c, 0x6f]);
+    }
+
+    #[test]
+    fn rsv1_frames() {
+        let mut out = Vec::new();
+        write_frame_ext(&mut out, Opcode::Text, true, true, b"x");
+        assert_eq!(out, [0xc1, 0x01, b'x']);
+        let mut out = Vec::new();
+        write_frame_ext(&mut out, Opcode::Binary, false, true, b"");
+        assert_eq!(out, [0x42, 0x00]);
+        // Same as the plain writer when RSV1 is clear.
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        write_frame_ext(&mut a, Opcode::Text, true, false, b"same");
+        write_text(&mut b, b"same");
+        assert_eq!(a, b);
+        // begin/finish keeps the bit through the header patch, in every length class.
+        for n in [0usize, 5, 125, 126, 70_000] {
+            let mut out = Vec::new();
+            let mark = begin_frame_ext(&mut out, Opcode::Text, true, true);
+            out.extend(std::iter::repeat_n(b'q', n));
+            finish_frame(&mut out, mark);
+            let mut want = Vec::new();
+            write_frame_ext(&mut want, Opcode::Text, true, true, &vec![b'q'; n]);
+            assert_eq!(out, want, "len {n}");
+        }
+        // Masked variant.
+        let mut enc = ClientEncoder::with_seed(4);
+        let mut out = Vec::new();
+        enc.write_frame_ext(&mut out, Opcode::Text, true, true, b"abc");
+        assert_eq!(out[0], 0xc1);
+        assert_eq!(out[1], 0x83);
     }
 
     #[test]

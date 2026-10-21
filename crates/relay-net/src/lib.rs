@@ -8,10 +8,16 @@
 //!
 //! The only dependency is `tokio`, and only [`conn`] uses it; SHA-1 and base64 are
 //! in-house because the handshake needs nothing more than a correct hash of 60
-//! bytes per connection.
+//! bytes per connection. DEFLATE ([`deflate`]) is in-house too, for the
+//! permessage-deflate extension ([`ws::pmd`]): a decoder and a speed-first encoder
+//! that keep no per-message allocations and, without context takeover, no
+//! per-connection memory. `miniz_oxide` is a dev-dependency only, the reference the
+//! codec is cross-checked against in the tests and measured against in the benchmark
+//! (`cargo run --release -p relay-net --example deflate_bench`).
 
 pub mod base64;
 pub mod conn;
+pub mod deflate;
 pub mod http;
 pub mod sha1;
 pub mod ws;
