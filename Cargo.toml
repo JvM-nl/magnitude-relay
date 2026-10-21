@@ -44,3 +44,8 @@ debug = 1
 [profile.bench]
 inherits = "release"
 debug = 1
+
+# The reference negentropy crate is only ever a test oracle; optimised, the
+# interop tests over a million items run in seconds rather than half a minute.
+[profile.dev.package.negentropy]
+opt-level = 3
