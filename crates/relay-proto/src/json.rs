@@ -55,6 +55,53 @@ impl<'a> RawStr<'a> {
     pub fn is(&self, s: &[u8]) -> bool {
         !self.escaped && self.bytes == s
     }
+
+    /// The text the string stands for, every escape undone: for messages meant
+    /// to be read (a relay's OK or NOTICE), never for anything hashed. A lone
+    /// surrogate, which has no UTF-8 form, becomes U+FFFD.
+    pub fn to_text(&self) -> String {
+        if !self.escaped {
+            // A scanned string is a slice of a `&str` between ASCII quotes.
+            return String::from_utf8_lossy(self.bytes).into_owned();
+        }
+        let raw = self.bytes;
+        let mut out = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] != b'\\' {
+                out.push(raw[i]);
+                i += 1;
+                continue;
+            }
+            let e = raw[i + 1];
+            i += 2;
+            match e {
+                b'b' => out.push(0x08),
+                b'f' => out.push(0x0C),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'u' => {
+                    // The scanner guaranteed four hex digits.
+                    let unit = hex4(&raw[i..]);
+                    i += 4;
+                    let cp = if (0xD800..0xDC00).contains(&unit) && raw.get(i..i + 2) == Some(b"\\u") && (0xDC00..0xE000).contains(&hex4(&raw[i + 2..])) {
+                        let low = hex4(&raw[i + 2..]);
+                        i += 6;
+                        0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+                    } else if (0xD800..0xE000).contains(&unit) {
+                        0xFFFD
+                    } else {
+                        unit
+                    };
+                    push_utf8(&mut out, cp);
+                }
+                // `"`, `\` and `/` stand for themselves.
+                other => out.push(other),
+            }
+        }
+        String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    }
 }
 
 #[derive(Clone)]
@@ -590,6 +637,27 @@ mod tests {
             let expect = &expect[1..expect.len() - 1];
             assert_eq!(canon(c), expect, "case {c}");
         }
+    }
+
+    #[test]
+    fn to_text_undoes_every_escape() {
+        // Escape sequences built at run time: a backslash-u in this file's text
+        // would be at the mercy of every tool that edits it.
+        let u = |hex: &str| format!("{}u{hex}", '\\');
+        let cases = [
+            r#""plain""#.to_string(),
+            r#""a\/b \" \\ \n\t\r\f\b""#.to_string(),
+            format!("\"caf{}{}\"", u("00e9"), u("0041")),
+            format!("\"{}{} emoji\"", u("d83d"), u("de00")),
+            "\"raw é and 😀\"".to_string(),
+        ];
+        for c in &cases {
+            let v: String = serde_json::from_str(c).unwrap();
+            assert_eq!(Scanner::new(c).string().unwrap().to_text(), v, "case {c}");
+        }
+        let lone = format!("\"{}x{}\"", u("d800"), u("dc00"));
+        let r = char::REPLACEMENT_CHARACTER;
+        assert_eq!(Scanner::new(&lone).string().unwrap().to_text(), format!("{r}x{r}"));
     }
 
     #[test]

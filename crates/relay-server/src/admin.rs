@@ -597,7 +597,7 @@ fn parse_reply(line: &str) -> Result<Result<Reply<'_>, String>, String> {
     let mut s = Scanner::new(line);
     s.object(|s, key| -> Result<(), Bad> {
         match key.bytes {
-            b"error" => error = Some(unescape(s.string()?)),
+            b"error" => error = Some(s.string()?.to_text()),
             b"done" => {
                 s.skip()?;
                 done = true;
@@ -656,36 +656,6 @@ fn parse_sample(s: &mut Scanner<'_>) -> Result<Sample, Bad> {
         Ok(())
     })?;
     Ok(Sample { id, kind, created_at, pubkey })
-}
-
-/// A JSON string's text. Only what `json::escape_str` writes needs undoing.
-fn unescape(v: RawStr<'_>) -> String {
-    let s = String::from_utf8_lossy(v.bytes);
-    if !v.escaped {
-        return s.into_owned();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('b') => out.push('\x08'),
-            Some('f') => out.push('\x0c'),
-            Some('u') => {
-                let code: String = chars.by_ref().take(4).collect();
-                out.push(u32::from_str_radix(&code, 16).ok().and_then(char::from_u32).unwrap_or(char::REPLACEMENT_CHARACTER));
-            }
-            Some(other) => out.push(other),
-            None => {}
-        }
-    }
-    out
 }
 
 #[cfg(test)]
