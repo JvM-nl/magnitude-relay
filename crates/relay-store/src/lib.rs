@@ -97,7 +97,7 @@ pub(crate) struct Shared {
 }
 
 /// Format version of the data directory.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 
 /// The store's fixed parameters, recorded when it is created. The log addresses
 /// records by `offset / segment_size`, so opening it with another segment size

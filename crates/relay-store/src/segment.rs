@@ -2,16 +2,20 @@
 //!
 //! ```text
 //! [block 0] ... [block n-1] [block index] [bloom] [footer]
-//! block  = entries ‖ crc32c u32;  entry = varint shared ‖ varint rest ‖ rest bytes
+//! block  = entries ‖ restart offsets (u16 each) ‖ restart count u16 ‖ crc32c u32
+//! entry  = varint shared ‖ varint rest ‖ rest bytes (shared = 0 at every restart)
 //! index  = n u32 ‖ n × entry offset u32 ‖ entries
 //!          entry = off u64 ‖ len u32 ‖ count u32 ‖ before u64 ‖ key_len u16 ‖ first key
 //! bloom  = cache-line blocks of 512 bits, k probes inside one block
 //! footer = fixed 80 bytes, see `Footer`
 //! ```
 //!
-//! Keys inside a block are prefix-compressed against the previous key (the
-//! first is stored whole), which collapses the long shared prefixes of index
-//! keys: an author's keys differ only in their last 16 bytes. Nothing is parsed
+//! Keys inside a block are prefix-compressed against the previous key, which
+//! collapses the long shared prefixes of index keys (an author's keys differ only
+//! in their last 16 bytes). Every 16th key is stored whole, a restart point: a
+//! seek binary-searches the restart keys and decodes at most 16 entries, and a
+//! backward walk decodes one 16-key interval at a time. A 4 KiB block of short
+//! keys holds ~340 entries; decoding all of them per seek cost ~5 us. Nothing is parsed
 //! at open: the block index and bloom are read straight from the mapping, so
 //! opening is O(1) and the only memory pinned is what the page cache keeps hot.
 //! A probe for an absent prefix costs one cache line of bloom.
@@ -27,7 +31,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Uncompressed block payload target. Fits L1 once decoded.
 pub const BLOCK_TARGET: usize = 4096;
-const MAGIC: &[u8; 8] = b"RLYSEG01";
+const MAGIC: &[u8; 8] = b"RLYSEG02";
+/// Keys between restart points.
+const RESTART: usize = 16;
 const FOOTER_LEN: usize = 80;
 const BLOOM_BITS_PER_PREFIX: usize = 10;
 const BLOOM_K: u32 = 7;
@@ -76,6 +82,7 @@ pub struct SegmentWriter {
     path: PathBuf,
     out: BufWriter<File>,
     block: Vec<u8>,
+    restarts: Vec<u16>,
     block_first: Vec<u8>,
     block_count: u32,
     prev: Vec<u8>,
@@ -93,6 +100,7 @@ impl SegmentWriter {
             path: path.to_path_buf(),
             out: BufWriter::with_capacity(1 << 20, f),
             block: Vec::with_capacity(BLOCK_TARGET + 512),
+            restarts: Vec::with_capacity(BLOCK_TARGET / 64),
             block_first: Vec::new(),
             block_count: 0,
             prev: Vec::new(),
@@ -110,9 +118,12 @@ impl SegmentWriter {
         if self.block.len() >= BLOCK_TARGET {
             self.finish_block()?;
         }
-        let shared = if self.block_count == 0 {
+        if self.block_count == 0 {
             self.block_first.clear();
             self.block_first.extend_from_slice(key);
+        }
+        let shared = if self.block_count as usize % RESTART == 0 {
+            self.restarts.push(self.block.len() as u16);
             0
         } else {
             self.prev.iter().zip(key).take_while(|(a, b)| a == b).count()
@@ -138,6 +149,11 @@ impl SegmentWriter {
         if self.block_count == 0 {
             return Ok(());
         }
+        for r in &self.restarts {
+            self.block.extend_from_slice(&r.to_le_bytes());
+        }
+        self.block.extend_from_slice(&(self.restarts.len() as u16).to_le_bytes());
+        self.restarts.clear();
         let crc = crc32c(&self.block);
         self.block.extend_from_slice(&crc.to_le_bytes());
         self.out.write_all(&self.block)?;
@@ -229,48 +245,103 @@ pub struct Segment {
     bloom_off: usize,
     bloom_blocks: u64,
     bytes: u64,
+    /// One bit per block: its checksum has been verified. Checked on first use
+    /// rather than at open, so opening stays O(1) and a block is hashed once.
+    verified: Box<[std::sync::atomic::AtomicU64]>,
     /// Set once a compaction has replaced it: the file goes when the last
     /// snapshot holding it does.
     obsolete: AtomicBool,
 }
 
-/// A block's keys, decoded into one buffer.
+/// Up to `RESTART` decoded keys of one interval of a block.
 #[derive(Default)]
-pub struct Block {
+pub struct Interval {
     data: Vec<u8>,
     offs: Vec<u32>,
 }
 
-impl Block {
+impl Interval {
     #[inline]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.offs.len()
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.offs.is_empty()
-    }
-
-    #[inline]
-    pub fn key(&self, i: usize) -> &[u8] {
+    fn key(&self, i: usize) -> &[u8] {
         let s = self.offs[i] as usize;
         let e = self.offs.get(i + 1).map_or(self.data.len(), |&e| e as usize);
         &self.data[s..e]
     }
+}
+
+/// A block's layout, borrowed from the mapping.
+#[derive(Clone, Copy)]
+struct BlockRef<'a> {
+    entries: &'a [u8],
+    restarts: &'a [u8],
+    count: usize,
+    before: u64,
+}
+
+impl<'a> BlockRef<'a> {
+    #[inline]
+    fn nrestarts(&self) -> usize {
+        self.restarts.len() / 2
+    }
 
     #[inline]
-    fn lower_bound(&self, k: &[u8]) -> usize {
-        let (mut lo, mut hi) = (0, self.len());
+    fn restart_off(&self, r: usize) -> usize {
+        u16::from_le_bytes([self.restarts[2 * r], self.restarts[2 * r + 1]]) as usize
+    }
+
+    /// The whole key stored at restart `r`.
+    #[inline]
+    fn restart_key(&self, r: usize) -> &'a [u8] {
+        let mut p = self.restart_off(r);
+        let _shared = varint::get(self.entries, &mut p).expect("restart entry");
+        let len = varint::get(self.entries, &mut p).expect("restart entry") as usize;
+        &self.entries[p..p + len]
+    }
+
+    /// Decodes interval `r` (keys `r*RESTART ..`) into `out`.
+    fn decode(&self, r: usize, out: &mut Interval) {
+        out.data.clear();
+        out.offs.clear();
+        let n = (self.count - r * RESTART).min(RESTART);
+        let mut p = self.restart_off(r);
+        let mut prev = 0usize;
+        for _ in 0..n {
+            let shared = varint::get(self.entries, &mut p).expect("block entry") as usize;
+            let rest = varint::get(self.entries, &mut p).expect("block entry") as usize;
+            let start = out.data.len();
+            out.data.extend_from_within(prev..prev + shared);
+            out.data.extend_from_slice(&self.entries[p..p + rest]);
+            p += rest;
+            out.offs.push(start as u32);
+            prev = start;
+        }
+    }
+
+    /// Position within the block of the first key `>= k`, leaving the interval
+    /// that holds it (or the last one searched) decoded in `iv` as `iv_at`.
+    fn lower_bound(&self, k: &[u8], iv: &mut Interval) -> (usize, usize) {
+        // The last restart whose key is <= k.
+        let (mut lo, mut hi) = (0usize, self.nrestarts());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.key(mid) < k {
+            if self.restart_key(mid) <= k {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        lo
+        let r = lo.saturating_sub(1);
+        self.decode(r, iv);
+        let mut i = 0;
+        while i < iv.len() && iv.key(i) < k {
+            i += 1;
+        }
+        (r * RESTART + i, r)
     }
 }
 
@@ -284,7 +355,7 @@ impl Segment {
         let f = map.slice(len - FOOTER_LEN, FOOTER_LEN);
         let u64_at = |o: usize| u64::from_le_bytes(f[o..o + 8].try_into().unwrap());
         if &f[..8] != MAGIC {
-            return Err(io::Error::other(format!("{}: not a segment file", path.display())));
+            return Err(io::Error::other(format!("{}: not a segment file (or an older format)", path.display())));
         }
         let nblocks = u64_at(16) as usize;
         let keys = u64_at(24);
@@ -301,8 +372,8 @@ impl Segment {
             return Err(io::Error::other(format!("{}: index or bloom checksum mismatch", path.display())));
         }
         map.advise(Advice::Random);
-        let seg = Segment { id, path: path.to_path_buf(), map, nblocks, keys, index_off, bloom_off, bloom_blocks, bytes: len as u64, obsolete: AtomicBool::new(false) };
-        Ok(seg)
+        let verified = (0..nblocks.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        Ok(Segment { id, path: path.to_path_buf(), map, nblocks, keys, index_off, bloom_off, bloom_blocks, bytes: len as u64, verified, obsolete: AtomicBool::new(false) })
     }
 
     #[inline]
@@ -344,6 +415,22 @@ impl Segment {
         (off, len, count, before, self.map.slice(e + 26, klen))
     }
 
+    /// Block `i`'s layout, its checksum verified on first use.
+    fn block(&self, i: usize) -> BlockRef<'_> {
+        let (off, len, count, before, _) = self.meta(i);
+        let raw = self.map.slice(off, len);
+        let (body, crc) = raw.split_at(len - 4);
+        let word = &self.verified[i / 64];
+        let bit = 1u64 << (i % 64);
+        if word.load(Ordering::Relaxed) & bit == 0 {
+            assert_eq!(crc32c(body), u32::from_le_bytes(crc.try_into().unwrap()), "index segment {} block {i} is corrupt", self.path.display());
+            word.fetch_or(bit, Ordering::Relaxed);
+        }
+        let n = u16::from_le_bytes([body[body.len() - 2], body[body.len() - 1]]) as usize;
+        let restarts_at = body.len() - 2 - 2 * n;
+        BlockRef { entries: &body[..restarts_at], restarts: &body[restarts_at..body.len() - 2], count, before }
+    }
+
     /// The last block whose first key is `<= k` (0 if `k` sorts first).
     fn block_for(&self, k: &[u8]) -> usize {
         let (mut lo, mut hi) = (0usize, self.nblocks);
@@ -372,42 +459,14 @@ impl Segment {
         lo.saturating_sub(1)
     }
 
-    /// Decodes block `i` into `out`, checking its checksum.
-    pub fn decode(&self, i: usize, out: &mut Block) {
-        let (off, len, count, _, _) = self.meta(i);
-        let raw = self.map.slice(off, len);
-        let (body, crc) = raw.split_at(len - 4);
-        assert_eq!(crc32c(body), u32::from_le_bytes(crc.try_into().unwrap()), "index segment {} block {i} is corrupt", self.path.display());
-        out.data.clear();
-        out.offs.clear();
-        out.data.reserve(count * 64);
-        let mut p = 0;
-        let mut prev_start = 0usize;
-        for _ in 0..count {
-            let shared = varint::get(body, &mut p).expect("block entry") as usize;
-            let rest = varint::get(body, &mut p).expect("block entry") as usize;
-            let start = out.data.len();
-            out.data.extend_from_within(prev_start..prev_start + shared);
-            out.data.extend_from_slice(&body[p..p + rest]);
-            p += rest;
-            out.offs.push(start as u32);
-            prev_start = start;
-        }
-    }
-
-    /// Global position of the first key `>= k`, decoding into `blk` (which is
-    /// left holding the block that position falls in, as `blk_idx`).
-    pub fn lower_bound(&self, k: &[u8], blk: &mut Block, blk_idx: &mut usize) -> u64 {
+    /// Global position of the first key `>= k`.
+    pub fn lower_bound(&self, k: &[u8]) -> u64 {
         if self.nblocks == 0 {
             return 0;
         }
-        let b = self.block_for(k);
-        if *blk_idx != b || blk.is_empty() {
-            self.decode(b, blk);
-            *blk_idx = b;
-        }
-        let before = self.meta(b).3;
-        before + blk.lower_bound(k) as u64
+        let b = self.block(self.block_for(k));
+        let mut iv = Interval::default();
+        b.before + b.lower_bound(k, &mut iv).0 as u64
     }
 
     /// A cheap estimate of the keys in `[lo, hi)` from the block index alone (no
@@ -428,33 +487,26 @@ impl Segment {
 
     /// Number of keys in `[lo, hi)`.
     pub fn count_range(&self, lo: &[u8], hi: &[u8]) -> u64 {
-        let mut blk = Block::default();
-        let mut bi = usize::MAX;
-        let a = self.lower_bound(lo, &mut blk, &mut bi);
-        let b = self.lower_bound(hi, &mut blk, &mut bi);
-        b.saturating_sub(a)
+        self.lower_bound(hi).saturating_sub(self.lower_bound(lo))
     }
 
     /// True if exactly `k` is present.
     pub fn contains(&self, k: &[u8]) -> bool {
-        if !self.may_contain(keys::bloom_prefix(k)) {
+        if self.nblocks == 0 || !self.may_contain(keys::bloom_prefix(k)) {
             return false;
         }
-        let mut blk = Block::default();
-        let mut bi = usize::MAX;
-        let pos = self.lower_bound(k, &mut blk, &mut bi);
-        let start = self.meta(bi).3;
-        let i = (pos - start) as usize;
-        i < blk.len() && blk.key(i) == k
+        let b = self.block(self.block_for(k));
+        let mut iv = Interval::default();
+        let (pos, r) = b.lower_bound(k, &mut iv);
+        let i = pos - r * RESTART;
+        i < iv.len() && iv.key(i) == k
     }
 
     /// A cursor over keys in `[lo, hi)`.
     pub fn range(&self, lo: &[u8], hi: &[u8]) -> SegCursor<'_> {
-        let mut blk = Block::default();
-        let mut bi = usize::MAX;
-        let a = self.lower_bound(lo, &mut blk, &mut bi);
-        let b = self.lower_bound(hi, &mut blk, &mut bi);
-        SegCursor { seg: self, blk, bi, front: a, back: b.max(a) }
+        let a = self.lower_bound(lo);
+        let b = self.lower_bound(hi);
+        SegCursor { seg: self, iv: Interval::default(), cur: None, front: a, back: b.max(a) }
     }
 
     pub fn path(&self) -> &Path {
@@ -470,30 +522,42 @@ impl Drop for Segment {
     }
 }
 
-/// Keys of one segment in `[front, back)`, walked from either end.
+/// Keys of one segment in `[front, back)`, walked from either end, one decoded
+/// interval of at most 16 keys at a time.
 pub struct SegCursor<'a> {
     seg: &'a Segment,
-    blk: Block,
-    bi: usize,
+    iv: Interval,
+    /// The decoded interval: (block layout, interval index).
+    cur: Option<(BlockRef<'a>, usize)>,
     front: u64,
     back: u64,
 }
 
-impl SegCursor<'_> {
+impl<'a> SegCursor<'a> {
     #[inline]
     pub fn remaining(&self) -> u64 {
         self.back - self.front
     }
 
+    /// Makes sure the interval holding global position `pos` is decoded; returns
+    /// the key's index within it.
+    #[inline]
     fn load(&mut self, pos: u64) -> usize {
-        let start = if self.bi < self.seg.nblocks { self.seg.meta(self.bi).3 } else { u64::MAX };
-        let count = if self.bi < self.seg.nblocks { self.blk.len() as u64 } else { 0 };
-        if start == u64::MAX || pos < start || pos >= start + count {
-            let b = self.seg.block_of_pos(pos);
-            self.seg.decode(b, &mut self.blk);
-            self.bi = b;
+        if let Some((b, r)) = self.cur {
+            if pos >= b.before && pos < b.before + b.count as u64 {
+                let at = (pos - b.before) as usize;
+                if at / RESTART != r {
+                    b.decode(at / RESTART, &mut self.iv);
+                    self.cur = Some((b, at / RESTART));
+                }
+                return at % RESTART;
+            }
         }
-        (pos - self.seg.meta(self.bi).3) as usize
+        let b = self.seg.block(self.seg.block_of_pos(pos));
+        let at = (pos - b.before) as usize;
+        b.decode(at / RESTART, &mut self.iv);
+        self.cur = Some((b, at / RESTART));
+        at % RESTART
     }
 
     /// The last key not yet taken, taken.
@@ -504,7 +568,7 @@ impl SegCursor<'_> {
         }
         self.back -= 1;
         let i = self.load(self.back);
-        Some(self.blk.key(i))
+        Some(self.iv.key(i))
     }
 
     /// The last key not yet taken, left in place.
@@ -514,7 +578,7 @@ impl SegCursor<'_> {
             return None;
         }
         let i = self.load(self.back - 1);
-        Some(self.blk.key(i))
+        Some(self.iv.key(i))
     }
 
     /// The first key not yet taken, left in place.
@@ -524,7 +588,7 @@ impl SegCursor<'_> {
             return None;
         }
         let i = self.load(self.front);
-        Some(self.blk.key(i))
+        Some(self.iv.key(i))
     }
 
     /// The first key not yet taken, taken.
@@ -535,7 +599,7 @@ impl SegCursor<'_> {
         }
         let i = self.load(self.front);
         self.front += 1;
-        Some(self.blk.key(i))
+        Some(self.iv.key(i))
     }
 }
 
