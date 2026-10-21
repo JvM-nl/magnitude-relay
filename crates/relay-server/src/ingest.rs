@@ -74,7 +74,12 @@ pub fn now() -> u64 {
 pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>) {
     let mut last_sweep = Instant::now();
     let mut reqs: Vec<WriteReq> = Vec::new();
+    // RELAY_DEBUG_WRITER=1 prints a per-second breakdown of the writer's cycle.
+    let debug = std::env::var_os("RELAY_DEBUG_WRITER").is_some();
+    let (mut d_batches, mut d_events, mut d_stage, mut d_finish, mut d_idle) = (0u64, 0u64, 0f64, 0f64, 0f64);
+    let mut d_last = Instant::now();
     loop {
+        let wait_started = Instant::now();
         if SHUTDOWN.load(Ordering::Acquire) {
             break;
         }
@@ -107,8 +112,12 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
             }
         }
 
+        d_idle += wait_started.elapsed().as_secs_f64();
+        let t_stage = Instant::now();
         let refs: Vec<&[u8]> = reqs.iter().map(|r| r.rec.as_slice()).collect();
         let staged = w.stage(&refs);
+        let stage_secs = t_stage.elapsed().as_secs_f64();
+        let mut finish_secs = 0f64;
         let gen = w.next_gen();
         let outcomes: Vec<Option<Outcome>> = match staged {
             Ok((outcomes, staged)) => {
@@ -121,7 +130,10 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
                         s(ReactorMsg::Live(live.clone()));
                     }
                 }
-                match w.finish(staged) {
+                let t_finish = Instant::now();
+                let finished = w.finish(staged);
+                finish_secs = t_finish.elapsed().as_secs_f64();
+                match finished {
                     Ok(()) => outcomes.into_iter().map(Some).collect(),
                     Err(e) => {
                         eprintln!("write failed: {e}");
@@ -134,6 +146,7 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
                 vec![None; reqs.len()]
             }
         };
+        let outcomes_len = outcomes.len() as u64;
         let mut replies: Vec<Vec<Reply>> = (0..sinks.len()).map(|_| Vec::new()).collect();
         for (r, outcome) in reqs.drain(..).zip(outcomes) {
             let id: [u8; 32] = r.rec[..32].try_into().unwrap();
@@ -142,6 +155,23 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
         let msg = Arc::new(Replies { gen: store.generation(), replies });
         for s in &sinks {
             s(ReactorMsg::Replies(msg.clone()));
+        }
+        if debug {
+            d_batches += 1;
+            d_events += outcomes_len;
+            d_stage += stage_secs;
+            d_finish += finish_secs;
+            if d_last.elapsed().as_secs() >= 1 {
+                eprintln!(
+                    "writer: {d_batches} batches, {d_events} events ({:.0}/batch), stage {:.2} ms/batch, finish {:.2} ms/batch, idle {:.0}%",
+                    d_events as f64 / d_batches.max(1) as f64,
+                    d_stage * 1e3 / d_batches.max(1) as f64,
+                    d_finish * 1e3 / d_batches.max(1) as f64,
+                    d_idle * 100.0 / d_last.elapsed().as_secs_f64()
+                );
+                (d_batches, d_events, d_stage, d_finish, d_idle) = (0, 0, 0.0, 0.0, 0.0);
+                d_last = Instant::now();
+            }
         }
         // With the OKs out, keep the log's next stretch pre-written.
         if let Err(e) = w.prepare() {
