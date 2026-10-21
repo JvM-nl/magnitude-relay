@@ -321,19 +321,20 @@ impl LogWriter {
         let o = off % self.seg_size;
         let len = seg.read_u32(o as usize) as usize;
         self.touched.insert(si);
-        // The header stays (its flag says dead); the record's blocks are given back.
-        let body = o + FRAME_HEADER as u64;
-        if seg.punch_hole(body, body + len as u64) {
-            return Ok(());
+        // The header stays (its flag says dead). Whole blocks inside the record
+        // are given back; the partial ones at its ends are overwritten. Most
+        // records are smaller than a block and are only overwritten: a hole
+        // punch there frees nothing, and costs the writer a filesystem
+        // transaction and an unmap of the range from every reader's mapping
+        // (ingest ran 20% slower punching every dead record).
+        const BLOCK: u64 = 4096;
+        let (body, end) = (o + FRAME_HEADER as u64, o + FRAME_HEADER as u64 + len as u64);
+        let (a, b) = (body.next_multiple_of(BLOCK), end / BLOCK * BLOCK);
+        if b > a && seg.punch_hole(a, b) {
+            write_zeros(&seg, body, a)?;
+            return write_zeros(&seg, b, end);
         }
-        const ZEROS: [u8; 4096] = [0; 4096];
-        let mut done = 0;
-        while done < len {
-            let n = (len - done).min(ZEROS.len());
-            seg.write_at(o + FRAME_HEADER as u64 + done as u64, &ZEROS[..n])?;
-            done += n;
-        }
-        Ok(())
+        write_zeros(&seg, body, end)
     }
 
     /// Writes queued frames and hands over the segments written since the last
@@ -445,4 +446,16 @@ impl LogWriter {
         self.zeroed_to = if to == seg_end { seg_end } else { to };
         Ok(())
     }
+}
+
+/// Overwrites `[from, to)` of a segment (offsets within it) with zeros.
+fn write_zeros(seg: &MappedFile, from: u64, to: u64) -> io::Result<()> {
+    const ZEROS: [u8; 4096] = [0; 4096];
+    let mut at = from;
+    while at < to {
+        let n = ((to - at) as usize).min(ZEROS.len());
+        seg.write_at(at, &ZEROS[..n])?;
+        at += n as u64;
+    }
+    Ok(())
 }
