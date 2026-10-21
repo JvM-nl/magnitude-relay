@@ -6,8 +6,11 @@
 #   nginx-unix  nginx terminates TLS, then the relay's Unix socket
 #   nginx-tcp   nginx terminates TLS, then loopback TCP (how strfry is reached today)
 #   builtin     the relay's own TLS (rustls)
+#   sni-pass    nginx passes the TLS bytes through untouched (stream, ssl_preread),
+#               the relay's own TLS behind it: how a relay with its own TLS can
+#               share port 443 with websites nginx serves
 # nginx here is a bench-only instance of the system binary: its own prefix, config,
-# pid file and logs under /root/bench/nginx, loopback ports 7806/7807, the relay's
+# pid file and logs under /root/bench/nginx, loopback ports 7806/7807/7809, the relay's
 # CPUs, the production vhost's proxy settings. It is stopped by its own pid, checked
 # against its command line; the production nginx is never signalled or read beyond
 # its binary. Per mode: a fresh store, `events` ingested (default 300k), then the
@@ -36,8 +39,8 @@ if [ ! -s "$TLS/key.pem" ]; then
 fi
 # The benchmark settings, plus the Unix socket and the relay's own TLS.
 sed "s|^\[relay\]|[relay]\nunix_socket = \"$sock\"|" "$BENCH_ROOT/ours.toml" > "$conf"
-# (http_bind, for ACME challenges and redirects, would take port 80: kept on loopback.)
-printf '\n[tls]\nenabled = true\ncert = "%s"\nkey = "%s"\nhttps_bind = "127.0.0.1:7808"\nhttp_bind = "127.0.0.1:7809"\n' "$TLS/cert.pem" "$TLS/key.pem" >> "$conf"
+# (http_bind, for ACME challenges and redirects, would take port 80: off.)
+printf '\n[tls]\nenabled = true\ncert = "%s"\nkey = "%s"\nhttps_bind = "127.0.0.1:7808"\nhttp_bind = ""\n' "$TLS/cert.pem" "$TLS/key.pem" >> "$conf"
 export OURS_CONF=$conf
 
 # The production vhost's /nostr location (proxy settings, TLS 1.2/1.3), twice.
@@ -58,6 +61,9 @@ proxy() { cat <<EOF
 EOF
 }
 cat > "$NGX/nginx.conf" <<EOF
+load_module /usr/lib/nginx/modules/ngx_stream_module.so;
+# Workers as root: the relay's socket is under /root (mode 700). Loopback only.
+user root;
 worker_processes 4;
 # Two descriptors per proxied connection.
 worker_rlimit_nofile 65536;
@@ -84,6 +90,13 @@ $(proxy "http://unix:$sock")
     server {
         listen 127.0.0.1:7807 ssl http2;
 $(proxy "http://127.0.0.1:$PORT_OURS")
+    }
+}
+stream {
+    server {
+        listen 127.0.0.1:7809;
+        ssl_preread on;
+        proxy_pass 127.0.0.1:7808;
     }
 }
 EOF
@@ -125,6 +138,7 @@ url_of() {
         nginx-unix) echo "wss://localhost:7806" ;;
         nginx-tcp) echo "wss://localhost:7807" ;;
         builtin) echo "wss://localhost:7808" ;;
+        sni-pass) echo "wss://localhost:7809" ;;
     esac
 }
 lg() { # url args...
@@ -149,7 +163,7 @@ step() { # mode pid name ops-hint args...
 ngx_start
 for r in $(seq 1 "$rounds"); do
     echo "=== round $r"
-    for mode in plain nginx-unix nginx-tcp builtin; do
+    for mode in ${MODES:-plain nginx-unix nginx-tcp builtin sni-pass}; do
         ./stop.sh ours >/dev/null 2>&1 || true
         ./wipe.sh ours >/dev/null
         ./start.sh ours >/dev/null || die "relay did not start"
