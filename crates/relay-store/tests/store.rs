@@ -176,6 +176,26 @@ fn deletions_follow_concord() {
     assert_eq!(write(&mut w, &[ev(1, 5, 100, 1059, &format!(r#"[["p","{recipient}"]]"#), "wrap")]), vec![Outcome::Deleted]);
 }
 
+/// A sync can bring a deletion before the event it deletes: the tombstone
+/// must hold for an event this store has never seen.
+#[test]
+fn deletions_that_arrive_first_hold() {
+    let dir = tmpdir("del-first");
+    let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+    let recipient = pk(9);
+    let note = ev(1, 3, 100, 1, "[]", "note");
+    let wrap = ev(2, 4, 100, 1059, &format!(r#"[["p","{recipient}"]]"#), "wrap");
+    let by_author = ev(3, 3, 200, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "");
+    let by_recipient = ev(4, 9, 200, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 2)), "");
+    assert!(write(&mut w, &[by_author, by_recipient]).iter().all(|o| matches!(o, Outcome::Stored(_))));
+    assert_eq!(write(&mut w, &[note.clone(), wrap.clone()]), vec![Outcome::Deleted, Outcome::Deleted]);
+    // From index segments too, after a reopen.
+    w.compact_all().unwrap();
+    drop((_store, w));
+    let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(write(&mut w, &[note, wrap]), vec![Outcome::Deleted, Outcome::Deleted]);
+}
+
 #[test]
 fn ordering_ties_and_limits() {
     let dir = tmpdir("ties");
