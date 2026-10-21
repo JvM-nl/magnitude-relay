@@ -1,5 +1,5 @@
-//! Where an event's verification time goes, measured on real events (a JSONL
-//! file, one event per line).
+//! Where an event's verification time goes, and what each change to it buys,
+//! measured on real events (a JSONL file, one event per line).
 //!
 //! `cargo run --release -p relay-proto --example sigbench -- <mode> <events.jsonl> [max]`
 //!
@@ -7,12 +7,14 @@
 //!   one at a time, timed with the cycle counter: JSON parse to a record, the
 //!   NIP-01 preimage, its SHA-256 (sha2 crate), the pubkey parse (lift_x) and
 //!   the Schnorr verify (libsecp256k1). ns per event by line size.
+//! * `sha`: event-id hashing, the sha2 crate against ours, one preimage at a
+//!   time and eight at once.
 //!
 //! Timings are the best of three passes: the production box is never idle.
 
 use relay_proto::event::{parse_event_json, EventParser};
 use relay_proto::json::Scanner;
-use relay_proto::Record;
+use relay_proto::{sha256, Record};
 use secp256k1::{schnorr, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 use std::hint::black_box;
@@ -20,7 +22,7 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: sigbench steps <events.jsonl> [max]";
+    let usage = "usage: sigbench <steps|sha> <events.jsonl> [max]";
     let mode = args.get(1).expect(usage).clone();
     let path = args.get(2).expect(usage);
     let max: usize = args.get(3).map_or(usize::MAX, |s| s.parse().unwrap());
@@ -28,8 +30,20 @@ fn main() {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).take(max).collect();
     match mode.as_str() {
         "steps" => steps(&lines),
+        "sha" => sha(&lines),
         _ => panic!("{usage}"),
     }
+}
+
+/// Best of three timings of `f`, in ns per item.
+fn best_ns(items: usize, mut f: impl FnMut()) -> f64 {
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let t = Instant::now();
+        f();
+        best = best.min(t.elapsed().as_nanos() as f64 / items as f64);
+    }
+    best
 }
 
 const CLASSES: [(&str, usize); 5] = [("<1K", 1024), ("1-2K", 2048), ("2-4K", 4096), ("4-16K", 16384), (">=16K", usize::MAX)];
@@ -155,5 +169,48 @@ fn steps(lines: &[&str]) {
         black_box(ok);
     }
     println!("parse_event_json(verify): {best_rate:.0} events/s on one thread ({:.0} ns/event)", 1e9 / best_rate);
+}
+
+/// Event-id hashing over the same preimages: the sha2 crate one at a time,
+/// ours one at a time, and ours eight lanes at once in groups of each size.
+fn sha(lines: &[&str]) {
+    let mut parser = EventParser::new();
+    let mut rec = Vec::new();
+    let mut pres: Vec<Vec<u8>> = Vec::new();
+    for l in lines {
+        if parser.parse_unchecked(&mut Scanner::new(l), &mut rec).is_ok() {
+            let mut p = Vec::new();
+            Record(&rec).write_id_preimage(&mut p);
+            pres.push(p);
+        }
+    }
+    let n = pres.len();
+    let bytes: usize = pres.iter().map(Vec::len).sum();
+    println!("{n} preimages, mean {} bytes", bytes / n);
+    let refs: Vec<&[u8]> = pres.iter().map(|p| p.as_slice()).collect();
+    let mut out = vec![[0u8; 32]; n];
+    let one = best_ns(n, || {
+        for (p, o) in refs.iter().zip(out.iter_mut()) {
+            *o = Sha256::digest(p).into();
+        }
+    });
+    let want = out.clone();
+    println!("sha2 one at a time: {one:.0} ns/event, {:.2} ns/byte", one * n as f64 / bytes as f64);
+    let ours = best_ns(n, || {
+        for (p, o) in refs.iter().zip(out.iter_mut()) {
+            *o = sha256::digest(p);
+        }
+    });
+    assert!(out == want, "digest disagrees with sha2");
+    println!("ours one at a time: {ours:.0} ns/event, {:.2} ns/byte, {:.2}x", ours * n as f64 / bytes as f64, one / ours);
+    for group in [8usize, 16, 64, 256, 2048] {
+        let ns = best_ns(n, || {
+            for (r, o) in refs.chunks(group).zip(out.chunks_mut(group)) {
+                sha256::digest_many(r, o);
+            }
+        });
+        assert!(out == want, "digest_many disagrees with sha2");
+        println!("digest_many in groups of {group:>4}: {ns:.0} ns/event, {:.2} ns/byte, {:.2}x", ns * n as f64 / bytes as f64, one / ns);
+    }
 }
 

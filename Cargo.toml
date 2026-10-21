@@ -23,7 +23,7 @@ relay-net = { path = "crates/relay-net" }
 relay-tls = { path = "crates/relay-tls" }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "signal", "io-util"] }
 secp256k1 = { version = "0.33", default-features = false, features = ["std"] }
-sha2 = { version = "0.10", features = ["asm"] }
+sha2 = { version = "0.10", features = ["asm", "compress"] }
 libc = "0.2"
 # TLS and cryptography are never written in-house: rustls (ring provider, no
 # aws-lc), its tokio glue, ring for the ACME account's signatures, and the CA

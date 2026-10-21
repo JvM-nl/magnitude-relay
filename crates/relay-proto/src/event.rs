@@ -6,8 +6,7 @@
 
 use crate::json::{self, RawStr, Scanner};
 use crate::record::{self, Record, FLAG_EXPIRATION, FLAG_PROTECTED, FLAG_RAW_FORM, HEADER_LEN};
-use crate::{hex, varint};
-use sha2::{Digest, Sha256};
+use crate::{hex, sha256, varint};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,7 +318,7 @@ fn parse_decimal(v: RawStr<'_>) -> Option<u64> {
 pub fn compute_id(rec: Record<'_>, scratch: &mut Vec<u8>) -> [u8; 32] {
     scratch.clear();
     rec.write_id_preimage(scratch);
-    Sha256::digest(&scratch[..]).into()
+    sha256::digest(scratch)
 }
 
 /// BIP-340 verification of the record's signature over its id.
