@@ -93,9 +93,9 @@ struct Job {
     final_len: u64,
     sparse: bool,
     private: bool,
-    /// A log segment (its index in [`log::Segs`]): its frames' dead flags are
-    /// set to the start's as they are copied.
-    log: Option<u64>,
+    /// A log segment: its frames' dead flags are set to the start's as they
+    /// are copied.
+    log: bool,
 }
 
 /// Bytes moved per read.
@@ -164,15 +164,15 @@ fn copy_into(plan: &Plan, out: &Path, progress: &mut dyn FnMut(u64, u64) -> bool
     }
     let mut jobs = Vec::new();
     let file = |p: &Path| -> io::Result<u64> { Ok(std::fs::metadata(p)?.len()) };
-    let mut add = |src: PathBuf, dst: PathBuf, len: Option<u64>, final_len: Option<u64>, log: Option<u64>, private: bool| -> io::Result<()> {
+    let mut add = |src: PathBuf, dst: PathBuf, len: Option<u64>, final_len: Option<u64>, log: bool, private: bool| -> io::Result<()> {
         let full = file(&src)?;
         let len = len.unwrap_or(full).min(full);
-        jobs.push(Job { src, dst, len, final_len: final_len.unwrap_or(len), sparse: log.is_some(), private, log });
+        jobs.push(Job { src, dst, len, final_len: final_len.unwrap_or(len), sparse: log, private, log });
         Ok(())
     };
-    add(src.join("meta"), out.join("meta"), None, None, None, false)?;
+    add(src.join("meta"), out.join("meta"), None, None, false, false)?;
     for &id in &ck.segments {
-        add(bg::seg_path(&src.join("idx"), id), bg::seg_path(&out.join("idx"), id), None, None, None, false)?;
+        add(bg::seg_path(&src.join("idx"), id), bg::seg_path(&out.join("idx"), id), None, None, false, false)?;
     }
     // Hot segments up to the head's; the head's only up to the head.
     let head_seg = plan.head / plan.seg_size;
@@ -182,17 +182,17 @@ fn copy_into(plan: &Plan, out: &Path, progress: &mut dyn FnMut(u64, u64) -> bool
         }
         let n = i as u64;
         let len = if n == head_seg { plan.head % plan.seg_size } else { plan.seg_size };
-        add(log::hot_path(&src.join("log"), n), log::hot_path(&out.join("log"), n), Some(len), Some(plan.seg_size), Some(n), false)?;
+        add(log::hot_path(&src.join("log"), n), log::hot_path(&out.join("log"), n), Some(len), Some(plan.seg_size), true, false)?;
     }
     for &n in &ck.cold {
-        add(log::cold_path(&src.join("log"), n), log::cold_path(&out.join("log"), n), None, Some(plan.seg_size), Some(log::COLD_BASE + n), false)?;
+        add(log::cold_path(&src.join("log"), n), log::cold_path(&out.join("log"), n), None, Some(plan.seg_size), true, false)?;
     }
     // Certificates and the ACME account, for a move to another machine.
     if let Ok(entries) = std::fs::read_dir(src.join("tls")) {
         std::fs::create_dir_all(out.join("tls"))?;
         for e in entries.flatten() {
             if e.file_type().is_ok_and(|t| t.is_file()) {
-                add(e.path(), out.join("tls").join(e.file_name()), None, None, None, true)?;
+                add(e.path(), out.join("tls").join(e.file_name()), None, None, false, true)?;
             }
         }
     }
@@ -248,13 +248,7 @@ fn copy_into(plan: &Plan, out: &Path, progress: &mut dyn FnMut(u64, u64) -> bool
 /// Copies `j.len` bytes, skipping all-zero blocks when sparse (they stay holes),
 /// then sets the final length and syncs.
 fn copy_file(plan: &Plan, j: &Job, buf: &mut [u8], c: &mut Copied, total: u64, progress: &mut dyn FnMut(u64, u64) -> bool) -> io::Result<()> {
-    let mut frames = match j.log {
-        Some(id) => {
-            let seg = plan.version.segs.file(id).ok_or_else(|| io::Error::other(format!("log segment {} is not in the snapshot", j.src.display())))?;
-            Some(Frames { seg, at: 0, end: (j.len as usize).min(seg.len()) })
-        }
-        None => None,
-    };
+    let mut frames = j.log.then_some(Frames { at: 0, end: j.len });
     let src = File::open(&j.src)?;
     let dst = create_new(&j.dst, j.private)?;
     let (mut off, mut dropped) = (0u64, 0u64);
@@ -262,7 +256,7 @@ fn copy_file(plan: &Plan, j: &Job, buf: &mut [u8], c: &mut Copied, total: u64, p
         let n = (j.len - off).min(buf.len() as u64) as usize;
         src.read_exact_at(&mut buf[..n], off)?;
         if let Some(f) = &mut frames {
-            f.patch(plan, &mut buf[..n], off);
+            f.patch(&src, &|seq| plan.was_dead(seq), &mut buf[..n], off)?;
         }
         if !(j.sparse && all_zero(&buf[..n])) {
             dst.write_all_at(&buf[..n], off)?;
@@ -288,42 +282,54 @@ fn copy_file(plan: &Plan, j: &Job, buf: &mut [u8], c: &mut Copied, total: u64, p
     Ok(())
 }
 
-/// Walks a log segment's frames alongside its copy. The headers are read
-/// through the snapshot's mapping: lengths and seqs never change, and the flags
-/// word is rewritten anyway.
-struct Frames<'a> {
-    seg: &'a crate::mmap::MappedFile,
+/// Walks a log segment's frames alongside its copy. Headers are read from the
+/// bytes just read (the few that straddle two blocks, from the file again),
+/// never through the relay's own mapping: a page touched there stays mapped,
+/// and a mapped page is never let go from the cache, so a backup would leave
+/// the whole log resident.
+struct Frames {
     /// The next frame whose flags are not yet (all) set.
-    at: usize,
-    end: usize,
+    at: u64,
+    end: u64,
 }
 
-impl Frames<'_> {
+impl Frames {
     /// Sets the dead flag of every frame whose flags word overlaps `buf` (the
-    /// bytes at `off`) to the start's.
-    fn patch(&mut self, plan: &Plan, buf: &mut [u8], off: u64) {
-        let (lo, hi) = (off as usize, off as usize + buf.len());
-        while self.at + log::FRAME_HEADER <= self.end && self.at + 4 < hi {
+    /// bytes of `src` at `off`) to the start's.
+    fn patch(&mut self, src: &File, was_dead: &dyn Fn(u64) -> bool, buf: &mut [u8], off: u64) -> io::Result<()> {
+        let (lo, hi) = (off, off + buf.len() as u64);
+        // Length, flags and seq: the first 16 bytes of a header.
+        let mut head = [0u8; 16];
+        while self.at + log::FRAME_HEADER as u64 <= self.end && self.at + 4 < hi {
             let o = self.at;
-            let len = self.seg.read_u32(o) as usize;
-            if len == 0 || len > log::MAX_RECORD {
+            if o >= lo && o + 16 <= hi {
+                let p = (o - lo) as usize;
+                head.copy_from_slice(&buf[p..p + 16]);
+            } else {
+                src.read_exact_at(&mut head, o)?;
+            }
+            let word = |at: usize| u32::from_le_bytes(head[at..at + 4].try_into().unwrap());
+            let len = word(0) as u64;
+            if len == 0 || len > log::MAX_RECORD as u64 {
                 // The end of the frames.
                 self.end = o;
-                return;
+                return Ok(());
             }
-            let seq = self.seg.read_u64(o + 8);
-            let flags = (self.seg.read_u32(o + 4) & !log::FLAG_DEAD) | if plan.was_dead(seq) { log::FLAG_DEAD } else { 0 };
+            let seq = u64::from_le_bytes(head[8..16].try_into().unwrap());
+            let flags = (word(4) & !log::FLAG_DEAD) | if was_dead(seq) { log::FLAG_DEAD } else { 0 };
             for (i, b) in flags.to_le_bytes().into_iter().enumerate() {
-                if let Some(x) = (o + 4 + i).checked_sub(lo).and_then(|p| buf.get_mut(p)) {
-                    *x = b;
+                let p = o + 4 + i as u64;
+                if (lo..hi).contains(&p) {
+                    buf[(p - lo) as usize] = b;
                 }
             }
             if o + 8 > hi {
                 // The rest of the word is in the next block.
-                return;
+                return Ok(());
             }
-            self.at = o + log::FRAME_HEADER + len;
+            self.at = o + log::FRAME_HEADER as u64 + len;
         }
+        Ok(())
     }
 }
 
@@ -389,4 +395,57 @@ pub fn verify(dest: &Path, opts: crate::Options, events: u64) -> io::Result<Veri
         seq += step;
     }
     Ok(Verified { events: n, checked })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frames of every length class, some flagged dead, in a file; then copied
+    /// in blocks of many sizes, so that headers straddle blocks at every offset.
+    #[test]
+    fn dead_flags_are_set_whatever_the_blocks() {
+        let mut file = Vec::new();
+        let mut frames = Vec::new();
+        for seq in 0..60u64 {
+            let len = 1 + (seq * 37 % 300) as usize;
+            let flags = if seq % 2 == 0 { log::FLAG_DEAD } else { 0 } | 0x10;
+            frames.push((file.len(), seq));
+            file.extend_from_slice(&(len as u32).to_le_bytes());
+            file.extend_from_slice(&flags.to_le_bytes());
+            file.extend_from_slice(&seq.to_le_bytes());
+            file.extend_from_slice(&0xC0FFEEu32.to_le_bytes());
+            file.extend((0..len).map(|i| (i as u8) ^ (seq as u8)));
+        }
+        let end = file.len() as u64;
+        file.extend_from_slice(&[0u8; 64]);
+        let path = std::env::temp_dir().join(format!("relay-backup-frames-{}", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let src = File::open(&path).unwrap();
+        let was_dead = |seq: u64| seq % 3 == 0;
+        for block in [1usize, 2, 3, 5, 7, 13, 16, 19, 20, 21, 64, 333, 4096, file.len()] {
+            let mut out = Vec::with_capacity(file.len());
+            let mut f = Frames { at: 0, end: file.len() as u64 };
+            for (i, chunk) in file.chunks(block).enumerate() {
+                let mut buf = chunk.to_vec();
+                f.patch(&src, &was_dead, &mut buf, (i * block) as u64).unwrap();
+                out.extend_from_slice(&buf);
+            }
+            assert_eq!(f.end, end, "block {block}: the frames end where they do");
+            for &(o, seq) in &frames {
+                let flags = u32::from_le_bytes(out[o + 4..o + 8].try_into().unwrap());
+                assert_eq!(flags & log::FLAG_DEAD != 0, was_dead(seq), "block {block}, seq {seq}");
+                assert_eq!(flags & !log::FLAG_DEAD, 0x10, "block {block}, seq {seq}: other flags kept");
+            }
+            // Nothing but flags words changed.
+            let mut a = file.clone();
+            let mut b = out.clone();
+            for &(o, _) in &frames {
+                a[o + 4..o + 8].fill(0);
+                b[o + 4..o + 8].fill(0);
+            }
+            assert!(a == b, "block {block}: only flags changed");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
