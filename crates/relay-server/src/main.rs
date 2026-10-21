@@ -5,6 +5,7 @@ mod brand;
 mod config;
 mod export;
 mod import;
+mod inbound;
 mod ingest;
 mod metrics;
 mod operator;
@@ -14,6 +15,7 @@ mod session;
 mod sock;
 mod stats;
 mod subs;
+mod sync;
 mod toml;
 
 use config::{store_options, Config};
@@ -52,11 +54,20 @@ commands:
       --age SECS       only events created more than SECS seconds ago
       --all            allow a filter with no conditions, which matches every
                        event ({})
+  sync <url> [--filter JSON] [--dir down|up|both] [--dry-run]
+                       compare this relay's events with another relay's (ws://
+                       or wss://, NIP-77) and copy what one side lacks: down
+                       (theirs to here, the default), up (ours to there) or
+                       both. Events copied here are checked like any app's:
+                       signatures, accepted kinds, deletions. --filter
+                       defaults to {} (everything); --dry-run only counts what
+                       differs. For a lasting sync, see [[sync]] in the
+                       settings file
 
   --filter takes one NIP-01 filter or a JSON array of them (their union); a
   limit inside a filter is refused (query has --limit). While the relay runs,
-  query, count, delete and backup reach it through <data>/admin.sock, which
-  only the user running the relay can open; otherwise they open the data
+  query, count, delete, backup and sync reach it through <data>/admin.sock,
+  which only the user running the relay can open; otherwise they open the data
   directory.
 
   --config FILE        settings file (default: ./relay.toml if it exists; every
@@ -245,6 +256,23 @@ fn run() -> Result<(), String> {
             operator::run_backup(&load()?, &dest, !no_verify)
         }
         "cert" => cert(&load()?),
+        "sync" => {
+            let fs = match text(&mut args, "--filter")? {
+                Some(f) => operator::parse_filters(&f)?,
+                None => vec![relay_proto::Filter::default()],
+            };
+            let dir = match text(&mut args, "--dir")? {
+                Some(d) => config::Direction::parse(&d).ok_or(format!("--dir is down, up or both, not {d:?}"))?,
+                None => config::Direction::Down,
+            };
+            let dry_run = flag(&mut args, "--dry-run");
+            if args.is_empty() {
+                return Err("sync needs the other relay's URL, like wss://relay.example.com".into());
+            }
+            let url = args.remove(0);
+            no_more(&args)?;
+            sync::run_command(&load()?, &url, fs, dir, dry_run)
+        }
         "help" | "--help" | "-h" => {
             print!("{} {}\n\n{}", brand::NAME, brand::VERSION, USAGE.replace("{bin}", brand::SLUG));
             Ok(())

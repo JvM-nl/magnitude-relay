@@ -14,7 +14,8 @@ path = "src/main.rs"
 [dependencies]
 relay-proto.workspace = true
 relay-store.workspace = true
-relay-net.workspace = true
+# tls: wss:// to other relays, for sync.
+relay-net = { workspace = true, features = ["tls"] }
 relay-tls.workspace = true
 tokio.workspace = true
 

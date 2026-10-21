@@ -1,5 +1,5 @@
-//! The admin socket: how `query`, `count` and `delete` reach a running relay,
-//! whose data directory they cannot open themselves.
+//! The admin socket: how `query`, `count`, `delete` and `sync` reach a running
+//! relay, whose data directory they cannot open themselves.
 //!
 //! A Unix socket at `<data>/admin.sock`, mode 0600. Whoever may open it may run
 //! operator commands, so file permissions are the whole authentication and
@@ -18,7 +18,17 @@
 //! {"op":"backup","filters":[],"dest":"/absolute/path"}
 //!     {"progress":BYTES,"total":BYTES} now and then, then
 //!     {"backup":true,"events":N,"files":F,"bytes":B,"written":W}
+//! {"op":"items","filters":[one],"limit":N,"hide_wraps":true}
+//!     {"items":"<hex>"} with up to 1000 (created_at, id) pairs of 40 bytes each,
+//!     newest first, at most N+1 in all, then {"done":true,"count":N}
+//! {"op":"ingest","events":[{...},...]}
+//!     {"verdicts":["stored","refused blocked: ...",...]}, one per event
 //! ```
+//!
+//! `items` is a negentropy set and `ingest` stores events another relay sent:
+//! the two halves of a sync. Ingested events are checked as a client's EVENT is
+//! (policy, id, signature), in the connection's thread, and stored through the
+//! writer like a client batch: relayed live, answered once durable.
 //!
 //! Any failure is `{"error":"..."}`. Reads run on a snapshot in the
 //! connection's own thread, off the reactors and the writer. A delete finds its
@@ -26,8 +36,10 @@
 //! it a batch at a time (see `ingest::Control`), between its own work. A backup
 //! is copied here as well; the writer only starts it, and hears when it is over.
 
+use crate::inbound::{self, Verdict};
 use crate::ingest::{self, Control};
 use crate::operator::{self, Deleted, Sample};
+use crate::session::SessionCfg;
 use relay_proto::filter::FilterError;
 use relay_proto::json::{self, RawStr, Scanner};
 use relay_proto::record::push_u64;
@@ -65,13 +77,24 @@ pub enum Op {
     Count,
     Delete,
     Backup,
+    Items,
+    Ingest,
+}
+
+impl Op {
+    const NAMES: [(Op, &'static str); 6] =
+        [(Op::Query, "query"), (Op::Count, "count"), (Op::Delete, "delete"), (Op::Backup, "backup"), (Op::Items, "items"), (Op::Ingest, "ingest")];
+
+    fn name(self) -> &'static str {
+        Op::NAMES.iter().find(|(o, _)| *o == self).map(|(_, n)| *n).expect("every op is named")
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     pub op: Op,
     pub filters: Vec<Filter>,
-    /// query: at most this many events.
+    /// query: at most this many events. items: this many and one more.
     pub limit: Option<u64>,
     /// delete: only events created more than this many seconds ago.
     pub age: Option<u64>,
@@ -81,7 +104,15 @@ pub struct Request {
     pub dry_run: bool,
     /// backup: where to, as an absolute path.
     pub dest: Option<String>,
+    /// items: leave out gift wraps unless the filter names their author,
+    /// recipient or id, as this relay does for its own clients.
+    pub hide_wraps: bool,
+    /// ingest: event objects, as JSON text.
+    pub events: Vec<String>,
 }
+
+/// Items per `{"items":..}` line: 80 KB of hex.
+const ITEMS_PER_LINE: usize = 1000;
 
 /// Why a request or reply could not be read.
 struct Bad(String);
@@ -114,17 +145,11 @@ fn boolean(s: &mut Scanner<'_>) -> Result<bool, Bad> {
 
 impl Request {
     pub fn new(op: Op, filters: Vec<Filter>) -> Request {
-        Request { op, filters, limit: None, age: None, all: false, dry_run: false, dest: None }
+        Request { op, filters, limit: None, age: None, all: false, dry_run: false, dest: None, hide_wraps: false, events: Vec::new() }
     }
 
     fn to_line(&self) -> String {
-        let mut out = Vec::new();
-        out.extend_from_slice(match self.op {
-            Op::Query => b"{\"op\":\"query\",\"filters\":[",
-            Op::Count => b"{\"op\":\"count\",\"filters\":[",
-            Op::Delete => b"{\"op\":\"delete\",\"filters\":[",
-            Op::Backup => b"{\"op\":\"backup\",\"filters\":[",
-        });
+        let mut out = format!("{{\"op\":\"{}\",\"filters\":[", self.op.name()).into_bytes();
         for (i, f) in self.filters.iter().enumerate() {
             if i > 0 {
                 out.push(b',');
@@ -138,7 +163,7 @@ impl Request {
                 push_u64(&mut out, v);
             }
         }
-        for (key, v) in [("all", self.all), ("dry_run", self.dry_run)] {
+        for (key, v) in [("all", self.all), ("dry_run", self.dry_run), ("hide_wraps", self.hide_wraps)] {
             if v {
                 out.extend_from_slice(format!(",\"{key}\":true").as_bytes());
             }
@@ -147,6 +172,17 @@ impl Request {
             out.extend_from_slice(b",\"dest\":\"");
             json::escape_str(dest, &mut out);
             out.push(b'"');
+        }
+        if !self.events.is_empty() {
+            out.extend_from_slice(b",\"events\":[");
+            for (i, e) in self.events.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                // As received: an event's bytes are what its id commits to.
+                out.extend_from_slice(e.as_bytes());
+            }
+            out.push(b']');
         }
         out.push(b'}');
         String::from_utf8(out).expect("request JSON is UTF-8")
@@ -160,13 +196,8 @@ impl Request {
             match key.bytes {
                 b"op" => {
                     let v = s.string()?;
-                    op = Some(match (v.escaped, v.bytes) {
-                        (false, b"query") => Op::Query,
-                        (false, b"count") => Op::Count,
-                        (false, b"delete") => Op::Delete,
-                        (false, b"backup") => Op::Backup,
-                        _ => return Err("unknown op".into()),
-                    });
+                    let found = Op::NAMES.iter().find(|(_, n)| v.is(n.as_bytes()));
+                    op = Some(found.ok_or("unknown op")?.0);
                 }
                 b"filters" => s.array(|s| -> Result<(), Bad> {
                     r.filters.push(Filter::parse(s)?);
@@ -176,7 +207,17 @@ impl Request {
                 b"age" => r.age = Some(s.u64()?),
                 b"all" => r.all = boolean(s)?,
                 b"dry_run" => r.dry_run = boolean(s)?,
-                b"dest" => r.dest = Some(unescape(s.string()?)),
+                b"dest" => r.dest = Some(s.string()?.to_text()),
+                b"hide_wraps" => r.hide_wraps = boolean(s)?,
+                b"events" => s.array(|s| -> Result<(), Bad> {
+                    s.ws();
+                    if s.peek() != Some(b'{') {
+                        return Err("events must be JSON objects".into());
+                    }
+                    // A slice of a &str between JSON delimiters is UTF-8.
+                    r.events.push(String::from_utf8_lossy(s.raw_value()?).into_owned());
+                    Ok(())
+                })?,
                 _ => return Err("unknown key".into()),
             }
             Ok(())
@@ -202,11 +243,20 @@ impl Admin {
     }
 }
 
-/// Starts listening on `<data>/admin.sock`. Events are killed through `ctl`.
-pub fn start(data: &Path, store: Store, ctl: Sender<Control>) -> io::Result<Admin> {
+/// What a request may use: the store to read, the writer to change it through,
+/// and the policy events handed in must pass.
+#[derive(Clone)]
+pub struct Ctx {
+    pub store: Store,
+    pub ctl: Sender<Control>,
+    pub policy: Arc<SessionCfg>,
+}
+
+/// Starts listening on `<data>/admin.sock`.
+pub fn start(data: &Path, cx: Ctx) -> io::Result<Admin> {
     let path = socket_path(data);
     let listener = bind(&path)?;
-    std::thread::Builder::new().name("admin".into()).spawn(move || accept_loop(listener, store, ctl))?;
+    std::thread::Builder::new().name("admin".into()).spawn(move || accept_loop(listener, cx))?;
     Ok(Admin { path })
 }
 
@@ -271,7 +321,7 @@ impl Drop for Slot {
     }
 }
 
-fn accept_loop(listener: UnixListener, store: Store, ctl: Sender<Control>) {
+fn accept_loop(listener: UnixListener, cx: Ctx) {
     let open = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let Ok(stream) = conn else {
@@ -285,11 +335,11 @@ fn accept_loop(listener: UnixListener, store: Store, ctl: Sender<Control>) {
             continue;
         }
         let slot = Slot(open.clone());
-        let (store, ctl) = (store.clone(), ctl.clone());
+        let cx = cx.clone();
         // If no thread can be had the closure, and the slot with it, is dropped.
         let _ = std::thread::Builder::new().name("admin-conn".into()).spawn(move || {
             let _slot = slot;
-            serve(&stream, &store, &ctl);
+            serve(&stream, &cx);
         });
     }
 }
@@ -301,7 +351,7 @@ fn refuse(out: &mut impl Write, why: &str) {
     let _ = out.write_all(&line);
 }
 
-fn serve(stream: &UnixStream, store: &Store, ctl: &Sender<Control>) {
+fn serve(stream: &UnixStream, cx: &Ctx) {
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let mut line = String::new();
@@ -310,7 +360,7 @@ fn serve(stream: &UnixStream, store: &Store, ctl: &Sender<Control>) {
     let result = match read {
         Ok(0) => Err("no request".to_string()),
         Ok(n) if n as u64 >= MAX_REQUEST && !line.ends_with('\n') => Err("request too large".to_string()),
-        Ok(_) => handle(&line, &mut out, store, ctl),
+        Ok(_) => handle(&line, &mut out, cx),
         Err(e) => Err(format!("cannot read the request: {e}")),
     };
     if let Err(why) = result {
@@ -319,14 +369,34 @@ fn serve(stream: &UnixStream, store: &Store, ctl: &Sender<Control>) {
     let _ = out.flush();
 }
 
-fn handle(line: &str, out: &mut impl Write, store: &Store, ctl: &Sender<Control>) -> Result<(), String> {
+fn handle(line: &str, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
+    let (store, ctl) = (&cx.store, &cx.ctl);
     let req = Request::parse(line)?;
     if req.op == Op::Backup {
         return backup(&req, out, ctl);
     }
+    if req.op == Op::Ingest {
+        return ingest(&req, out, cx);
+    }
     operator::check_filters(&req.filters)?;
     let now = ingest::now();
     match req.op {
+        Op::Items => {
+            let [f] = &req.filters[..] else { return Err("items takes exactly one filter".into()) };
+            let cap = req.limit.map_or(usize::MAX, |l| l as usize);
+            let items = crate::sync::local::items_of(&store.snapshot(), f, req.hide_wraps, cap, now);
+            for chunk in items.chunks(ITEMS_PER_LINE) {
+                let mut b = b"{\"items\":\"".to_vec();
+                for (ca, id) in chunk {
+                    hex::encode_into(&ca.to_be_bytes(), &mut b);
+                    hex::encode_into(id, &mut b);
+                }
+                b.extend_from_slice(b"\"}\n");
+                out.write_all(&b).map_err(|e| e.to_string())?;
+            }
+            writeln!(out, "{{\"done\":true,\"count\":{}}}", items.len()).map_err(|e| e.to_string())
+        }
+        Op::Ingest => unreachable!("handled above"),
         Op::Query => {
             let v = store.snapshot();
             let mut buf = Vec::new();
@@ -392,6 +462,63 @@ impl Drop for Held {
             let (reply, _) = mpsc::channel();
             let _ = ctl.send(Control::EndBackup { reply });
         }
+    }
+}
+
+/// Threads one ingest request may use to check signatures: it runs beside the
+/// relay's own work, so it takes no more than half the machine.
+fn ingest_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 4)
+}
+
+/// Checks each event as a client's EVENT is checked, then stores what passed
+/// through the writer, which relays it live and answers once it is durable.
+fn ingest(req: &Request, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
+    if !req.filters.is_empty() {
+        return Err("ingest takes events, not filters".into());
+    }
+    let texts: Vec<(&str, usize)> = req.events.iter().map(|e| (e.as_str(), 0)).collect();
+    let v = cx.store.snapshot();
+    let checked = inbound::check_all(&texts, &cx.policy, &v, ingest::now(), ingest_threads());
+    // Not held while the writer works: a snapshot pins what it may reclaim.
+    drop(v);
+    let mut verdicts: Vec<Option<Verdict>> = Vec::with_capacity(checked.len());
+    let mut recs = Vec::new();
+    for c in checked {
+        match c {
+            Ok(rec) => {
+                recs.push(rec);
+                verdicts.push(None);
+            }
+            Err(v) => verdicts.push(Some(v)),
+        }
+    }
+    let mut outcomes = if recs.is_empty() { Vec::new() } else { store_through_writer(&cx.ctl, recs)? }.into_iter();
+    let mut b = b"{\"verdicts\":[".to_vec();
+    for (i, v) in verdicts.into_iter().enumerate() {
+        if i > 0 {
+            b.push(b',');
+        }
+        let v = v.unwrap_or_else(|| outcomes.next().unwrap_or(Verdict::Failed));
+        b.push(b'"');
+        json::escape_str(&v.code(), &mut b);
+        b.push(b'"');
+    }
+    b.extend_from_slice(b"]}\n");
+    out.write_all(&b).map_err(|e| e.to_string())
+}
+
+/// Hands checked records to the writer and waits until they are durable.
+fn store_through_writer(ctl: &Sender<Control>, recs: Vec<Vec<u8>>) -> Result<Vec<Verdict>, String> {
+    let n = recs.len();
+    let (reply, answer) = mpsc::channel();
+    let reply: ingest::IngestReply = Box::new(move |o| {
+        let _ = reply.send(o);
+    });
+    ctl.send(Control::Ingest { recs, reply }).map_err(|_| STOPPING.to_string())?;
+    match answer.recv().map_err(|_| STOPPING.to_string())? {
+        Some(outcomes) => Ok(outcomes.into_iter().map(|o| Verdict::of(Some(o))).collect()),
+        None => Ok(vec![Verdict::Failed; n]),
     }
 }
 
@@ -509,6 +636,8 @@ enum Reply<'a> {
     Count(u64),
     Deleted(Deleted),
     BackedUp(u64, Copied),
+    Items(Vec<(u64, [u8; 32])>),
+    Verdicts(Vec<Verdict>),
 }
 
 impl Client {
@@ -574,6 +703,29 @@ impl Client {
             }
         }
     }
+
+    /// A filter's `(created_at, id)` set, newest first.
+    pub fn items(self, req: &Request) -> io::Result<Vec<(u64, [u8; 32])>> {
+        let mut r = self.ask(req)?;
+        let mut line = String::new();
+        let mut items = Vec::new();
+        loop {
+            match next_reply(&mut r, &mut line)? {
+                Reply::Items(mut more) => items.append(&mut more),
+                Reply::Done(n) if n == items.len() as u64 => return Ok(items),
+                _ => return Err(io::Error::other("the relay's reply was not what was asked for")),
+            }
+        }
+    }
+
+    /// What became of each event, in order.
+    pub fn ingest(self, req: &Request) -> io::Result<Vec<Verdict>> {
+        let mut r = self.ask(req)?;
+        match next_reply(&mut r, &mut String::new())? {
+            Reply::Verdicts(v) if v.len() == req.events.len() => Ok(v),
+            _ => Err(io::Error::other("the relay's reply was not what was asked for")),
+        }
+    }
 }
 
 /// The next reply line. The relay's own `{"error":..}` becomes the error.
@@ -594,9 +746,26 @@ fn parse_reply(line: &str) -> Result<Result<Reply<'_>, String>, String> {
     let (mut count, mut matched, mut deleted) = (None, None, None);
     let (mut backed_up, mut events, mut files, mut bytes, mut written) = (false, None, None, None, None);
     let mut sample = Vec::new();
+    let (mut items, mut verdicts) = (None, None);
     let mut s = Scanner::new(line);
     s.object(|s, key| -> Result<(), Bad> {
         match key.bytes {
+            b"items" => {
+                let h = s.string()?;
+                let mut raw = vec![0u8; h.bytes.len() / 2];
+                if h.escaped || h.bytes.len() % 80 != 0 || !hex::decode_into(h.bytes, &mut raw) {
+                    return Err("bad items in a reply".into());
+                }
+                items = Some(raw.chunks(40).map(|c| (u64::from_be_bytes(c[..8].try_into().unwrap()), c[8..].try_into().unwrap())).collect());
+            }
+            b"verdicts" => {
+                let mut v = Vec::new();
+                s.array(|s| -> Result<(), Bad> {
+                    v.push(Verdict::parse(&s.string()?.to_text()).ok_or("bad verdict in a reply")?);
+                    Ok(())
+                })?;
+                verdicts = Some(v);
+            }
             b"error" => error = Some(s.string()?.to_text()),
             b"done" => {
                 s.skip()?;
@@ -627,6 +796,10 @@ fn parse_reply(line: &str) -> Result<Result<Reply<'_>, String>, String> {
     .map_err(|b| format!("unreadable reply from the relay: {}", b.0))?;
     Ok(if let Some(msg) = error {
         Err(msg)
+    } else if let Some(items) = items {
+        Ok(Reply::Items(items))
+    } else if let Some(v) = verdicts {
+        Ok(Reply::Verdicts(v))
     } else if done {
         Ok(Reply::Done(count.unwrap_or(0)))
     } else if let Some(n) = progress {
@@ -677,8 +850,13 @@ mod tests {
             Request { limit: Some(7), ..Request::new(Op::Query, fs.clone()) },
             Request::new(Op::Count, fs.clone()),
             Request { age: Some(86_400), all: true, dry_run: true, ..Request::new(Op::Delete, fs.clone()) },
-            Request { age: Some(0), ..Request::new(Op::Delete, fs) },
+            Request { age: Some(0), ..Request::new(Op::Delete, fs.clone()) },
             Request { dest: Some("/srv/backups/a \"quoted\" \\ name\ttab".into()), ..Request::new(Op::Backup, Vec::new()) },
+            Request { limit: Some(500_000), hide_wraps: true, ..Request::new(Op::Items, fs[..1].to_vec()) },
+            Request {
+                events: vec![format!(r#"{{"id":"{h}","content":"a \"quoted\" line\nand more"}}"#), "{}".into()],
+                ..Request::new(Op::Ingest, Vec::new())
+            },
         ] {
             let line = req.to_line();
             assert!(!line.contains('\n'), "one line: {line}");
@@ -718,6 +896,16 @@ mod tests {
         let Ok(Ok(Reply::Deleted(d))) = parse_reply(&line) else { panic!("not a delete reply") };
         assert_eq!((d.matched, d.deleted, d.sample.len()), (5, 0, 1));
         assert_eq!((d.sample[0].kind, d.sample[0].created_at, d.sample[0].id), (14, 77, [0xcd; 32]));
+        // A set, as 40-byte (created_at, id) items in hex.
+        let items = format!(r#"{{"items":"{}{}{}{}"}}"#, hex::encode_string(&7u64.to_be_bytes()), "ab".repeat(32), hex::encode_string(&9u64.to_be_bytes()), "cd".repeat(32));
+        let Ok(Ok(Reply::Items(got))) = parse_reply(&items) else { panic!("not items") };
+        assert_eq!(got, [(7, [0xab; 32]), (9, [0xcd; 32])]);
+        assert!(parse_reply(r#"{"items":"abcd"}"#).is_err(), "items come whole");
+        let Ok(Ok(Reply::Verdicts(v))) = parse_reply(r#"{"verdicts":["stored","refused blocked: kind 1 is not accepted by this relay","vanished"]}"#) else {
+            panic!("not verdicts")
+        };
+        assert_eq!(v, [Verdict::Stored, Verdict::Refused("blocked: kind 1 is not accepted by this relay".into()), Verdict::Vanished]);
+        assert!(parse_reply(r#"{"verdicts":["sideways"]}"#).is_err());
         // And what a relay says when it fails survives its escaping.
         let mut e = b"{\"error\":\"".to_vec();
         json::escape_str("a \"b\" \\ c\nd", &mut e);

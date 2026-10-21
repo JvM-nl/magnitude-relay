@@ -50,3 +50,9 @@ debug = 1
 # interop tests over a million items run in seconds rather than half a minute.
 [profile.dev.package.negentropy]
 opt-level = 3
+
+# libsecp256k1 (C) optimised in debug builds too: tests sign and verify
+# hundreds of thousands of events, ten times slower unoptimised. Our own code
+# stays at the debug level.
+[profile.dev.package.secp256k1-sys]
+opt-level = 3
