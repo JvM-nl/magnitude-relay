@@ -339,16 +339,37 @@ impl<'a> BlockRef<'a> {
         lo.saturating_sub(1)
     }
 
-    /// Position within the block of the first key `>= k`, leaving the interval
-    /// that holds it (or the last one searched) decoded in `iv` as `iv_at`.
-    fn lower_bound(&self, k: &[u8], iv: &mut Interval) -> (usize, usize) {
+    /// Position within the block of the first key `>= k`: the restart search,
+    /// then at most one interval's keys rebuilt in a stack buffer.
+    fn position(&self, k: &[u8]) -> usize {
         let r = self.restart_le(k);
-        self.decode(r, iv);
+        let mut buf = [0u8; SCAN_KEY_MAX];
+        let mut p = self.restart_off(r);
+        let end = (r * RESTART + RESTART).min(self.count);
+        for i in r * RESTART..end {
+            let shared = varint::get(self.entries, &mut p).expect("block entry") as usize;
+            let rest = varint::get(self.entries, &mut p).expect("block entry") as usize;
+            if shared + rest > SCAN_KEY_MAX {
+                return self.position_slow(k, r);
+            }
+            buf[shared..shared + rest].copy_from_slice(&self.entries[p..p + rest]);
+            p += rest;
+            if &buf[..shared + rest] >= k {
+                return i;
+            }
+        }
+        end
+    }
+
+    #[cold]
+    fn position_slow(&self, k: &[u8], r: usize) -> usize {
+        let mut iv = Interval::default();
+        self.decode(r, &mut iv);
         let mut i = 0;
         while i < iv.len() && iv.key(i) < k {
             i += 1;
         }
-        (r * RESTART + i, r)
+        r * RESTART + i
     }
 }
 
@@ -472,8 +493,7 @@ impl Segment {
             return 0;
         }
         let b = self.block(self.block_for(k));
-        let mut iv = Interval::default();
-        b.before + b.lower_bound(k, &mut iv).0 as u64
+        b.before + b.position(k) as u64
     }
 
     /// A cheap estimate of the keys in `[lo, hi)` from the block index alone (no
