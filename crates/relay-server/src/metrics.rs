@@ -43,6 +43,8 @@ counters! {
     connections_total,
     /// Connections refused at the per-IP limit.
     connections_refused,
+    /// Connections that negotiated permessage-deflate.
+    connections_deflate,
     /// Text messages received.
     messages_in,
     /// EVENT messages received.

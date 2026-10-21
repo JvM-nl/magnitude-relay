@@ -78,7 +78,7 @@ pub const SUPPORTED_NIPS: &[u32] = &[1, 9, 11, 40, 45, 59, 62, 70, 77];
 /// Every section and its keys. The single source for "did you mean" hints and
 /// for the test that keeps the documented default file complete.
 const KEYS: &[(&str, &[&str])] = &[
-    ("relay", &["bind", "threads", "real_ip_header", "urls"]),
+    ("relay", &["bind", "threads", "real_ip_header", "urls", "compression"]),
     (
         "info",
         &["name", "description", "pubkey", "contact", "icon", "banner", "privacy_policy", "terms_of_service", "privacy_addresses"],
@@ -123,6 +123,32 @@ pub struct RelayCfg {
     pub real_ip_header: String,
     /// This relay's public addresses; NIP-62 vanish requests naming one are honoured.
     pub urls: Vec<String>,
+    /// permessage-deflate for clients that offer it.
+    pub compression: Compression,
+}
+
+/// How WebSocket messages are compressed (RFC 7692) for clients that ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    Off,
+    /// Every message on its own, both ways: no codec memory per connection.
+    Stateless,
+    /// History carried across messages: better ratio, up to ~80 KB per connection.
+    Full,
+}
+
+impl RelayCfg {
+    /// What the handshake accepts.
+    pub fn deflate_policy(&self) -> Option<relay_net::ws::DeflatePolicy> {
+        use relay_net::ws::DeflatePolicy;
+        match self.compression {
+            Compression::Off => None,
+            Compression::Stateless => {
+                Some(DeflatePolicy { server_no_context_takeover: true, client_no_context_takeover: true, ..DeflatePolicy::default() })
+            }
+            Compression::Full => Some(DeflatePolicy::default()),
+        }
+    }
 }
 
 /// `[info]`: the NIP-11 document.
@@ -199,7 +225,13 @@ pub struct StoreCfg {
 impl Default for RelayCfg {
     fn default() -> Self {
         // 7777 is strfry's port, so an existing nginx upstream keeps working.
-        RelayCfg { bind: SocketAddr::from(([127, 0, 0, 1], 7777)), threads: 0, real_ip_header: String::new(), urls: Vec::new() }
+        RelayCfg {
+            bind: SocketAddr::from(([127, 0, 0, 1], 7777)),
+            threads: 0,
+            real_ip_header: String::new(),
+            urls: Vec::new(),
+            compression: Compression::Stateless,
+        }
     }
 }
 
@@ -668,6 +700,14 @@ fn apply_relay(c: &mut RelayCfg, e: &Entry) -> Result<bool, String> {
             })?;
         }
         "threads" => c.threads = int(e, 0, 1024)? as usize,
+        "compression" => {
+            c.compression = match string(e)? {
+                "stateless" => Compression::Stateless,
+                "full" => Compression::Full,
+                "off" => Compression::Off,
+                other => return Err(format!("`compression` is \"stateless\", \"full\" or \"off\", not \"{other}\"")),
+            }
+        }
         "real_ip_header" => {
             let s = string(e)?;
             let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
@@ -919,6 +959,13 @@ const TEMPLATE: &str = r##"# {name} settings
 # says ALL_RELAYS: everything they published here is then deleted for good.
 # urls = []
 
+# Compression of messages for apps that ask for it (browsers do). One of:
+#   "stateless"  each message compressed on its own: no extra memory per connection
+#   "full"       compressed with what came before: smaller, but up to about
+#                80 KB of memory for every connection that uses it
+#   "off"        never compress
+# compression = "stateless"
+
 [info]
 # What the relay tells apps about itself (NIP-11).
 # name = "{name}"
@@ -1113,6 +1160,7 @@ mod tests {
 bind = "0.0.0.0:8080"
 threads = 4
 real_ip_header = "X-Forwarded-For"
+compression = "full"
 
 [info]
 name = "My relay"
@@ -1154,7 +1202,16 @@ segment_mb = 64
 "#
         );
         let c = ok(&text);
-        assert_eq!(c.relay, RelayCfg { bind: "0.0.0.0:8080".parse().unwrap(), threads: 4, real_ip_header: "x-forwarded-for".into(), urls: Vec::new() });
+        assert_eq!(
+            c.relay,
+            RelayCfg {
+                bind: "0.0.0.0:8080".parse().unwrap(),
+                threads: 4,
+                real_ip_header: "x-forwarded-for".into(),
+                urls: Vec::new(),
+                compression: Compression::Full,
+            }
+        );
         assert_eq!(c.info.name, "My relay");
         assert_eq!(c.info.pubkey, pk);
         assert_eq!(c.info.banner, "https://example.com/b.png");

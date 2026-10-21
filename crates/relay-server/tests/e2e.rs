@@ -325,3 +325,58 @@ async fn deleted_content_leaves_the_disk_with_idle_reactors() {
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn compressing_clients_get_stateless_deflate() {
+    use relay_net::conn::{client_connect_with, ClientDeflate};
+    use relay_net::ws::Role;
+    let dir = std::env::temp_dir().join(format!("relay-e2e-deflate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start(dir.clone(), port);
+    let host = format!("127.0.0.1:{port}");
+    let me = Signer::new(9);
+
+    // A browser-style offer (context takeover both ways): the relay answers
+    // stateless, so it keeps no codec memory for this connection.
+    let mut c = client_connect_with(relay.addr, &host, "/", Some(ClientDeflate::default())).await.unwrap();
+    let p = *c.deflate_params().expect("deflate negotiated");
+    assert!(!p.send(Role::Server).context_takeover && !p.send(Role::Client).context_takeover);
+
+    // Big enough to be compressed both ways; repetitive enough to show it.
+    let content = "vector settings ".repeat(400);
+    let ev = me.event(now(), 30078, json!([["d", "vector/settings"]]), &content);
+    send(&mut c, json!(["EVENT", ev])).await;
+    assert!(ok_of(&mut c).await.0);
+    send(&mut c, json!(["REQ", "s", {"kinds": [30078], "authors": [me.pk()]}])).await;
+    let (evs, end) = collect(&mut c, "s").await;
+    assert_eq!(end[0], "EOSE");
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0]["content"], content);
+    assert_eq!(evs[0]["id"], ev["id"]);
+
+    // A client that offers nothing still gets plain frames.
+    let mut plain = client_connect(relay.addr, &host, "/").await.unwrap();
+    assert!(plain.deflate_params().is_none());
+    send(&mut plain, json!(["REQ", "s", {"kinds": [30078], "authors": [me.pk()]}])).await;
+    let (evs, _) = collect(&mut plain, "s").await;
+    assert_eq!(evs[0]["content"], content);
+
+    // Counted.
+    let mut s = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    s.write_all(format!("GET /stats HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).await.unwrap();
+    let stats: Value = serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert_eq!(stats["connections_deflate"].as_u64(), Some(1), "{stats}");
+    // The plain client got the 6.4 KB event as is; the compressing one a few
+    // hundred bytes for it.
+    let out = stats["bytes_out"].as_u64().unwrap();
+    eprintln!("bytes out: {out}");
+    assert!(out < 9_000, "the event went out uncompressed to both: {out} bytes");
+
+    drop((c, plain));
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}

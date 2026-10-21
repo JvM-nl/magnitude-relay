@@ -11,9 +11,9 @@ use crate::ingest::{ReactorMsg, WriteReq};
 use crate::metrics::{self, Metrics};
 use crate::session::{self, Ctx, Outbox, Session, SessionCfg};
 use crate::subs::{ConnId, FxMap, SubIndex};
-use relay_net::conn::{server_handshake, Handshake, OwnedRequest};
-use relay_net::http::write_response;
-use relay_net::ws::{self, Decoder, Event};
+use relay_net::conn::{server_handshake_with, Handshake, OwnedRequest};
+use relay_net::http::{write_response, ExtensionPolicy};
+use relay_net::ws::{self, Compressor, DeflateParams, Decoder, Event, Role};
 use relay_proto::{EventParser, Record};
 use relay_store::{Store, Version};
 use std::cell::{Cell, RefCell};
@@ -129,6 +129,18 @@ struct ConnOut {
     notify: Notify,
     /// Set when the client fell too far behind; its task closes it.
     overflow: Cell<bool>,
+    /// permessage-deflate, when the client asked for it.
+    deflate: RefCell<Option<Compressor>>,
+}
+
+impl ConnOut {
+    /// Appends messages to this connection's output, compressed if it negotiated that.
+    #[inline]
+    fn write(&self, f: impl FnOnce(&mut WsOut<'_>)) {
+        let mut buf = self.buf.borrow_mut();
+        let mut z = self.deflate.borrow_mut();
+        f(&mut WsOut { buf: &mut buf, z: z.as_mut() });
+    }
 }
 
 struct Reactor {
@@ -144,17 +156,37 @@ struct Reactor {
     pending: std::collections::VecDeque<Arc<crate::ingest::LiveBatch>>,
 }
 
-/// Frames each reply as a WebSocket text message, built in place.
+/// Frames each reply as a WebSocket text message: built in place, or, for a
+/// connection that negotiated compression, built aside and compressed in.
 struct WsOut<'a> {
     buf: &'a mut Vec<u8>,
+    z: Option<&'a mut Compressor>,
+}
+
+thread_local! {
+    /// Where a message for a compressing connection is built first (one per reactor).
+    static STAGE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 impl Outbox for WsOut<'_> {
     #[inline]
     fn text(&mut self, f: &mut dyn FnMut(&mut Vec<u8>)) {
-        let mark = ws::begin_text(self.buf);
-        f(self.buf);
-        ws::finish_text(self.buf, mark);
+        match self.z.as_deref_mut() {
+            None => {
+                let mark = ws::begin_text(self.buf);
+                f(self.buf);
+                ws::finish_text(self.buf, mark);
+            }
+            Some(z) => STAGE.with(|stage| {
+                let mut stage = stage.borrow_mut();
+                stage.clear();
+                f(&mut stage);
+                z.compress_text(self.buf, &stage);
+                if stage.capacity() > 1 << 20 {
+                    *stage = Vec::new();
+                }
+            }),
+        }
     }
 }
 
@@ -293,7 +325,7 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                         _ => metrics::inc(&m.events_refused),
                     }
                     if let Some(o) = r.conns.get(&reply.conn) {
-                        session::ok_reply(&mut WsOut { buf: &mut o.buf.borrow_mut() }, reply);
+                        o.write(|w| session::ok_reply(w, reply));
                         o.notify.notify_one();
                     }
                 }
@@ -312,16 +344,14 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
             Record(rec).write_json(&mut json);
             for (conn, sub) in &targets {
                 let Some(o) = r.conns.get(conn) else { continue };
-                let mut b = o.buf.borrow_mut();
-                if b.len() > limit {
+                if o.buf.borrow().len() > limit {
                     o.overflow.set(true);
                 } else {
-                    session::event_msg_json(&mut WsOut { buf: &mut b }, sub, &json);
+                    o.write(|w| session::event_msg_json(w, sub, &json));
                     let m = shared.metrics.of(r.idx);
                     metrics::inc(&m.events_out);
                     metrics::inc(&m.events_live);
                 }
-                drop(b);
                 o.notify.notify_one();
             }
         }
@@ -341,9 +371,13 @@ fn client_ip(req: &OwnedRequest, peer: SocketAddr, header: &str) -> IpAddr {
 
 async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
     let mut buf = Vec::with_capacity(4096);
-    let req = match tokio::time::timeout(HANDSHAKE_TIMEOUT, server_handshake(&mut s, &mut buf, MAX_HEAD)).await {
-        Ok(Ok(Handshake::Upgraded(req))) => req,
-        Ok(Ok(Handshake::PlainHttp(req))) => {
+    let policy = match shared.cfg.relay.deflate_policy() {
+        Some(p) => ExtensionPolicy::with_deflate(p),
+        None => ExtensionPolicy::NONE,
+    };
+    let (req, deflate) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, server_handshake_with(&mut s, &mut buf, MAX_HEAD, &policy)).await {
+        Ok(Ok((Handshake::Upgraded(req), ext))) => (req, ext.deflate),
+        Ok(Ok((Handshake::PlainHttp(req), _))) => {
             let _ = plain_http(&mut s, &req, &shared).await;
             return;
         }
@@ -361,10 +395,14 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
     shared.metrics.open.fetch_add(1, Ordering::Relaxed);
     metrics::inc(&shared.metrics.of(idx).connections_total);
     let conn = shared.next_conn.fetch_add(1, Ordering::Relaxed);
-    let out = Rc::new(ConnOut { buf: RefCell::new(Vec::new()), notify: Notify::new(), overflow: Cell::new(false) });
+    let z = deflate.map(|p| Compressor::for_role(&p, Role::Server, Compressor::DEFAULT_MIN_LEN));
+    if z.is_some() {
+        metrics::inc(&shared.metrics.of(idx).connections_deflate);
+    }
+    let out = Rc::new(ConnOut { buf: RefCell::new(Vec::new()), notify: Notify::new(), overflow: Cell::new(false), deflate: RefCell::new(z) });
     st.borrow_mut().conns.insert(conn, out.clone());
 
-    let _ = serve(&mut s, &mut buf, conn, ip, &out, &st, &shared).await;
+    let _ = serve(&mut s, &mut buf, conn, ip, deflate, &out, &st, &shared).await;
 
     {
         let mut r = st.borrow_mut();
@@ -433,10 +471,10 @@ fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &Conn
                     m,
                     pending: &r.pending,
                 };
-                session.on_text(t, &mut cx, &mut WsOut { buf: &mut out.buf.borrow_mut() });
+                out.write(|w| session.on_text(t, &mut cx, w));
             }
             Some(Event::Binary(_)) => {
-                session::notice(&mut WsOut { buf: &mut out.buf.borrow_mut() }, "error: binary messages are not supported");
+                out.write(|w| session::notice(w, "error: binary messages are not supported"));
             }
             Some(Event::Ping(p)) => ws::write_pong(&mut out.buf.borrow_mut(), p),
             Some(Event::Pong(_)) => {}
@@ -457,17 +495,22 @@ fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &Conn
 /// buffer and are decoded in place; the connection keeps bytes of its own only
 /// while a frame is split across reads, and frees them as soon as it is whole,
 /// so an idle connection costs almost nothing.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     s: &mut TcpStream,
     buf: &mut Vec<u8>,
     conn: ConnId,
     ip: IpAddr,
+    deflate: Option<DeflateParams>,
     out: &Rc<ConnOut>,
     st: &Rc<RefCell<Reactor>>,
     shared: &Arc<Shared>,
 ) -> io::Result<()> {
     let max = shared.cfg.limits.max_message_bytes;
     let mut dec = Decoder::server(max, max);
+    if let Some(p) = &deflate {
+        dec = dec.with_deflate(p);
+    }
     let mut session = Session::new(conn);
     let mut wbuf = Vec::new();
     let mut last_rx = Instant::now();
