@@ -151,7 +151,19 @@ const FORMAT: u32 = 3;
 fn check_meta(dir: &Path, opts: &Options) -> io::Result<()> {
     let path = dir.join("meta");
     let want = format!("format {FORMAT}\nsegment_size {}\n", opts.segment_size);
+    // Replaced whole or not at all: a crash while creating the store must not
+    // leave a file that refuses every later start.
+    let create = || -> io::Result<()> {
+        let tmp = dir.join("meta.tmp");
+        std::fs::write(&tmp, &want)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        bg::sync_dir(dir)
+    };
     match std::fs::read_to_string(&path) {
+        // Empty: written by an earlier version that crashed while creating the
+        // store. It is written before anything else, so the store is still new.
+        Ok(have) if have.is_empty() => create(),
         Ok(have) => {
             let get = |k: &str| have.lines().find_map(|l| l.strip_prefix(k)?.trim().parse::<u64>().ok());
             if get("format ") != Some(u64::from(FORMAT)) {
@@ -166,7 +178,7 @@ fn check_meta(dir: &Path, opts: &Options) -> io::Result<()> {
             }
             Ok(())
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::write(&path, want),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => create(),
         Err(e) => Err(e),
     }
 }

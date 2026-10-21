@@ -713,6 +713,23 @@ fn segment_size_cannot_change() {
     assert!(Store::open(&dir, opts()).is_ok());
 }
 
+/// Found by the crash torture: a kill while the very first open wrote `meta`
+/// left it empty, and every later start refused the folder as an
+/// "unsupported data format". The file is now written atomically, and an
+/// empty one (from an older version) means the store was never created.
+#[test]
+fn a_crash_while_creating_the_store_does_not_brick_it() {
+    let dir = tmpdir("meta-empty");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("meta"), "").unwrap();
+    let (store, mut w) = Store::open(&dir, opts()).expect("an empty meta file is a store not yet created");
+    write(&mut w, &[ev(1, 1, 100, 14, "[]", "x")]);
+    drop((store, w));
+    assert!(std::fs::read_to_string(dir.join("meta")).unwrap().contains("format"));
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(ids(&store, "{}", 10), vec![id_of(1)]);
+}
+
 #[test]
 fn restart_uses_checkpoint_and_compacts() {
     let dir = tmpdir("ckpt");
