@@ -25,6 +25,9 @@ use std::sync::Arc;
 pub struct Inbound {
     pub text: String,
     pub at: usize,
+    /// From a trusted peer that took it from a client itself: its signature
+    /// is taken as checked.
+    pub vouched: bool,
 }
 
 impl Inbound {
@@ -129,7 +132,7 @@ impl Refused {
 /// Checks `batch` and returns the verdicts so far (`None` where an event
 /// passed) and the records to store, in order.
 fn check_batch(batch: &[Inbound], policy: &SessionCfg, v: &Version, threads: usize) -> (Vec<Option<Verdict>>, Vec<Vec<u8>>) {
-    let texts: Vec<(&str, usize)> = batch.iter().map(|e| (e.text.as_str(), e.at)).collect();
+    let texts: Vec<(&str, usize, bool)> = batch.iter().map(|e| (e.text.as_str(), e.at, e.vouched)).collect();
     let mut verdicts = Vec::with_capacity(batch.len());
     let mut recs = Vec::new();
     for c in inbound::check_all(&texts, policy, v, ingest::now(), threads) {
@@ -224,7 +227,11 @@ impl Local for ViaSocket {
     }
 
     async fn ingest(&mut self, batch: &[Inbound]) -> Result<Vec<Verdict>, String> {
-        let req = Request { events: batch.iter().map(|e| e.object().to_string()).collect(), ..Request::new(Op::Ingest, Vec::new()) };
+        let req = Request {
+            events: batch.iter().map(|e| e.object().to_string()).collect(),
+            trusted: (0..batch.len() as u64).filter(|&i| batch[i as usize].vouched).collect(),
+            ..Request::new(Op::Ingest, Vec::new())
+        };
         self.client()?.ingest(&req).map_err(|e| e.to_string())
     }
 }

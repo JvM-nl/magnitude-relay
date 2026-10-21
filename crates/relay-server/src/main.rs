@@ -54,14 +54,16 @@ commands:
       --age SECS       only events created more than SECS seconds ago
       --all            allow a filter with no conditions, which matches every
                        event ({})
-  sync <url> [--filter JSON] [--dir down|up|both] [--dry-run]
+  sync <url> [--filter JSON] [--dir down|up|both] [--dry-run] [--trusted]
                        compare this relay's events with another relay's (ws://
                        or wss://, NIP-77) and copy what one side lacks: down
                        (theirs to here, the default), up (ours to there) or
                        both. Events copied here are checked like any app's:
                        signatures, accepted kinds, deletions. --filter
                        defaults to {} (everything); --dry-run only counts what
-                       differs. For a lasting sync, see [[sync]] in the
+                       differs. --trusted: the other relay is one of yours
+                       that lists this one as a [[peer]] (see `trusted` under
+                       [[sync]]). For a lasting sync, see [[sync]] in the
                        settings file
 
   --filter takes one NIP-01 filter or a JSON array of them (their union); a
@@ -266,12 +268,13 @@ fn run() -> Result<(), String> {
                 None => config::Direction::Down,
             };
             let dry_run = flag(&mut args, "--dry-run");
+            let trusted = flag(&mut args, "--trusted");
             if args.is_empty() {
                 return Err("sync needs the other relay's URL, like wss://relay.example.com".into());
             }
             let url = args.remove(0);
             no_more(&args)?;
-            sync::run_command(&load()?, &url, fs, dir, dry_run)
+            sync::run_command(&load()?, &url, fs, dir, dry_run, trusted)
         }
         "help" | "--help" | "-h" => {
             print!("{} {}\n\n{}", brand::NAME, brand::VERSION, USAGE.replace("{bin}", brand::SLUG));

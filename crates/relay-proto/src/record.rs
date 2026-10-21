@@ -35,6 +35,15 @@ pub const FLAG_PROTECTED: u8 = 1 << 1;
 /// Strings are stored exactly as received because the canonical form did not
 /// hash to the id (an event signed by a serialiser with other escaping rules).
 pub const FLAG_RAW_FORM: u8 = 1 << 2;
+/// This relay took the event from a client and checked its signature itself
+/// (not from another relay, an import or a backup's source). Trusted peers
+/// may skip the check for these (see PLAN.md, trusted peers).
+pub const FLAG_FIRST_HAND: u8 = 1 << 3;
+
+/// Marks a record [`FLAG_FIRST_HAND`].
+pub fn mark_first_hand(rec: &mut [u8]) {
+    rec[OFF_FLAGS] |= FLAG_FIRST_HAND;
+}
 
 pub const FIELD_HEX32: u64 = 1;
 
@@ -79,6 +88,11 @@ impl<'a> Record<'a> {
     pub fn expiration(&self) -> Option<u64> {
         (self.flags() & FLAG_EXPIRATION != 0)
             .then(|| u64::from_le_bytes(self.0[HEADER_LEN..HEADER_LEN + 8].try_into().unwrap()))
+    }
+
+    #[inline]
+    pub fn is_first_hand(&self) -> bool {
+        self.flags() & FLAG_FIRST_HAND != 0
     }
 
     #[inline]

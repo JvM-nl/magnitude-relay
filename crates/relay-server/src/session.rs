@@ -112,11 +112,14 @@ pub struct Session {
     /// Events queued to the writer and not yet answered.
     pub pending: usize,
     neg: Vec<(Box<str>, VecStorage)>,
+    /// One of our own relays (a `[[peer]]`): gift wraps are listed to it like
+    /// any other event, and events this relay took from clients are marked so.
+    trusted: bool,
 }
 
 impl Session {
-    pub fn new(conn: ConnId) -> Session {
-        Session { conn, pending: 0, neg: Vec::new() }
+    pub fn new(conn: ConnId, trusted: bool) -> Session {
+        Session { conn, pending: 0, neg: Vec::new(), trusted }
     }
 
     pub fn on_text(&mut self, text: &str, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
@@ -168,6 +171,11 @@ impl Session {
             metrics::inc(&cx.m.events_refused);
             return ok(out, &id, false, "invalid: bad signature");
         }
+        // Taken from a client and checked here. What a peer sends was taken by
+        // some other relay first, so it is not.
+        if !self.trusted {
+            relay_proto::record::mark_first_hand(cx.rec);
+        }
         if kind::is_ephemeral(info.kind) {
             metrics::inc(&cx.m.events_ephemeral);
             (cx.broadcast)(ReactorMsg::Ephemeral(Arc::from(cx.rec.as_slice())));
@@ -199,7 +207,7 @@ impl Session {
             // recipient (#p) or id, never listed wholesale.
             let addressed = f.ids.is_some() || f.authors.is_some() || f.tags.iter().any(|t| t.name == b'p');
             let wants_wraps = f.kinds.as_ref().is_some_and(|k| k.contains(&kind::GIFT_WRAP));
-            if wants_wraps && !addressed {
+            if wants_wraps && !addressed && !self.trusted {
                 return Err(String::from("restricted: gift wraps are requested by author, recipient or id"));
             }
         }
@@ -220,7 +228,7 @@ impl Session {
         let snap = cx.snap.clone();
         // Live from the snapshot the stored results come from: nothing is missed
         // and nothing is sent twice.
-        cx.subs.add(self.conn, sub_id, filters.clone(), snap.gen);
+        cx.subs.add_with(self.conn, sub_id, filters.clone(), snap.gen, self.trusted);
 
         let mut hits = Vec::new();
         for f in &filters {
@@ -235,7 +243,7 @@ impl Session {
         }
         // A gift wrap only broad filters matched is left out; with no broad
         // filter (Vector's are never broad) every hit came from one that is not.
-        let any_broad = filters.iter().any(broad);
+        let any_broad = !self.trusted && filters.iter().any(broad);
         for (i, h) in hits.iter().enumerate() {
             // A later event's bytes load while this one is written out.
             if let Some(next) = hits.get(i + 3) {
@@ -245,7 +253,7 @@ impl Session {
                 if any_broad && hides_wrap(&filters, rec) {
                     continue;
                 }
-                event_msg(out, sub_id, rec);
+                event_msg(out, sub_id, rec, self.trusted);
                 metrics::inc(&cx.m.events_out);
             }
         }
@@ -256,8 +264,8 @@ impl Session {
         for batch in cx.pending.iter().filter(|b| b.gen > snap.gen) {
             for rec in &batch.events {
                 let rec = Record(rec);
-                if filters.iter().any(|f| f.matches(rec)) && !hides_wrap(&filters, rec) {
-                    event_msg(out, sub_id, rec);
+                if filters.iter().any(|f| f.matches(rec)) && !(any_broad && hides_wrap(&filters, rec)) {
+                    event_msg(out, sub_id, rec, self.trusted);
                     metrics::inc(&cx.m.events_live);
                 }
             }
@@ -285,7 +293,7 @@ impl Session {
             Some(items) => items,
             None => {
                 let hits = cx.snap.query(&f, MAX_NEG_ITEMS + 1, cx.now);
-                hits.iter().filter(|h| !broad_wrap(&f, cx.snap, h.seq)).map(|h| (h.created_at, h.id)).collect()
+                hits.iter().filter(|h| self.trusted || !broad_wrap(&f, cx.snap, h.seq)).map(|h| (h.created_at, h.id)).collect()
             }
         };
         if items.len() > MAX_NEG_ITEMS {
@@ -358,26 +366,39 @@ pub fn hides_wrap(filters: &[Filter], rec: Record<'_>) -> bool {
     rec.kind() == kind::GIFT_WRAP && !filters.iter().any(|f| !broad(f) && f.matches(rec))
 }
 
-pub fn event_msg(out: &mut dyn Outbox, sub_id: &str, rec: Record<'_>) {
+/// `["EVENT","sub",{...}]`. To a trusted peer, an event this relay took from
+/// a client itself ends `,"first-hand"]`: the peer need not check its signature.
+pub fn event_msg(out: &mut dyn Outbox, sub_id: &str, rec: Record<'_>, to_peer: bool) {
+    let mark = to_peer && rec.is_first_hand();
     out.text(&mut |b| {
         b.extend_from_slice(b"[\"EVENT\",\"");
         b.extend_from_slice(sub_id.as_bytes());
         b.extend_from_slice(b"\",");
         rec.write_json(b);
-        b.push(b']');
+        end_event(b, mark);
     });
 }
 
-/// `["EVENT","sub",` + pre-encoded event JSON + `]`, for fan-out where the JSON
-/// is built once and shared by every subscriber.
-pub fn event_msg_json(out: &mut dyn Outbox, sub_id: &str, json: &[u8]) {
+/// [`event_msg`] with the event's JSON already encoded, for fan-out where it is
+/// built once and shared by every subscriber.
+pub fn event_msg_json(out: &mut dyn Outbox, sub_id: &str, json: &[u8], first_hand: bool) {
     out.text(&mut |b| {
         b.extend_from_slice(b"[\"EVENT\",\"");
         b.extend_from_slice(sub_id.as_bytes());
         b.extend_from_slice(b"\",");
         b.extend_from_slice(json);
-        b.push(b']');
+        end_event(b, first_hand);
     });
+}
+
+#[inline]
+fn end_event(b: &mut Vec<u8>, first_hand: bool) {
+    if first_hand {
+        b.extend_from_slice(b",\"");
+        b.extend_from_slice(relay_proto::message::FIRST_HAND);
+        b.push(b'"');
+    }
+    b.push(b']');
 }
 
 pub fn eose(out: &mut dyn Outbox, sub_id: &str) {

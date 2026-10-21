@@ -88,8 +88,11 @@ impl Verdict {
 /// Parses and checks the event object at byte `at` of `text`, leaving its
 /// record in `rec` when it is to be stored. Policy first and the duplicate
 /// check before any hashing, as for a client: a refusal or an event already
-/// here costs no signature check.
-pub fn check(text: &str, at: usize, cfg: &SessionCfg, v: &Version, now: u64, parser: &mut EventParser, rec: &mut Vec<u8>) -> Result<(), Verdict> {
+/// here costs no signature check. With `vouched`, a trusted peer took the
+/// event from a client and checked its signature: that alone is not redone
+/// (its id still is, and every rule still applies).
+#[allow(clippy::too_many_arguments)]
+pub fn check(text: &str, at: usize, vouched: bool, cfg: &SessionCfg, v: &Version, now: u64, parser: &mut EventParser, rec: &mut Vec<u8>) -> Result<(), Verdict> {
     let info = parser.parse_unchecked(&mut Scanner::new_at(text, at), rec).map_err(|e| Verdict::Invalid(format!("invalid: {e}")))?;
     if let Some(msg) = cfg.refusal(&info, Record(rec), now) {
         return Err(Verdict::Refused(msg));
@@ -103,7 +106,7 @@ pub fn check(text: &str, at: usize, cfg: &SessionCfg, v: &Version, now: u64, par
     if parser.confirm_id(Scanner::new_at(text, at), rec, info).is_err() {
         return Err(Verdict::Invalid("invalid: bad event id".into()));
     }
-    if !verify_sig(Record(rec)) {
+    if !vouched && !verify_sig(Record(rec)) {
         return Err(Verdict::Invalid("invalid: bad signature".into()));
     }
     Ok(())
@@ -111,13 +114,13 @@ pub fn check(text: &str, at: usize, cfg: &SessionCfg, v: &Version, now: u64, par
 
 /// [`check`] for a batch, spread over up to `threads` threads (signature
 /// checks are the cost). Per event: its record to store, or what settled it.
-pub fn check_all(events: &[(&str, usize)], cfg: &SessionCfg, v: &Version, now: u64, threads: usize) -> Vec<Result<Vec<u8>, Verdict>> {
-    let one = |part: &[(&str, usize)]| -> Vec<Result<Vec<u8>, Verdict>> {
+pub fn check_all(events: &[(&str, usize, bool)], cfg: &SessionCfg, v: &Version, now: u64, threads: usize) -> Vec<Result<Vec<u8>, Verdict>> {
+    let one = |part: &[(&str, usize, bool)]| -> Vec<Result<Vec<u8>, Verdict>> {
         let mut parser = EventParser::new();
         part.iter()
-            .map(|&(text, at)| {
+            .map(|&(text, at, vouched)| {
                 let mut rec = Vec::new();
-                check(text, at, cfg, v, now, &mut parser, &mut rec).map(|()| rec)
+                check(text, at, vouched, cfg, v, now, &mut parser, &mut rec).map(|()| rec)
             })
             .collect()
     };

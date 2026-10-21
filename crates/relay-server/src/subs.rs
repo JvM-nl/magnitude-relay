@@ -67,6 +67,8 @@ struct Entry {
     /// Store generation the REQ's stored results were read at: batches up to
     /// it are already answered, so live delivery starts after it.
     gen: u64,
+    /// A trusted peer's: gift wraps go to its broad filters too.
+    wraps: bool,
 }
 
 #[derive(Default)]
@@ -97,7 +99,14 @@ impl SubIndex {
 
     /// Opens (or replaces) subscription `sub` on `conn`, live from after store
     /// generation `gen`.
+    #[cfg(test)]
     pub fn add(&mut self, conn: ConnId, sub: &str, filters: Vec<Filter>, gen: u64) {
+        self.add_with(conn, sub, filters, gen, false);
+    }
+
+    /// [`add`](Self::add); with `wraps`, broad filters get gift wraps too (a
+    /// trusted peer's).
+    pub fn add_with(&mut self, conn: ConnId, sub: &str, filters: Vec<Filter>, gen: u64, wraps: bool) {
         self.remove(conn, sub);
         let sub: Arc<str> = Arc::from(sub);
         let mut ids = Vec::with_capacity(filters.len());
@@ -106,7 +115,7 @@ impl SubIndex {
                 continue;
             }
             let slots = slots_for(&f);
-            let e = Entry { conn, sub: sub.clone(), filter: f, slots, gen };
+            let e = Entry { conn, sub: sub.clone(), filter: f, slots, gen, wraps };
             let i = match self.free.pop() {
                 Some(i) => {
                     self.entries[i as usize] = Some(e);
@@ -226,7 +235,7 @@ impl SubIndex {
         let start = out.len();
         for &i in cand.iter() {
             let e = self.entries[i as usize].as_ref().expect("indexed entry exists");
-            let wrap_to_broad = rec.kind() == relay_proto::kind::GIFT_WRAP && crate::session::broad(&e.filter);
+            let wrap_to_broad = !e.wraps && rec.kind() == relay_proto::kind::GIFT_WRAP && crate::session::broad(&e.filter);
             if e.gen < gen && !wrap_to_broad && e.filter.matches(rec) {
                 out.push((e.conn, e.sub.clone()));
             }

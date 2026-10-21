@@ -267,7 +267,7 @@ async fn reconcile_once(e: &Rc<Entry>) -> Result<Report, String> {
     let mut remote = Remote::connect(&e.connector, &e.url).await?;
     let hide_wraps = if e.broad() { remote.hides_wraps().await? } else { false };
     let mut local = e.local();
-    let opts = Opts { hide_wraps, ..Opts::new(e.cfg.direction) };
+    let opts = Opts { hide_wraps, trusted: e.cfg.trusted, ..Opts::new(e.cfg.direction) };
     let mut total = Report::default();
     for f in &e.cfg.filters {
         let mut r = Report::default();
@@ -345,7 +345,9 @@ async fn live_once(e: &Rc<Entry>, cursor: &mut u64, reconnected: bool) -> Result
             text = remote.next() => {
                 let text = text?;
                 match RelayMsg::parse(&text) {
-                    Ok(RelayMsg::Event { sub_id: "live", at }) if !already_here(&mut parser, &mut rec, &e.store, &text, at) => batch.push(Inbound { text, at }),
+                    Ok(RelayMsg::Event { sub_id: "live", at, first_hand }) if !already_here(&mut parser, &mut rec, &e.store, &text, at) => {
+                        batch.push(Inbound { text, at, vouched: e.cfg.trusted && first_hand })
+                    }
                     Ok(RelayMsg::Ok { id, accepted, message }) => answered(e, &mut out, id, accepted, &message),
                     Ok(RelayMsg::Closed { sub_id: "live", message }) => return Err(format!("{} ended the live subscription: {message}", e.url)),
                     _ => {}

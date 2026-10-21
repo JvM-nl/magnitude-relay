@@ -109,6 +109,9 @@ pub struct Request {
     pub hide_wraps: bool,
     /// ingest: event objects, as JSON text.
     pub events: Vec<String>,
+    /// ingest: indices into `events` whose signatures a trusted peer vouched
+    /// for (it took them from a client itself): not checked again.
+    pub trusted: Vec<u64>,
 }
 
 /// Items per `{"items":..}` line: 80 KB of hex.
@@ -145,7 +148,7 @@ fn boolean(s: &mut Scanner<'_>) -> Result<bool, Bad> {
 
 impl Request {
     pub fn new(op: Op, filters: Vec<Filter>) -> Request {
-        Request { op, filters, limit: None, age: None, all: false, dry_run: false, dest: None, hide_wraps: false, events: Vec::new() }
+        Request { op, filters, limit: None, age: None, all: false, dry_run: false, dest: None, hide_wraps: false, events: Vec::new(), trusted: Vec::new() }
     }
 
     fn to_line(&self) -> String {
@@ -184,6 +187,16 @@ impl Request {
             }
             out.push(b']');
         }
+        if !self.trusted.is_empty() {
+            out.extend_from_slice(b",\"trusted\":[");
+            for (i, n) in self.trusted.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                push_u64(&mut out, *n);
+            }
+            out.push(b']');
+        }
         out.push(b'}');
         String::from_utf8(out).expect("request JSON is UTF-8")
     }
@@ -216,6 +229,10 @@ impl Request {
                     }
                     // A slice of a &str between JSON delimiters is UTF-8.
                     r.events.push(String::from_utf8_lossy(s.raw_value()?).into_owned());
+                    Ok(())
+                })?,
+                b"trusted" => s.array(|s| -> Result<(), Bad> {
+                    r.trusted.push(s.u64()?);
                     Ok(())
                 })?,
                 _ => return Err("unknown key".into()),
@@ -477,7 +494,11 @@ fn ingest(req: &Request, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
     if !req.filters.is_empty() {
         return Err("ingest takes events, not filters".into());
     }
-    let texts: Vec<(&str, usize)> = req.events.iter().map(|e| (e.as_str(), 0)).collect();
+    let mut vouched = vec![false; req.events.len()];
+    for &i in &req.trusted {
+        *vouched.get_mut(i as usize).ok_or("a trusted index names no event")? = true;
+    }
+    let texts: Vec<(&str, usize, bool)> = req.events.iter().zip(vouched).map(|(e, t)| (e.as_str(), 0, t)).collect();
     let v = cx.store.snapshot();
     let checked = inbound::check_all(&texts, &cx.policy, &v, ingest::now(), ingest_threads());
     // Not held while the writer works: a snapshot pins what it may reclaim.

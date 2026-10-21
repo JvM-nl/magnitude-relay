@@ -149,12 +149,15 @@ struct ConnOut {
     /// Large live events may be shared rather than copied: a plain socket that
     /// does not compress (TLS and compression each need their own bytes).
     share: bool,
+    /// A trusted peer's: events this relay took from clients are marked so.
+    peer: bool,
 }
 
 impl ConnOut {
-    fn new(deflate: Option<Compressor>, plain: bool) -> ConnOut {
+    fn new(deflate: Option<Compressor>, plain: bool, peer: bool) -> ConnOut {
         ConnOut {
             share: plain && deflate.is_none(),
+            peer,
             buf: RefCell::new(Vec::new()),
             spliced: RefCell::new(Vec::new()),
             spliced_bytes: Cell::new(0),
@@ -485,10 +488,12 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                     o.overflow.set(true);
                 } else {
                     let m = shared.metrics.of(r.idx);
-                    if body.as_ref().is_some_and(|b| o.event_shared(sub, b)) {
+                    // The mark is this connection's own ending: not shared.
+                    let mark = o.peer && Record(rec).is_first_hand();
+                    if !mark && body.as_ref().is_some_and(|b| o.event_shared(sub, b)) {
                         metrics::inc(&m.events_shared);
                     } else {
-                        o.write(|w| session::event_msg_json(w, sub, &json));
+                        o.write(|w| session::event_msg_json(w, sub, &json, mark));
                     }
                     metrics::inc(&m.events_out);
                     metrics::inc(&m.events_live);
@@ -497,6 +502,18 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
             }
         }
     }
+}
+
+/// Whether a connection is one of our trusted peers': `/peer/<secret>` naming a
+/// `[[peer]]`, from one of that peer's addresses; both, or it is not. `None`
+/// for any other path; `Some(false)` for a peer path that does not check out.
+fn trusted_peer(peers: &[crate::config::PeerCfg], path: &str, ip: IpAddr) -> Option<bool> {
+    let rest = path.strip_prefix("/peer/")?;
+    let secret = rest.split(['?', '#', '/']).next().unwrap_or("").as_bytes();
+    // Every secret compared in full: how long a comparison takes says nothing
+    // about how much of a guess was right.
+    let same = |a: &[u8], b: &[u8]| a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
+    Some(peers.iter().fold(false, |ok, p| ok | (same(p.secret.as_bytes(), secret) & p.ips.contains(&ip))))
 }
 
 fn client_ip(req: &OwnedRequest, peer: SocketAddr, header: &str) -> IpAddr {
@@ -530,6 +547,17 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
     };
     let ip = client_ip(&req, peer, real_ip_header);
     let idx = st.borrow().idx;
+    let trusted = match trusted_peer(&shared.cfg.peers, &req.path, ip) {
+        None => false,
+        Some(true) => true,
+        Some(false) => {
+            metrics::inc(&shared.metrics.of(idx).connections_refused);
+            let mut out = Vec::new();
+            ws::write_close(&mut out, 1008, "not a known peer");
+            let _ = s.write_all(&out).await;
+            return;
+        }
+    };
     if !shared.admit(ip) {
         metrics::inc(&shared.metrics.of(idx).connections_refused);
         let mut out = Vec::new();
@@ -544,10 +572,10 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
     if z.is_some() {
         metrics::inc(&shared.metrics.of(idx).connections_deflate);
     }
-    let out = Rc::new(ConnOut::new(z, s.is_clear()));
+    let out = Rc::new(ConnOut::new(z, s.is_clear(), trusted));
     st.borrow_mut().conns.insert(conn, out.clone());
 
-    let _ = serve(&mut s, &mut buf, conn, ip, deflate, &out, &st, &shared).await;
+    let _ = serve(&mut s, &mut buf, conn, ip, deflate, trusted, &out, &st, &shared).await;
 
     {
         let mut r = st.borrow_mut();
@@ -681,6 +709,7 @@ async fn serve(
     conn: ConnId,
     ip: IpAddr,
     deflate: Option<DeflateParams>,
+    trusted: bool,
     out: &Rc<ConnOut>,
     st: &Rc<RefCell<Reactor>>,
     shared: &Arc<Shared>,
@@ -690,7 +719,7 @@ async fn serve(
     if let Some(p) = &deflate {
         dec = dec.with_deflate(p);
     }
-    let mut session = Session::new(conn);
+    let mut session = Session::new(conn, trusted);
     let mut wbuf = Vec::new();
     let mut wspliced: Vec<(usize, Rc<[u8]>)> = Vec::new();
     let mut last_rx = Instant::now();

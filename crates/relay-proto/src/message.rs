@@ -153,7 +153,9 @@ fn neg_hex(s: &mut Scanner<'_>) -> Result<Vec<u8>, MsgError> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum RelayMsg<'a> {
     /// `["EVENT", sub, {...}]`. The event object starts at byte `at` of the text.
-    Event { sub_id: &'a str, at: usize },
+    /// `first_hand`: the relay ended it with `"first-hand"`, which our own relays
+    /// do for a trusted peer when they took the event from a client themselves.
+    Event { sub_id: &'a str, at: usize, first_hand: bool },
     /// `["OK", id, accepted, message]`.
     Ok { id: [u8; 32], accepted: bool, message: String },
     Eose { sub_id: &'a str },
@@ -164,6 +166,10 @@ pub enum RelayMsg<'a> {
     /// Something a client may ignore (AUTH, COUNT, a command from a later NIP).
     Other,
 }
+
+/// What ends an EVENT a relay sends a trusted peer for an event it took from a
+/// client itself.
+pub const FIRST_HAND: &[u8] = b"first-hand";
 
 impl<'a> RelayMsg<'a> {
     pub fn parse(text: &'a str) -> Result<RelayMsg<'a>, MsgError> {
@@ -192,7 +198,13 @@ impl<'a> RelayMsg<'a> {
                     return Err(MsgError::Json(json::Error { msg: "expected an event object", pos: at }));
                 }
                 s.skip()?;
-                RelayMsg::Event { sub_id, at }
+                let first_hand = if s.eat(b',') {
+                    let m = s.string()?;
+                    !m.escaped && m.bytes == FIRST_HAND
+                } else {
+                    false
+                };
+                RelayMsg::Event { sub_id, at, first_hand }
             }
             b"OK" => {
                 s.expect(b',')?;
@@ -252,8 +264,12 @@ mod tests {
     fn relay_messages() {
         let id = "ab".repeat(32);
         let ev = format!(r#"["EVENT","s1", {{"id":"{id}","kind":1}} ]"#);
-        let RelayMsg::Event { sub_id, at } = RelayMsg::parse(&ev).unwrap() else { panic!("not an event") };
-        assert_eq!((sub_id, &ev[at..at + 6]), ("s1", r#"{"id":"#));
+        let RelayMsg::Event { sub_id, at, first_hand } = RelayMsg::parse(&ev).unwrap() else { panic!("not an event") };
+        assert_eq!((sub_id, &ev[at..at + 6], first_hand), ("s1", r#"{"id":"#, false));
+        let marked = format!(r#"["EVENT","s1",{{"id":"{id}"}},"first-hand"]"#);
+        assert!(matches!(RelayMsg::parse(&marked), Ok(RelayMsg::Event { first_hand: true, .. })));
+        let other = format!(r#"["EVENT","s1",{{"id":"{id}"}},"second-hand"]"#);
+        assert!(matches!(RelayMsg::parse(&other), Ok(RelayMsg::Event { first_hand: false, .. })));
         let ok = format!(r#"["OK","{id}",false,"rate-limited: slow \"down\""]"#);
         assert_eq!(RelayMsg::parse(&ok).unwrap(), RelayMsg::Ok { id: [0xab; 32], accepted: false, message: "rate-limited: slow \"down\"".into() });
         assert_eq!(RelayMsg::parse(&format!(r#"["OK","{id}",true,""]"#)).unwrap(), RelayMsg::Ok { id: [0xab; 32], accepted: true, message: String::new() });

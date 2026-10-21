@@ -123,6 +123,9 @@ pub struct Opts {
     pub dry_run: bool,
     /// Leave gift wraps out of broad filters (the other relay does; see `Remote::hides_wraps`).
     pub hide_wraps: bool,
+    /// The other relay is a trusted peer: the signatures of events it marks
+    /// first-hand are not checked again.
+    pub trusted: bool,
     /// Print a line per window to stderr.
     pub verbose: bool,
     /// [`WINDOW_TARGET`] and [`WINDOW_CAP`], smaller in tests.
@@ -132,7 +135,7 @@ pub struct Opts {
 
 impl Opts {
     pub fn new(dir: Direction) -> Opts {
-        Opts { dir, dry_run: false, hide_wraps: false, verbose: false, target: WINDOW_TARGET, cap: WINDOW_CAP }
+        Opts { dir, dry_run: false, hide_wraps: false, trusted: false, verbose: false, target: WINDOW_TARGET, cap: WINDOW_CAP }
     }
 }
 
@@ -203,7 +206,7 @@ async fn windows(remote: &mut Remote, local: &mut impl Local, f: &Filter, opts: 
         }
         if !opts.dry_run {
             if opts.dir.down() && !diff.need.is_empty() {
-                fetch(remote, local, &diff.need, report).await?;
+                fetch(remote, local, &diff.need, opts.trusted, report).await?;
             }
             if opts.dir.up() && !diff.have.is_empty() {
                 push(remote, local, &diff.have, report).await?;
@@ -227,7 +230,7 @@ pub fn filter_text(f: &Filter) -> String {
 }
 
 /// Asks for `need` by id and stores what comes back.
-async fn fetch(remote: &mut Remote, local: &mut impl Local, need: &[[u8; 32]], report: &mut Report) -> Result<(), String> {
+async fn fetch(remote: &mut Remote, local: &mut impl Local, need: &[[u8; 32]], trusted: bool, report: &mut Report) -> Result<(), String> {
     // Turned away on an earlier pass and still there: not asked for again.
     let asking: Vec<[u8; 32]> = need.iter().filter(|id| !local.refused_before(id)).copied().collect();
     report.refused_before += (need.len() - asking.len()) as u64;
@@ -253,7 +256,7 @@ async fn fetch(remote: &mut Remote, local: &mut impl Local, need: &[[u8; 32]], r
         let text = remote.next_within(IDLE).await?;
         let mut closed = None;
         match RelayMsg::parse(&text) {
-            Ok(RelayMsg::Event { sub_id, at }) => {
+            Ok(RelayMsg::Event { sub_id, at, first_hand }) => {
                 let Some(want) = asked.get_mut(sub_id) else { continue };
                 let id = match parser.parse_unchecked(&mut relay_proto::json::Scanner::new_at(&text, at), &mut rec) {
                     Ok(_) => *Record(&rec).id(),
@@ -268,7 +271,7 @@ async fn fetch(remote: &mut Remote, local: &mut impl Local, need: &[[u8; 32]], r
                 }
                 report.fetched += 1;
                 batch_bytes += text.len();
-                batch.push(Inbound { text, at });
+                batch.push(Inbound { text, at, vouched: trusted && first_hand });
                 ids.push(id);
             }
             Ok(RelayMsg::Eose { sub_id }) | Ok(RelayMsg::Closed { sub_id, .. }) => closed = Some(sub_id.to_string()),
@@ -427,7 +430,7 @@ enum Target {
 }
 
 /// `sync <url>`: one pass over each filter, with the relay running or not.
-pub fn run_command(cfg: &Config, url: &str, filters: Vec<Filter>, dir: Direction, dry_run: bool) -> Result<(), String> {
+pub fn run_command(cfg: &Config, url: &str, filters: Vec<Filter>, dir: Direction, dry_run: bool, trusted: bool) -> Result<(), String> {
     let url = RelayUrl::parse(url)?;
     crate::operator::check_filters(&filters)?;
     let mut target = match Store::open(&cfg.store.data, store_options(cfg)) {
@@ -445,7 +448,7 @@ pub fn run_command(cfg: &Config, url: &str, filters: Vec<Filter>, dir: Direction
         eprintln!("{how} {url} ({}{})", dir.name(), if hide_wraps { "; it lists gift wraps only by author, recipient or id, so they are left out here too" } else { "" });
         for f in &filters {
             println!("filter {}", filter_text(f));
-            let opts = Opts { dry_run, hide_wraps, verbose: true, ..Opts::new(dir) };
+            let opts = Opts { dry_run, hide_wraps, trusted, verbose: true, ..Opts::new(dir) };
             let mut report = Report::default();
             let r = match &mut target {
                 Target::Direct(l) => sync_filter(&mut remote, l.as_mut(), f, &opts, &mut report).await,

@@ -36,6 +36,8 @@ struct Script {
     withhold: HashSet<[u8; 32]>,
     /// Sent with every answer to a REQ, though nobody asked.
     extra: Option<String>,
+    /// Sent marked first-hand, as our relays mark them for a trusted peer.
+    first_hand: HashSet<[u8; 32]>,
 }
 
 #[derive(Default)]
@@ -107,7 +109,8 @@ async fn fake_relay(script: Script, seen: Arc<Mutex<Seen>>) -> RelayUrl {
                         for id in m[2]["ids"].as_array().unwrap().iter().map(id_of) {
                             let found = script.events.iter().find(|e| e.1 == id).and_then(|e| e.2.clone());
                             if let (Some(json), false) = (found, script.withhold.contains(&id)) {
-                                write_text(&mut out, format!("[\"EVENT\",\"{sub}\",{json}]").as_bytes());
+                                let mark = if script.first_hand.contains(&id) { ",\"first-hand\"" } else { "" };
+                                write_text(&mut out, format!("[\"EVENT\",\"{sub}\",{json}{mark}]").as_bytes());
                             }
                         }
                         if let Some(extra) = &script.extra {
@@ -282,4 +285,51 @@ async fn fetched_events_are_checked_and_accounted_for() {
     let mut remote2 = Remote::connect(&Connector::new().unwrap(), &url2).await.unwrap();
     sync_filter(&mut remote2, &mut local, &Filter::default(), &opts, &mut again).await.unwrap();
     assert_eq!((again.need, again.have), (2, 0), "only the two withheld are missing");
+}
+
+#[tokio::test]
+async fn a_trusted_peer_vouches_only_for_signatures_and_only_first_hand() {
+    use secp256k1::{schnorr, Keypair};
+    use sha2::{Digest, Sha256};
+    let key = Keypair::from_secret_bytes([4; 32]).unwrap();
+    let pk = hex::encode_string(&key.x_only_public_key().0.to_byte_array());
+    // A real id, and a signature that does not verify.
+    let unsigned = |at: u64, content: &str| -> (u64, [u8; 32], String) {
+        let pre = serde_json::to_string(&json!([0, pk, at, 8, [], content])).unwrap();
+        let id: [u8; 32] = Sha256::digest(pre.as_bytes()).into();
+        let sig = hex::encode_string(&schnorr::sign_no_aux_rand(&[9; 32], &key).to_byte_array());
+        (at, id, json!({"id": hex::encode_string(&id), "pubkey": pk, "created_at": at, "kind": 8, "tags": [], "content": content, "sig": sig}).to_string())
+    };
+    let t0 = 1_700_000_000;
+    let vouched = unsigned(t0, "first-hand");
+    let plain = unsigned(t0 + 1, "not marked");
+    // Marked, but its content no longer hashes to its id: ids are always checked.
+    let (at, wrong, json) = unsigned(t0 + 2, "tampered");
+    let tampered = (at, wrong, json.replace("tampered", "tampered!"));
+    let events: Vec<_> = [&vouched, &plain, &tampered].iter().map(|e| (e.0, e.1, Some(e.2.clone()))).collect();
+    let first_hand: HashSet<[u8; 32]> = [vouched.1, tampered.1].into_iter().collect();
+    let script = Script { events, max_set: usize::MAX, first_hand, ..Script::default() };
+    let run = |trusted: bool, tag: &'static str| {
+        let script = script.clone();
+        async move {
+            let url = fake_relay(script, Arc::new(Mutex::new(Seen::default()))).await;
+            let mut remote = Remote::connect(&Connector::new().unwrap(), &url).await.unwrap();
+            let dir = std::env::temp_dir().join(format!("relay-sync-fake-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (store, w) = Store::open(&dir, Options { segment_size: 16 << 20, ..Options::default() }).unwrap();
+            let mut local = Direct::new(store, w, SessionCfg::from_config(&Config::default()));
+            let mut r = Report::default();
+            let opts = Opts { trusted, ..Opts::new(Direction::Down) };
+            sync_filter(&mut remote, &mut local, &Filter::default(), &opts, &mut r).await.unwrap();
+            r
+        }
+    };
+    let r = run(true, "trusted").await;
+    assert_eq!(r.down.stored, 1, "{:?}", r.down);
+    assert_eq!(r.down.invalid.get("invalid: bad signature"), Some(&1), "the unmarked one is checked: {:?}", r.down);
+    assert_eq!(r.down.invalid.get("invalid: bad event id"), Some(&1), "{:?}", r.down);
+    // From a relay not trusted, the mark means nothing.
+    let r = run(false, "untrusted").await;
+    assert_eq!(r.down.stored, 0, "{:?}", r.down);
+    assert_eq!(r.down.invalid.get("invalid: bad signature"), Some(&2), "{:?}", r.down);
 }

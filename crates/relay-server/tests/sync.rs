@@ -369,3 +369,83 @@ async fn continuous_sync_keeps_two_relays_in_step() {
     let _ = std::fs::remove_dir_all(&da);
     let _ = std::fs::remove_dir_all(&db);
 }
+
+/// Every text message on `c` until EOSE for `sub`: the EVENTs, as sent.
+async fn raw_events(c: &mut relay_net::conn::ClientConn, sub: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), c.recv()).await.expect("no answer in time").unwrap() {
+            Message::Text(t) if t.starts_with("[\"EOSE\"") => return out,
+            Message::Text(t) if t.starts_with(&format!("[\"EVENT\",\"{sub}\"")) => out.push(t),
+            Message::Close(why) => panic!("closed: {why:?}"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_trusted_peer_gets_everything_and_vouches_for_first_hand_events() {
+    let secret = "a".repeat(20) + &"7".repeat(20);
+    let elsewhere = "b".repeat(40);
+    let peers = format!("[[peer]]\nname = \"here\"\nsecret = \"{secret}\"\nips = [\"127.0.0.1\"]\n[[peer]]\nname = \"far\"\nsecret = \"{elsewhere}\"\nips = [\"10.1.2.3\"]\n");
+    let (da, db, dc) = (tmp("peer-a"), tmp("peer-b"), tmp("peer-c"));
+    let mut a = Relay::configure(&da, free_port(), "", &peers);
+    let b = Relay::configure(&db, free_port(), "", "");
+    let c = Relay::configure(&dc, free_port(), "", "");
+    // Imported: not taken from an app by A. Published: taken, and checked, by A.
+    let data = dataset(2_000);
+    a.import(&data);
+    a.start();
+    let fresh: Vec<Value> = dataset(40).into_iter().map(|e| Signer::new(77).event(now(), e["kind"].as_u64().unwrap(), e["tags"].clone(), "fresh")).collect();
+    publish(&a, &fresh).await;
+    let (held, wraps) = (a.count("{}"), a.count(&json!({"kinds": [1059]}).to_string()));
+    assert!(wraps > 0);
+
+    // Over the peer path from a listed address: wraps listed like any event,
+    // and only what A took from an app itself marked first-hand.
+    let host = format!("127.0.0.1:{}", a.port);
+    let mut p = client_connect(a.addr(), &host, &format!("/peer/{secret}")).await.unwrap();
+    let ids = json!([data[6]["id"], fresh[6]["id"]]);
+    p.send_text(&json!(["REQ", "x", {"ids": ids}]).to_string()).await.unwrap();
+    let got = raw_events(&mut p, "x").await;
+    assert_eq!(got.len(), 2, "{got:?}");
+    let marked = |id: &Value| got.iter().find(|t| t.contains(id.as_str().unwrap())).unwrap().ends_with(",\"first-hand\"]");
+    assert!(!marked(&data[6]["id"]), "imported: not first-hand");
+    assert!(marked(&fresh[6]["id"]), "published by an app: first-hand");
+    p.send_text(&json!(["REQ", "all", {"kinds": [1059]}]).to_string()).await.unwrap();
+    assert_eq!(raw_events(&mut p, "all").await.len() as u64, wraps, "every wrap, to a peer");
+    // An EVENT the peer itself sends is stored, but not as A's own.
+    let relayed = Signer::new(78).event(now(), 1, json!([]), "via the peer");
+    p.send_text(&json!(["EVENT", relayed]).to_string()).await.unwrap();
+    loop {
+        if let Message::Text(t) = tokio::time::timeout(Duration::from_secs(10), p.recv()).await.expect("no OK").unwrap() {
+            if t.starts_with("[\"OK\"") {
+                assert!(t.contains(",true,"), "{t}");
+                break;
+            }
+        }
+    }
+    p.send_text(&json!(["REQ", "r", {"ids": [relayed["id"]]}]).to_string()).await.unwrap();
+    let back = raw_events(&mut p, "r").await;
+    assert!(back.len() == 1 && !back[0].ends_with(",\"first-hand\"]"), "{back:?}");
+    drop(p);
+
+    // The other peer's secret from an address not its own, or a wrong secret:
+    // turned away.
+    for path in [format!("/peer/{elsewhere}"), format!("/peer/{}", "c".repeat(40))] {
+        let mut x = client_connect(a.addr(), &host, &path).await.unwrap();
+        let m = tokio::time::timeout(Duration::from_secs(5), x.recv()).await.expect("no answer");
+        assert!(matches!(m, Ok(Message::Close(Some((1008, _))))), "{path}: {m:?}");
+    }
+
+    // A trusted sync copies everything; an ordinary one, everything but wraps.
+    b.run_ok(&["sync", &format!("ws://{host}/peer/{secret}"), "--trusted"]);
+    assert_eq!(b.count("{}"), held + 1, "everything, and the event relayed through the peer");
+    assert_eq!(b.count(&json!({"kinds": [1059]}).to_string()), wraps);
+    c.run_ok(&["sync", &a.url()]);
+    assert_eq!(c.count(&json!({"kinds": [1059]}).to_string()), 0);
+    drop(a);
+    for d in [da, db, dc] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

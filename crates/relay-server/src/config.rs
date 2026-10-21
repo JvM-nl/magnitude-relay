@@ -106,11 +106,12 @@ const KEYS: &[(&str, &[&str])] = &[
     ),
     ("store", &["data", "sync", "segment_mb", "memory_mb"]),
     ("tls", &["enabled", "domains", "email", "https_bind", "http_bind", "cert", "key", "staging", "directory"]),
-    ("sync", &["url", "filter", "direction", "reconcile_seconds"]),
+    ("sync", &["url", "filter", "direction", "reconcile_seconds", "trusted"]),
+    ("peer", &["name", "secret", "ips"]),
 ];
 
 /// Sections written `[[name]]`: there may be any number of each.
-const LISTS: &[&str] = &["sync"];
+const LISTS: &[&str] = &["sync", "peer"];
 
 /// Builds the error for a rule that relates settings, blaming the first of `keys` the file wrote.
 type Blame<'a> = dyn Fn(&[(&str, &str)], String) -> ConfigError + 'a;
@@ -130,6 +131,23 @@ pub struct Config {
     pub tls: TlsCfg,
     /// One per `[[sync]]` block, in file order.
     pub sync: Vec<SyncCfg>,
+    /// One per `[[peer]]` block.
+    pub peers: Vec<PeerCfg>,
+}
+
+/// `[[peer]]`: another relay of ours, trusted with everything this one holds
+/// (gift wraps listed like any event) and to have checked the signatures of
+/// events it took from clients itself. Recognised by its private path and its
+/// address together.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PeerCfg {
+    /// For people reading the file and the logs.
+    pub name: String,
+    /// It connects to `/peer/<secret>`.
+    pub secret: String,
+    /// The addresses it connects from (as `real_ip_header` names them, behind
+    /// a web server).
+    pub ips: Vec<std::net::IpAddr>,
 }
 
 /// `[relay]`: where and how to listen.
@@ -334,6 +352,9 @@ pub struct SyncCfg {
     /// Between two full comparisons new events stream live; the comparison
     /// catches whatever the stream missed (a disconnect, a restart).
     pub reconcile_seconds: u64,
+    /// The other relay is one of ours ([[peer]] there): the signatures of
+    /// events it took from clients itself are not checked again here.
+    pub trusted: bool,
 }
 
 /// Which way a sync copies events.
@@ -378,7 +399,7 @@ impl Direction {
 impl Default for SyncCfg {
     /// Everything, theirs to us, compared hourly. No url: one must be given.
     fn default() -> Self {
-        SyncCfg { url: String::new(), filters: vec![Filter::default()], direction: Direction::Down, reconcile_seconds: 3600 }
+        SyncCfg { url: String::new(), filters: vec![Filter::default()], direction: Direction::Down, reconcile_seconds: 3600, trusted: false }
     }
 }
 
@@ -638,6 +659,7 @@ impl Config {
                 return Err(ConfigError::at(sec.line, format!("write [[{0}]] with double brackets: there can be one for each relay", sec.name)));
             }
             let mut sync = SyncCfg::default();
+            let mut peer = PeerCfg::default();
             for e in &sec.entries {
                 let applied = match sec.name.as_str() {
                     "relay" => apply_relay(&mut cfg.relay, e),
@@ -647,6 +669,7 @@ impl Config {
                     "store" => apply_store(&mut cfg.store, e),
                     "tls" => apply_tls(&mut cfg.tls, e),
                     "sync" => apply_sync(&mut sync, e),
+                    "peer" => apply_peer(&mut peer, e),
                     _ => Ok(false),
                 };
                 match applied {
@@ -660,6 +683,15 @@ impl Config {
                     return Err(ConfigError::at(sec.line, "this [[sync]] has no url: name the relay, like url = \"wss://relay.example.com\""));
                 }
                 cfg.sync.push(sync);
+            }
+            if sec.name == "peer" {
+                if peer.secret.is_empty() || peer.ips.is_empty() {
+                    return Err(ConfigError::at(sec.line, "this [[peer]] needs both a secret and its ips: the relay trusts a peer only on its private path from one of its addresses"));
+                }
+                if cfg.peers.iter().any(|p| p.secret == peer.secret) {
+                    return Err(ConfigError::at(sec.line, "two [[peer]] blocks have the same secret: give each its own"));
+                }
+                cfg.peers.push(peer);
             }
         }
         cfg.check_together(&doc)?;
@@ -1193,6 +1225,28 @@ fn apply_sync(c: &mut SyncCfg, e: &Entry) -> Result<bool, String> {
             })?;
         }
         "reconcile_seconds" => c.reconcile_seconds = int(e, 1, 30 * 86_400)?,
+        "trusted" => c.trusted = boolean(e)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn apply_peer(c: &mut PeerCfg, e: &Entry) -> Result<bool, String> {
+    match e.key.as_str() {
+        "name" => c.name = string(e)?.to_string(),
+        "secret" => {
+            let s = string(e)?;
+            if s.len() < 32 || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                return Err("`secret` must be at least 32 letters, digits, '-' or '_' (for example from `openssl rand -hex 24`)".into());
+            }
+            c.secret = s.to_string();
+        }
+        "ips" => {
+            c.ips = strings(e)?
+                .iter()
+                .map(|s| s.parse::<std::net::IpAddr>().map(|ip| ip.to_canonical()).map_err(|_| format!("`ips` takes IP addresses like \"203.0.113.7\" or \"2001:db8::7\", not \"{s}\"")))
+                .collect::<Result<_, _>>()?;
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -1506,6 +1560,25 @@ const TEMPLATE: &str = r##"# {name} settings
 
 # Seconds between full comparisons. New events arrive live in between.
 # reconcile_seconds = 3600
+
+# true when the other relay is one of yours and lists this one as a [[peer]]
+# (the url is then its private peer address, wss://host/peer/<secret>): events
+# it took from apps itself arrive with their signatures already checked, and
+# are not checked again. Everything else is, and every other rule applies.
+# trusted = false
+
+# Your own relays that copy everything from this one ([[sync]] with trusted =
+# true on theirs): one block for each. Such a relay is sent gift wraps like any
+# other event, and events this relay took from apps itself carry a mark that
+# their signatures were checked here. It is recognised by its private address,
+# wss://this-relay/peer/<secret>, AND the address it connects from; both, or
+# it is an ordinary client (and a wrong secret is turned away). Behind a web
+# server set real_ip_header, and pass /peer/ on to the relay.
+#
+# [[peer]]
+# name = "eu-2"
+# secret = "replace-with-your-own-secret-from-openssl-rand"  # `openssl rand -hex 24`
+# ips = ["203.0.113.7"]
 "##;
 
 #[cfg(test)]
@@ -1577,7 +1650,8 @@ mod tests {
             })
             .collect();
         let example = SyncCfg { url: "wss://relay.example.com".into(), ..SyncCfg::default() };
-        assert_eq!(ok(&uncommented), Config { sync: vec![example], ..Config::default() }, "with every setting uncommented");
+        let peer = PeerCfg { name: "eu-2".into(), secret: "replace-with-your-own-secret-from-openssl-rand".into(), ips: vec!["203.0.113.7".parse().unwrap()] };
+        assert_eq!(ok(&uncommented), Config { sync: vec![example], peers: vec![peer], ..Config::default() }, "with every setting uncommented");
 
         // Every key is documented exactly once, under its own header.
         let all: Vec<&str> = KEYS.iter().flat_map(|(_, ks)| ks.iter().copied()).collect();
@@ -1636,6 +1710,22 @@ reconcile_seconds = 60
         fails("[[sync]]\nurl = \"ws://h\"\nreconcile_seconds = 0", Some(3), "between 1 and");
         fails("[[sync]]\nurl = \"ws://h\"\nbind = \"x\"", Some(3), "`bind` belongs in [relay]");
         fails("[relay]\nurl = \"ws://h\"", Some(2), "`url` belongs in [sync]");
+    }
+
+    #[test]
+    fn peers() {
+        let s = "k".repeat(32);
+        let c = ok(&format!("[[peer]]\nname = \"eu\"\nsecret = \"{s}\"\nips = [\"203.0.113.7\", \"::ffff:198.51.100.1\"]\n"));
+        assert_eq!(c.peers.len(), 1);
+        assert_eq!(c.peers[0].ips, vec!["203.0.113.7".parse::<std::net::IpAddr>().unwrap(), "198.51.100.1".parse().unwrap()], "mapped addresses compare as IPv4");
+        fails("[[peer]]\nsecret = \"short\"\nips = [\"1.2.3.4\"]", Some(2), "at least 32");
+        fails(&format!("[[peer]]\nsecret = \"{}\"\nips = [\"1.2.3.4\"]", "/".repeat(32)), Some(2), "at least 32");
+        fails(&format!("[[peer]]\nsecret = \"{s}\""), Some(1), "needs both a secret and its ips");
+        fails("[[peer]]\nips = [\"1.2.3.4\"]", Some(1), "needs both a secret and its ips");
+        fails(&format!("[[peer]]\nsecret = \"{s}\"\nips = [\"relay.example.com\"]"), Some(3), "IP addresses");
+        let twice = format!("[[peer]]\nsecret = \"{s}\"\nips = [\"1.2.3.4\"]\n[[peer]]\nsecret = \"{s}\"\nips = [\"5.6.7.8\"]\n");
+        fails(&twice, Some(4), "same secret");
+        fails("[peer]\nname = \"x\"", Some(1), "double brackets");
     }
 
     #[test]
