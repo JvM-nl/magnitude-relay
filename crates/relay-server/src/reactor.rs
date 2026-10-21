@@ -1041,7 +1041,8 @@ async fn plain_http(s: &mut Sock, req: &OwnedRequest, shared: &Shared) -> io::Re
         write_response(&mut out, 200, "OK", "text/plain; version=0.0.4", &[], crate::stats::prometheus(shared).as_bytes(), true);
     } else if page == "live" {
         write_response(&mut out, 200, "OK", "application/json", &cors, crate::landing::live_json(shared).as_bytes(), true);
-    } else if page == "rubik.woff2" {
+    } else if page == "font" {
+        // No extension: web servers' static-file rules (`\.woff2$`) would take it.
         write_response(&mut out, 200, "OK", "font/woff2", &[("Cache-Control", "public, max-age=604800")], crate::landing::FONT, true);
     } else if req.accepts("application/nostr+json") {
         write_response(&mut out, 200, "OK", "application/nostr+json", &cors, shared.nip11.as_bytes(), true);
