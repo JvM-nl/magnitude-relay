@@ -35,6 +35,18 @@ pub enum Outcome {
     Rejected(&'static str),
 }
 
+/// Nanoseconds spent in each phase of `finish` (sync, build run, merge runs,
+/// publish + reclaim), for the writer's debug breakdown.
+pub static FINISH_NS: [std::sync::atomic::AtomicU64; 4] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+#[inline]
+fn lap(slot: usize, t: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    FINISH_NS[slot].fetch_add((now - *t).as_nanos() as u64, Ordering::Relaxed);
+    *t = now;
+}
+
 /// A batch written to the log but not yet synced or published (see `Writer::stage`).
 pub struct Staged {
     b: Batch,
@@ -403,11 +415,13 @@ impl Writer {
             self.log.mark_dead(off)?;
             zero.push(off);
         }
+        let mut t = std::time::Instant::now();
         if self.opts.sync {
             self.log.sync()?;
         } else {
             self.log.flush()?;
         }
+        lap(0, &mut t);
 
         self.dead.grow_to(self.next_seq);
         for &seq in &b.kills {
@@ -415,13 +429,16 @@ impl Writer {
         }
         if !b.keys.is_empty() {
             self.mem.push(Arc::new(MemRun::build(&b.keys)));
+            lap(1, &mut t);
             self.merge_mem();
+            lap(2, &mut t);
         }
         let old = self.publish();
         self.pending_zero.push_back((Arc::downgrade(&old), zero));
         drop(old);
         self.reclaim()?;
         self.maybe_flush();
+        lap(3, &mut t);
         Ok(())
     }
 

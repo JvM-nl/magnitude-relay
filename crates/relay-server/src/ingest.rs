@@ -162,11 +162,19 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
             d_stage += stage_secs;
             d_finish += finish_secs;
             if d_last.elapsed().as_secs() >= 1 {
+                let ph: Vec<f64> = relay_store::writer::FINISH_NS
+                    .iter()
+                    .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / d_batches.max(1) as f64)
+                    .collect();
                 eprintln!(
-                    "writer: {d_batches} batches, {d_events} events ({:.0}/batch), stage {:.2} ms/batch, finish {:.2} ms/batch, idle {:.0}%",
+                    "writer: {d_batches} batches, {d_events} events ({:.0}/batch), stage {:.2} ms/batch, finish {:.2} ms/batch (sync {:.2}, build {:.2}, merge {:.2}, publish {:.2}), idle {:.0}%",
                     d_events as f64 / d_batches.max(1) as f64,
                     d_stage * 1e3 / d_batches.max(1) as f64,
                     d_finish * 1e3 / d_batches.max(1) as f64,
+                    ph[0],
+                    ph[1],
+                    ph[2],
+                    ph[3],
                     d_idle * 100.0 / d_last.elapsed().as_secs_f64()
                 );
                 (d_batches, d_events, d_stage, d_finish, d_idle) = (0, 0, 0.0, 0.0, 0.0);
