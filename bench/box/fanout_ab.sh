@@ -3,6 +3,7 @@
 # Live-delivery cost of two builds of our relay, alternated A B A B per event
 # size: the schedule fixes deliveries per second, so what differs is the relay's
 # CPU time for the same work, its peak memory, and delivery latency.
+# FANOUT_ARGS overrides the workload (default: 1000 subscribers, 2000 events/s).
 set -euo pipefail
 . "$(dirname "$(readlink -f "$0")")/env.sh"
 export RELAY_CPUS=${RELAY_CPUS:-0,1,4,5}
@@ -21,7 +22,7 @@ run() { # binary pad
     pid=$(cat "$(pidfile_of ours)")
     t0=$(awk '{print $14 + $15}' /proc/"$pid"/stat)
     line=$(systemd-run --scope --quiet -p AllowedCPUs=2,3 nice -n 10 "$BIN_DIR/relay-bench" fanout \
-        --url ws://127.0.0.1:"$(port_of ours)" --subscribers 1000 --publishers 4 --rate 2000 --duration 20 \
+        --url ws://127.0.0.1:"$(port_of ours)" ${FANOUT_ARGS:---subscribers 1000 --publishers 4 --rate 2000 --duration 20} \
         --pad "$2" --label ab --threads 2 2>&1 | grep -E "^fanout +[0-9]")
     t1=$(awk '{print $14 + $15}' /proc/"$pid"/stat)
     printf '%-28s pad %5s  cpu %6.2f s  peak %6s MB  %s\n' "$(basename "$1")" "$2" \
