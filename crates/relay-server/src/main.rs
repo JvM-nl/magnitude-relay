@@ -33,7 +33,8 @@ commands:
   serve                run the relay (the default when no command is given)
   init [FILE]          write a fully commented settings file (default: ./relay.toml);
                        never overwrites an existing file
-  import <file|->      load a JSONL export (strfry format), verifying every event
+  import <file|->      load a JSONL export (strfry format), verifying every event;
+                       kinds the policy refuses are skipped
       --no-verify      skip id and signature checks (trusted input only)
       --relaxed        do not sync per batch (one sync at the end)
   export [--since T] [--until T]
@@ -167,7 +168,11 @@ fn run() -> Result<(), String> {
             let opts = Options { sync: cfg.store.sync && !relaxed, ..store_options(&cfg) };
             let (_store, mut w) = Store::open(&cfg.store.data, opts).map_err(|e| e.to_string())?;
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-            let opts = import::ImportOptions { verify, skip_kind: None, threads };
+            // Kinds the relay refuses from apps are left out, as sync leaves them out.
+            let policy = cfg.policy.kind_policy();
+            let skip_kind: Option<Box<dyn Fn(u64) -> bool + Send + Sync>> =
+                cfg.policy.restricts_writes().then(|| Box::new(move |k| !policy.allows(k)) as _);
+            let opts = import::ImportOptions { verify, skip_kind, threads };
             let t = Instant::now();
             let report = |s: &import::ImportStats| {
                 let secs = t.elapsed().as_secs_f64();

@@ -675,8 +675,10 @@ async fn a_big_delete_runs_beside_live_writes() {
     for i in 0..n {
         let (id, pk) = (format!("{:064x}", i + 1), format!("{:064x}", i % 7 + 1));
         let (at, sig) = (1_700_000_000 + i, "00".repeat(64));
-        writeln!(f, r#"{{"content":"x","created_at":{at},"id":"{id}","kind":14,"pubkey":"{pk}","sig":"{sig}","tags":[]}}"#).unwrap();
+        writeln!(f, r#"{{"content":"x","created_at":{at},"id":"{id}","kind":1059,"pubkey":"{pk}","sig":"{sig}","tags":[]}}"#).unwrap();
     }
+    // A public note: not a kind the relay accepts, so import leaves it out.
+    writeln!(f, r#"{{"content":"x","created_at":1700000000,"id":"{:064x}","kind":1,"pubkey":"{:064x}","sig":"{}","tags":[]}}"#, n + 1, 1, "00".repeat(64)).unwrap();
     drop(f);
     run_ok(&dir, &["import", "--no-verify", file.to_str().unwrap()]);
     assert_eq!(run_ok(&dir, &["count", "--filter", "{}"]), format!("{n}\n"));
@@ -687,7 +689,7 @@ async fn a_big_delete_runs_beside_live_writes() {
     let mut delete = Command::new(env!("CARGO_BIN_EXE_magnitude-relay"))
         .arg("--config")
         .arg(dir.join("relay.toml"))
-        .args(["delete", "--filter", r#"{"kinds":[14]}"#, "--yes"])
+        .args(["delete", "--filter", r#"{"kinds":[1059]}"#, "--yes"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -708,7 +710,7 @@ async fn a_big_delete_runs_beside_live_writes() {
     let out = delete.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), format!("deleted {n} events\n"));
-    assert_eq!(run_ok(&dir, &["count", "--filter", r#"{"kinds":[14]}"#]), "0\n");
+    assert_eq!(run_ok(&dir, &["count", "--filter", r#"{"kinds":[1059]}"#]), "0\n");
     assert_eq!(run_ok(&dir, &["count", "--filter", "{}"]), "40\n", "the live writes are all there, and nothing else");
     assert_eq!(ids_over_req(&relay, json!({"kinds": [30078], "authors": [me.pk()]})).await.len(), 40);
     let dir = relay.stop();
@@ -796,7 +798,7 @@ async fn a_backup_runs_beside_live_writes_and_restores() {
     for i in 0..n {
         let (id, pk) = (format!("{:064x}", i + 1), format!("{:064x}", i % 7 + 1));
         let (at, sig) = (1_700_000_000 + i, "00".repeat(64));
-        writeln!(f, r#"{{"content":"x","created_at":{at},"id":"{id}","kind":14,"pubkey":"{pk}","sig":"{sig}","tags":[]}}"#).unwrap();
+        writeln!(f, r#"{{"content":"x","created_at":{at},"id":"{id}","kind":1059,"pubkey":"{pk}","sig":"{sig}","tags":[]}}"#).unwrap();
     }
     drop(f);
     run_ok(&dir, &["import", "--no-verify", file.to_str().unwrap()]);
@@ -847,7 +849,7 @@ async fn a_backup_runs_beside_live_writes_and_restores() {
     std::fs::rename(&dest, restored.join("data")).unwrap();
     let port = free_port();
     let relay = Relay::start(restored.clone(), port);
-    assert_eq!(run_ok(&restored, &["count", "--filter", r#"{"kinds":[14]}"#]), format!("{n}\n"));
+    assert_eq!(run_ok(&restored, &["count", "--filter", r#"{"kinds":[1059]}"#]), format!("{n}\n"));
     assert_eq!(run_ok(&restored, &["count", "--filter", "{}"]), format!("{held}\n"));
     let mut c = client_connect(relay.addr, &format!("127.0.0.1:{port}"), "/").await.unwrap();
     send(&mut c, json!(["EVENT", me.event(now(), 30078, json!([["d", "after"]]), "after restore")])).await;
