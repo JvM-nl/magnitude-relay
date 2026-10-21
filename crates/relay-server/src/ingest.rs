@@ -216,6 +216,7 @@ fn syncer(rx: Receiver<SyncJob>, sinks: Vec<Sink>) {
             }
         }
         let t_sync = Instant::now();
+        let had_ticket = ticket.is_some();
         let failed = match ticket.map_or(Ok(()), |t| t.sync()) {
             Ok(()) => false,
             Err(e) => {
@@ -223,6 +224,9 @@ fn syncer(rx: Receiver<SyncJob>, sinks: Vec<Sink>) {
                 true
             }
         };
+        if had_ticket {
+            crate::health::note_sync(t_sync.elapsed(), !failed);
+        }
         if debug {
             let took = t_sync.elapsed().as_secs_f64();
             let age = jobs[0].taken.elapsed().as_secs_f64();
@@ -282,6 +286,7 @@ fn commit(w: &mut Writer, recs: &[&[u8]], received: Instant, sinks: &[Sink]) -> 
         Ok(s) => s,
         Err(e) => {
             eprintln!("write failed: {e}");
+            crate::health::note_write_failure(&e);
             return failed(stage_secs);
         }
     };
@@ -304,6 +309,7 @@ fn commit(w: &mut Writer, recs: &[&[u8]], received: Instant, sinks: &[Sink]) -> 
         }
         Err(e) => {
             eprintln!("write failed: {e}");
+            crate::health::note_write_failure(&e);
             failed(stage_secs)
         }
     }

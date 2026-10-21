@@ -119,6 +119,20 @@
   }
   .banner[hidden] { display: none; }
   .banner b { color: var(--critical-text); }
+
+  /* What the relay or its host wants an operator to know, worst first. */
+  .alerts { display: grid; gap: 8px; margin: 16px 0 0; }
+  .alerts[hidden] { display: none; }
+  .alert {
+    display: flex; gap: 10px; align-items: baseline; padding: 9px 13px; border-radius: 10px; font-size: 13px;
+    border: 1px solid var(--warning); color: var(--ink);
+    background: color-mix(in srgb, var(--warning) 10%, var(--surface));
+  }
+  .alert.critical { border-color: var(--critical); background: color-mix(in srgb, var(--critical) 9%, var(--surface)); }
+  .alert b { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; flex: none; min-width: 5.5em; }
+  .alert.critical b { color: var(--critical-text); }
+  .meter > span.warn { background: var(--warning); }
+  .meter > span.bad { background: var(--critical); }
   main { transition: opacity .3s ease; }
   main.dim { opacity: .55; }
 
@@ -234,6 +248,7 @@
   </header>
   <div class="provenance" id="provenance"></div>
   <div class="banner" id="banner" role="status" hidden></div>
+  <div class="alerts" id="alerts" role="status" hidden></div>
 
   <main id="main">
     <h2>Traffic <em>per second, last 5 minutes; legend figures are 6 s averages</em></h2>
@@ -270,6 +285,38 @@
           <span><i class="sw seg"></i><b id="s-seg">—</b> in segment files</span>
         </div>
       </div>
+    </div>
+
+    <h2>Host <em>the machine the relay runs on, read now</em></h2>
+    <div class="panel store">
+      <div>
+        <div class="k">Free on the data volume</div>
+        <div class="figure" id="x-disk">—</div>
+        <div class="meter" id="x-disk-meter" role="meter" aria-label="Share of the data volume in use"
+             aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="x-disk-bar"></span></div>
+        <div class="meterfoot">
+          <span><b id="x-disk-used">—</b> used</span>
+          <span><b id="x-disk-total">—</b> in all</span>
+        </div>
+      </div>
+      <div>
+        <div class="k">Memory available</div>
+        <div class="figure" id="x-mem">—</div>
+        <div class="meter" id="x-mem-meter" role="meter" aria-label="Share of memory in use"
+             aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="x-mem-bar"></span></div>
+        <div class="meterfoot">
+          <span><b id="x-mem-used">—</b> in use</span>
+          <span><b id="x-mem-total">—</b> in all</span>
+        </div>
+      </div>
+    </div>
+    <div class="tiles" style="margin-top: 12px">
+      <div class="tile"><div class="k">CPU pressure</div><div class="v" id="t-cpu">—</div><div class="sub" id="t-cpu-sub">—</div></div>
+      <div class="tile"><div class="k">Memory pressure</div><div class="v" id="t-mpr">—</div><div class="sub" id="t-mpr-sub">—</div></div>
+      <div class="tile"><div class="k">Disk pressure</div><div class="v" id="t-iop">—</div><div class="sub" id="t-iop-sub">—</div></div>
+      <div class="tile"><div class="k">Open files</div><div class="v" id="t-files">—</div><div class="sub" id="t-files-sub">—</div></div>
+      <div class="tile"><div class="k">Disk syncs</div><div class="v" id="t-sync">—</div><div class="sub" id="t-sync-sub">—</div></div>
+      <div class="tile"><div class="k">Write failures</div><div class="v" id="t-wfail">—</div><div class="sub" id="t-wfail-sub">—</div></div>
     </div>
   </main>
 
@@ -704,7 +751,78 @@
     $("s-meter").setAttribute("aria-valuenow", share.toFixed(1));
     $("s-meter").setAttribute("aria-valuetext", mem + seg > 0 ? pct(share) + " of the index is in memory" : "index is empty");
 
+    renderHealth(d);
     updateCharts();
+  }
+
+  // ── host health ─────────────────────────────────────────────────────────
+  function warningsOf(d) {
+    return Array.isArray(d && d.warnings) ? d.warnings.filter((w) => w && typeof w.message === "string") : [];
+  }
+  /// "bad", "warn" or "" for the worst warning about `what`.
+  function levelOf(ws, what) {
+    const mine = ws.filter((w) => w.what === what);
+    return mine.some((w) => w.level === "critical") ? "bad" : mine.length ? "warn" : "";
+  }
+  function setMeter(id, used, total, level, label) {
+    const share = total > 0 ? Math.min(100, used / total * 100) : 0;
+    const bar = $(id + "-bar");
+    bar.style.width = share + "%";
+    bar.className = level;
+    $(id + "-meter").setAttribute("aria-valuenow", share.toFixed(1));
+    $(id + "-meter").setAttribute("aria-valuetext", total > 0 ? pct(share) + " " + label : "unknown");
+  }
+  function setPressure(id, p) {
+    if (!p || typeof p.some_avg60 !== "number") return setTile(id, "—", "", "not reported by this system");
+    setTile(id, pct(p.some_avg60), "", "of the last minute something waited · all stalled " + pct(n0(p.full_avg60)));
+  }
+  function renderHealth(d) {
+    const ws = warningsOf(d);
+    const box = $("alerts");
+    box.textContent = "";
+    for (const w of ws) {
+      const row = document.createElement("div");
+      row.className = "alert" + (w.level === "critical" ? " critical" : "");
+      const b = document.createElement("b");
+      b.textContent = (w.level === "critical" ? "Critical" : "Warning") + " · " + (w.what || "");
+      row.appendChild(b);
+      row.appendChild(document.createTextNode(w.message));
+      box.appendChild(row);
+    }
+    box.hidden = ws.length === 0;
+
+    const h = d.host || {}, du = d.durability || {};
+    const dt = h.disk_total_bytes, da = h.disk_available_bytes;
+    const disk = typeof dt === "number" && typeof da === "number";
+    $("x-disk").textContent = disk ? bytes(da) : "—";
+    $("x-disk-used").textContent = disk ? bytes(dt - da) : "—";
+    $("x-disk-total").textContent = disk ? bytes(dt) : "—";
+    setMeter("x-disk", disk ? dt - da : 0, disk ? dt : 0, levelOf(ws, "disk"), "of the data volume in use");
+    const mt = h.memory_total_bytes, ma = h.memory_available_bytes;
+    const memKnown = typeof mt === "number" && typeof ma === "number";
+    $("x-mem").textContent = memKnown ? bytes(ma) : "not reported";
+    $("x-mem-used").textContent = memKnown ? bytes(mt - ma) : "—";
+    $("x-mem-total").textContent = memKnown ? bytes(mt) : "—";
+    setMeter("x-mem", memKnown ? mt - ma : 0, memKnown ? mt : 0, levelOf(ws, "memory"), "of memory in use");
+
+    const pr = h.pressure || {};
+    setPressure("cpu", pr.cpu);
+    setPressure("mpr", pr.memory);
+    setPressure("iop", pr.io);
+    if (typeof h.open_files === "number") {
+      setTile("files", big(h.open_files), "", typeof h.open_files_limit === "number" ? "of " + big(h.open_files_limit) + " allowed · one per connection" : "no limit reported", num(h.open_files));
+    } else {
+      setTile("files", "—", "", "not reported by this system");
+    }
+    const syncs = n0(du.syncs);
+    if (syncs > 0) {
+      const [fig, unit] = micros(n0(du.sync_ms_total) * 1000 / syncs);
+      setTile("sync", fig, unit, "mean, " + big(syncs) + " syncs · " + (n0(du.slow_syncs) > 0 ? num(du.slow_syncs) + " slow, the slowest " + num(du.slowest_sync_ms) + " ms" : "none slow"));
+    } else {
+      setTile("sync", "—", "", "no writes yet");
+    }
+    const wf = n0(du.failed_writes) + n0(du.failed_syncs);
+    setTile("wfail", big(wf), "", wf > 0 ? num(du.no_space_refusals) + " for a full disk · " + num(du.failed_syncs) + " failed syncs" : "none since start");
   }
 
   // ── connection state ────────────────────────────────────────────────────
@@ -721,9 +839,18 @@
         : "No reading yet. ") + "Retrying every " + POLL_MS / 1000 + " s.";
     } else if (lastOk) {
       banner.hidden = true;
+      const ws = warningsOf(latest), crit = ws.filter((w) => w.level === "critical").length;
       const L = newest(), slow = L && samples.length > 1 ? L.c.slow_drops - back(60000).c.slow_drops : 0;
-      dot.className = "dot" + (slow > 0 ? " warn" : "");
-      health.textContent = slow > 0 ? "slow clients dropped in the last minute" : "live";
+      if (crit > 0) {
+        dot.className = "dot bad";
+        health.textContent = crit + " critical" + (ws.length > crit ? ", " + (ws.length - crit) + " more" : "");
+      } else if (ws.length > 0) {
+        dot.className = "dot warn";
+        health.textContent = ws.length + (ws.length === 1 ? " warning" : " warnings");
+      } else {
+        dot.className = "dot" + (slow > 0 ? " warn" : "");
+        health.textContent = slow > 0 ? "slow clients dropped in the last minute" : "live";
+      }
     }
     $("foot-updated").textContent = lastOk ? "updated " + dur((Date.now() - lastOk) / 1000) + " ago, " + clock(lastOk) : "—";
   }

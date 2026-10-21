@@ -4,6 +4,7 @@ mod admin;
 mod brand;
 mod config;
 mod export;
+mod health;
 mod import;
 mod inbound;
 mod ingest;

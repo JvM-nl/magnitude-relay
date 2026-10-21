@@ -18,6 +18,8 @@ relay-store.workspace = true
 relay-net = { workspace = true, features = ["tls"] }
 relay-tls.workspace = true
 tokio.workspace = true
+# Host health: statvfs, getrlimit (already linked through relay-store).
+libc.workspace = true
 
 [dev-dependencies]
 # The in-process ACME server and a TLS client, for the end-to-end HTTPS tests.
