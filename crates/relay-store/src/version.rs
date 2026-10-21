@@ -417,6 +417,27 @@ impl Version {
     /// Lazy, unlike [`query`](Self::query): memory is bounded by the number of
     /// filters, not of matches, so an operator can walk millions of events.
     pub fn matching(&self, filters: &[Filter], older_than: Option<u64>, now: u64) -> Matching<'_> {
+        self.walk(filters, older_than, now, None)
+    }
+
+    /// [`matching`](Self::matching) without the records: hits carry no id (it is
+    /// zeroed), and a filter the index answers whole reads no record at all,
+    /// because the only expired events still live are the few the next sweep
+    /// will take, found up front in the expiry index. For counting and removal,
+    /// where reading millions of records would be the whole cost.
+    pub fn matching_seqs(&self, filters: &[Filter], older_than: Option<u64>, now: u64) -> Matching<'_> {
+        let mut expired = std::collections::HashSet::new();
+        let hi = prefix(T_EXPIRY, &[&now.saturating_add(1).to_be_bytes()]);
+        self.for_range(&[T_EXPIRY], &hi, |k| {
+            let seq = seq_of(k);
+            if self.is_live(seq) {
+                expired.insert(seq);
+            }
+        });
+        self.walk(filters, older_than, now, Some(expired))
+    }
+
+    fn walk(&self, filters: &[Filter], older_than: Option<u64>, now: u64, keys_only: Option<std::collections::HashSet<u64>>) -> Matching<'_> {
         let mut filters = filters.to_vec();
         if let Some(cutoff) = older_than {
             for f in &mut filters {
@@ -448,10 +469,10 @@ impl Version {
                 }
             };
             let mut s = Source { feed, exact, last: u64::MAX, head: None };
-            s.advance(self, f, now);
+            s.advance(self, f, now, keys_only.as_ref());
             sources.push(s);
         }
-        Matching { v: self, now, filters, sources }
+        Matching { v: self, now, filters, sources, keys_only }
     }
 
     /// The NIP-77 set for `kinds:[k...] #name:[values...]` within `[since, until]`,
@@ -546,6 +567,8 @@ pub struct Matching<'a> {
     now: u64,
     filters: Vec<Filter>,
     sources: Vec<Source<'a>>,
+    /// Set for a keys-only walk: the live events already expired.
+    keys_only: Option<std::collections::HashSet<u64>>,
 }
 
 /// One filter's share of a [`Matching`] walk.
@@ -568,7 +591,7 @@ enum Feed<'a> {
 
 impl Source<'_> {
     /// Moves `head` to the next live, unexpired event the filter matches.
-    fn advance(&mut self, v: &Version, f: &Filter, now: u64) {
+    fn advance(&mut self, v: &Version, f: &Filter, now: u64, keys_only: Option<&std::collections::HashSet<u64>>) {
         self.head = None;
         loop {
             let next = match &mut self.feed {
@@ -583,11 +606,18 @@ impl Source<'_> {
             if !v.is_live(seq) {
                 continue;
             }
+            if let Some(expired_now) = keys_only.filter(|_| self.exact) {
+                if expired_now.contains(&seq) {
+                    continue;
+                }
+                self.head = Some(Hit { created_at, seq, id: [0; 32] });
+                return;
+            }
             let rec = v.record_unchecked(seq);
             if expired(rec, now) || (!self.exact && !f.matches(rec)) {
                 continue;
             }
-            self.head = Some(Hit { created_at, seq, id: *rec.id() });
+            self.head = Some(Hit { created_at, seq, id: if keys_only.is_some() { [0; 32] } else { *rec.id() } });
             return;
         }
     }
@@ -601,7 +631,7 @@ impl Iterator for Matching<'_> {
         // Every filter that matched this event moves past it.
         for (s, f) in self.sources.iter_mut().zip(&self.filters) {
             if s.head.is_some_and(|h| h.seq == hit.seq) {
-                s.advance(self.v, f, self.now);
+                s.advance(self.v, f, self.now, self.keys_only.as_ref());
             }
         }
         Some(hit)

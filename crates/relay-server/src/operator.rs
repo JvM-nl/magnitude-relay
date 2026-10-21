@@ -95,7 +95,7 @@ pub fn older_than(age: Option<u64>, now: u64) -> Option<u64> {
 /// Returns how many. Memory use does not grow with the number of matches.
 pub fn stream(v: &Version, filters: &[Filter], limit: Option<u64>, now: u64, emit: &mut dyn FnMut(Record<'_>) -> io::Result<()>) -> io::Result<u64> {
     let mut n = 0;
-    for hit in v.matching(filters, None, now) {
+    for hit in v.matching_seqs(filters, None, now) {
         if limit.is_some_and(|l| n >= l) {
             break;
         }
@@ -108,13 +108,13 @@ pub fn stream(v: &Version, filters: &[Filter], limit: Option<u64>, now: u64, emi
 }
 
 pub fn count_matching(v: &Version, filters: &[Filter], now: u64) -> u64 {
-    v.matching(filters, None, now).count() as u64
+    v.matching_seqs(filters, None, now).count() as u64
 }
 
 /// What `delete` would remove: how many, and the newest few.
 pub fn preview(v: &Version, filters: &[Filter], older_than: Option<u64>, now: u64) -> Deleted {
     let mut d = Deleted::default();
-    for hit in v.matching(filters, older_than, now) {
+    for hit in v.matching_seqs(filters, older_than, now) {
         d.matched += 1;
         if d.sample.len() < SAMPLES {
             if let Some(rec) = v.record(hit.seq) {

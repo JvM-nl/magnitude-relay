@@ -592,7 +592,7 @@ impl Writer {
 
     fn kill_batches(&mut self, v: &Version, filters: &[Filter], older_than: Option<u64>, now: u64, deleted: &mut usize) -> io::Result<()> {
         let mut batch = Vec::with_capacity(DELETE_BATCH);
-        for hit in v.matching(filters, older_than, now) {
+        for hit in v.matching_seqs(filters, older_than, now) {
             batch.push(hit.seq);
             if batch.len() == DELETE_BATCH {
                 *deleted += self.kill_live(&batch)?;

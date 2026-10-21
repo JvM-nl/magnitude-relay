@@ -1107,7 +1107,14 @@ fn matching_skips_expired_and_dead() {
     let dir = tmpdir("matching");
     let (store, mut w) = Store::open(&dir, opts()).unwrap();
     write(&mut w, &[ev(1, 1, 100, 1059, r#"[["expiration","500"]]"#, "typing"), ev(2, 1, 100, 1059, "[]", "msg"), ev(3, 1, 101, 1059, "[]", "gone")]);
-    let walk = |f: &str, older: Option<u64>, now: u64| store.snapshot().matching(&[filter(f)], older, now).map(|h| h.id).collect::<Vec<_>>();
+    let walk = |f: &str, older: Option<u64>, now: u64| {
+        let v = store.snapshot();
+        let ids: Vec<_> = v.matching(&[filter(f)], older, now).map(|h| h.id).collect();
+        // The keys-only walk finds the same events (its hits carry seqs only).
+        let by_keys: Vec<_> = v.matching_seqs(&[filter(f)], older, now).map(|h| *v.record(h.seq).unwrap().id()).collect();
+        assert_eq!(by_keys, ids, "keys-only walk of {f} at {now}");
+        ids
+    };
     assert_eq!(walk("{}", None, 499).len(), 3);
     assert_eq!(walk("{}", None, 500), vec![id_of(3), id_of(2)], "expired at 500, newest first");
     // The same by id.

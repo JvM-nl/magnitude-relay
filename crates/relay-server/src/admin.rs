@@ -368,7 +368,7 @@ fn kill_matching(
 ) -> (Deleted, Option<String>) {
     let mut d = Deleted::default();
     let mut batch = Vec::with_capacity(DELETE_BATCH);
-    for hit in v.matching(filters, older, now) {
+    for hit in v.matching_seqs(filters, older, now) {
         d.matched += 1;
         batch.push(hit.seq);
         if batch.len() < DELETE_BATCH {
