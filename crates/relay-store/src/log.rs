@@ -309,9 +309,15 @@ impl LogWriter {
     /// linger on disk. Only once no snapshot that could read it is alive.
     pub fn zero_record(&mut self, off: u64) -> io::Result<()> {
         let si = off / self.seg_size;
-        let Some(seg) = self.file(si) else { return Ok(()) };
+        let Some(seg) = self.file(si).cloned() else { return Ok(()) };
         let o = off % self.seg_size;
         let len = seg.read_u32(o as usize) as usize;
+        self.touched.insert(si);
+        // The header stays (its flag says dead); the record's blocks are given back.
+        let body = o + FRAME_HEADER as u64;
+        if seg.punch_hole(body, body + len as u64) {
+            return Ok(());
+        }
         const ZEROS: [u8; 4096] = [0; 4096];
         let mut done = 0;
         while done < len {
@@ -319,7 +325,6 @@ impl LogWriter {
             seg.write_at(o + FRAME_HEADER as u64 + done as u64, &ZEROS[..n])?;
             done += n;
         }
-        self.touched.insert(si);
         Ok(())
     }
 

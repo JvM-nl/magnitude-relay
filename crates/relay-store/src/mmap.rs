@@ -114,6 +114,28 @@ impl MappedFile {
         let _ = (off, len);
     }
 
+    /// Makes `[off, end)` read as zeros and gives whole filesystem blocks in it
+    /// back (Linux, `fallocate(PUNCH_HOLE)`; partial blocks are zeroed by the
+    /// filesystem). False where that is not available: the caller writes zeros.
+    pub fn punch_hole(&self, off: u64, end: u64) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if end <= off {
+                return true;
+            }
+            // SAFETY: valid descriptor; the range lies within the file.
+            let r = unsafe {
+                libc::fallocate(self.file.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, off as i64, (end - off) as i64)
+            };
+            r == 0
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (off, end);
+            false
+        }
+    }
+
     /// Discards everything from `off` to the end, leaving zeros (a hole) behind.
     pub fn zero_from(&self, off: u64) -> io::Result<()> {
         self.file.set_len(off)?;

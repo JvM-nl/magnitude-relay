@@ -869,3 +869,25 @@ fn one_process_per_directory() {
     // Released with the store.
     assert!(Store::open(&dir, opts()).is_ok());
 }
+
+/// On Linux a deleted record's whole blocks go back to the filesystem.
+#[cfg(target_os = "linux")]
+#[test]
+fn deleted_large_records_give_their_blocks_back() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tmpdir("punch");
+    let big = Options { segment_size: 4 << 20, ..opts() };
+    let (_store, mut w) = Store::open(&dir, big.clone()).unwrap();
+    let content = "y".repeat(1 << 20);
+    write(&mut w, &[ev(1, 1, 100, 14, "[]", &content)]);
+    w.sync().unwrap();
+    let seg = dir.join("log").join("00000000.log");
+    let before = std::fs::metadata(&seg).unwrap().blocks();
+    write(&mut w, &[ev(2, 1, 101, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "")]);
+    // The next batch finds no reader of the old version and zeroes the record.
+    write(&mut w, &[ev(3, 1, 102, 14, "[]", "later")]);
+    w.sync().unwrap();
+    let after = std::fs::metadata(&seg).unwrap().blocks();
+    assert!(before - after >= 1900, "1 MiB deleted, only {} KiB given back", (before - after) / 2);
+    assert!(!std::fs::read(&seg).unwrap().windows(64).any(|w| w == content[..64].as_bytes()));
+}
