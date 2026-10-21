@@ -1,5 +1,5 @@
 #!/bin/bash
-# build-cargo.sh <ditto|ours>  (run on the box)
+# build-cargo.sh <ditto|ours|ours-prof>  (run on the box)
 # Release build of ditto-relay (src/ditto-relay @ da4ec6c) or our relay (src/ours, a
 # `git archive` snapshot, see push-ours-src.sh), capped to CPUs 0-5, nice 10, 4 jobs.
 #
@@ -15,7 +15,11 @@ which=${1:-}
 case "$which" in
     ditto) SRC=$BENCH_ROOT/src/ditto-relay; PKG=();                BIN=ditto-relay;      DEST=$BIN_DITTO ;;
     ours)  SRC=$BENCH_ROOT/src/ours;        PKG=(-p relay-server); BIN=magnitude-relay;  DEST=$BIN_OURS ;;
-    *) die "usage: build-cargo.sh <ditto|ours>" ;;
+    # Frame pointers on, in a target directory of its own, for profile.sh's stack sampling.
+    ours-prof)
+        SRC=$BENCH_ROOT/src/ours; PKG=(-p relay-server); BIN=magnitude-relay; DEST=$BIN_DIR/magnitude-relay-prof
+        export CARGO_TARGET_DIR=$BENCH_ROOT/prof-target RUSTFLAGS="-C force-frame-pointers=yes" ;;
+    *) die "usage: build-cargo.sh <ditto|ours|ours-prof>" ;;
 esac
 assert_in_bench "$SRC"; assert_in_bench "$DEST"
 
@@ -29,6 +33,6 @@ systemd-run --scope --quiet -p "AllowedCPUs=$CAP_CPUS" nice -n "$NICE_LEVEL" car
 echo "built $BIN in $(( $(date +%s) - start ))s"
 mkdir -p "$BIN_DIR"
 # Copy, then rename over: a running relay keeps its old binary (cp onto it would fail).
-cp "target/release/$BIN" "$DEST.new"
+cp "${CARGO_TARGET_DIR:-target}/release/$BIN" "$DEST.new"
 mv -f "$DEST.new" "$DEST"
 ls -l "$DEST"

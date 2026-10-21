@@ -36,7 +36,8 @@ NOFILE=${NOFILE:-524288}
 # --- binaries ------------------------------------------------------------------
 BIN_FASTR=$BIN_DIR/fastr
 BIN_DITTO=$BIN_DIR/ditto-relay
-BIN_OURS=$BIN_DIR/magnitude-relay
+# Overridable for profiling (profile.sh runs the frame-pointer build in its place).
+BIN_OURS=${BIN_OURS:-$BIN_DIR/magnitude-relay}
 BIN_STRFRY=/root/strfry/strfry   # production binary, read-only use, never modified
 
 # --- per-relay data -------------------------------------------------------------
