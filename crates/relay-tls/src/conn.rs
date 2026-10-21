@@ -140,19 +140,44 @@ impl TlsConn {
     /// `WouldBlock` means nothing yet. `buf` must not be empty.
     pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         debug_assert!(!buf.is_empty());
+        // As much as the socket has, up to `buf`: one pull decrypts about one
+        // record (16 KB), and a reader handed a record at a time gets its
+        // messages a dozen per turn instead of as many as a plain read brings
+        // (built-in TLS ingested a third slower for it).
+        let mut got = 0;
         loop {
-            match self.tls.reader().read(buf) {
+            match self.tls.reader().read(&mut buf[got..]) {
+                Ok(0) if got > 0 => return Ok(got),
+                Ok(0) => return Ok(0),
                 Ok(n) => {
-                    // A full buffer may leave more behind it.
-                    self.buffered = n == buf.len();
-                    return Ok(n);
+                    got += n;
+                    if got == buf.len() {
+                        // A full buffer may leave more behind it.
+                        self.buffered = true;
+                        return Ok(got);
+                    }
+                    continue;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.buffered = false,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(got),
+                Err(_) if got > 0 => {
+                    // Deliver what came before the error; the next read reports it.
+                    self.buffered = true;
+                    return Ok(got);
+                }
                 Err(e) => return Err(e),
             }
-            if let Pulled::Blocked = self.pull()? {
-                return Err(io::ErrorKind::WouldBlock.into());
+            match self.pull() {
+                Ok(Pulled::Data) => {}
+                Ok(Pulled::Blocked) if got > 0 => return Ok(got),
+                Ok(Pulled::Blocked) => return Err(io::ErrorKind::WouldBlock.into()),
+                // The end, or a broken stream, after some data: that data first.
+                Ok(Pulled::Eof) | Err(_) if got > 0 => {
+                    self.buffered = true;
+                    return Ok(got);
+                }
+                Ok(Pulled::Eof) => return Ok(0),
+                Err(e) => return Err(e),
             }
         }
     }
