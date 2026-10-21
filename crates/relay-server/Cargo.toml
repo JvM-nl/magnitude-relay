@@ -1,8 +1,23 @@
 [package]
 name = "relay-server"
+description = "The relay binary"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+# The product name: change it here and in src/brand.rs.
+[[bin]]
+name = "magnitude-relay"
+path = "src/main.rs"
+
 [dependencies]
+relay-proto.workspace = true
+relay-store.workspace = true
+relay-net.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+secp256k1.workspace = true
+sha2.workspace = true
+serde_json.workspace = true

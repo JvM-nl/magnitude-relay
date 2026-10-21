@@ -330,3 +330,13 @@ fn queries_match_brute_force() {
         assert_eq!(snap.count(&f, 0), total, "count {q}: {fjson}");
     }
 }
+
+#[test]
+fn segment_size_cannot_change() {
+    let dir = tmpdir("meta");
+    drop(Store::open(&dir, opts()).unwrap());
+    let other = Options { segment_size: 128 * 1024, sync: true };
+    let err = Store::open(&dir, other).err().expect("must refuse");
+    assert!(err.to_string().contains("segment size"), "{err}");
+    assert!(Store::open(&dir, opts()).is_ok());
+}

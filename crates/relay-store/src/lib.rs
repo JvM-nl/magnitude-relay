@@ -52,6 +52,35 @@ pub(crate) struct Shared {
     pub(crate) gen: AtomicU64,
 }
 
+/// Format version of the data directory.
+const FORMAT: u32 = 1;
+
+/// The store's fixed parameters, recorded when it is created. The log addresses
+/// records by `offset / segment_size`, so opening it with another segment size
+/// would misread every record: refuse instead.
+fn check_meta(dir: &Path, opts: &Options) -> io::Result<()> {
+    let path = dir.join("meta");
+    let want = format!("format {FORMAT}\nsegment_size {}\n", opts.segment_size);
+    match std::fs::read_to_string(&path) {
+        Ok(have) => {
+            let get = |k: &str| have.lines().find_map(|l| l.strip_prefix(k)?.trim().parse::<u64>().ok());
+            if get("format ") != Some(u64::from(FORMAT)) {
+                return Err(io::Error::other(format!("{}: unsupported data format (expected format {FORMAT})", path.display())));
+            }
+            if get("segment_size ") != Some(opts.segment_size) {
+                return Err(io::Error::other(format!(
+                    "this data folder was created with a segment size of {} MiB; segment_mb cannot change after creation (configured: {} MiB)",
+                    get("segment_size ").unwrap_or(0) >> 20,
+                    opts.segment_size >> 20
+                )));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::write(&path, want),
+        Err(e) => Err(e),
+    }
+}
+
 /// A cloneable handle readers use to get snapshots.
 #[derive(Clone)]
 pub struct Store {
@@ -63,6 +92,7 @@ impl Store {
     /// handle and the one writer.
     pub fn open(dir: &Path, opts: Options) -> io::Result<(Store, Writer)> {
         std::fs::create_dir_all(dir)?;
+        check_meta(dir, &opts)?;
         let mut locs = LocsWriter::open(&dir.join("locs"))?;
         let mut kb = KeyBuf::default();
         let mut scratch = Vec::new();
