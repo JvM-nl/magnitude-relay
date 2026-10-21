@@ -273,10 +273,13 @@ dependencies = [
  "relay-net",
  "relay-proto",
  "relay-store",
+ "relay-tls",
+ "rustls",
  "secp256k1",
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

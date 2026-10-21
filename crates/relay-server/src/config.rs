@@ -99,7 +99,16 @@ const KEYS: &[(&str, &[&str])] = &[
         ],
     ),
     ("store", &["data", "sync", "segment_mb", "memory_mb"]),
+    ("tls", &["enabled", "domains", "email", "https_bind", "http_bind", "cert", "key", "staging", "directory"]),
 ];
+
+/// Builds the error for a rule that relates settings, blaming the first of `keys` the file wrote.
+type Blame<'a> = dyn Fn(&[(&str, &str)], String) -> ConfigError + 'a;
+
+/// Let's Encrypt's production ACME directory, the default certificate authority.
+pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
+/// Let's Encrypt's test directory: the same protocol, untrusted certificates, generous limits.
+pub const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Config {
@@ -108,6 +117,7 @@ pub struct Config {
     pub policy: PolicyCfg,
     pub limits: LimitsCfg,
     pub store: StoreCfg,
+    pub tls: TlsCfg,
 }
 
 /// `[relay]`: where and how to listen.
@@ -220,6 +230,80 @@ pub struct StoreCfg {
     pub segment_mb: u32,
     /// Memory recent index entries may use before they are written to disk.
     pub memory_mb: u32,
+}
+
+/// `[tls]`: HTTPS served by the relay itself. Off by default; the relay then speaks
+/// plain `ws://` on `[relay] bind`, for a web server in front of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsCfg {
+    pub enabled: bool,
+    /// The certificate's names; empty means the hosts of `[relay] urls`.
+    pub domains: Vec<String>,
+    /// ACME contact, or empty.
+    pub email: String,
+    pub https_bind: SocketAddr,
+    /// HTTP-01 challenges and the redirect to HTTPS; `None` is no plain-HTTP port.
+    pub http_bind: Option<SocketAddr>,
+    /// A certificate chain in PEM, or empty to get one from a CA. Both or neither of
+    /// `cert` and `key`.
+    pub cert: String,
+    pub key: String,
+    pub staging: bool,
+    /// The ACME directory URL, or empty for Let's Encrypt.
+    pub directory: String,
+}
+
+impl Default for TlsCfg {
+    fn default() -> Self {
+        TlsCfg {
+            enabled: false,
+            domains: Vec::new(),
+            email: String::new(),
+            https_bind: SocketAddr::from(([0, 0, 0, 0], 443)),
+            http_bind: Some(SocketAddr::from(([0, 0, 0, 0], 80))),
+            cert: String::new(),
+            key: String::new(),
+            staging: false,
+            directory: String::new(),
+        }
+    }
+}
+
+impl TlsCfg {
+    /// The ACME directory to ask for certificates.
+    pub fn directory_url(&self) -> &str {
+        match (self.directory.as_str(), self.staging) {
+            ("", false) => LETS_ENCRYPT,
+            ("", true) => LETS_ENCRYPT_STAGING,
+            (d, _) => d,
+        }
+    }
+
+    /// Whether the certificate comes from files instead of a CA.
+    pub fn uses_files(&self) -> bool {
+        !self.cert.is_empty()
+    }
+
+    /// The names to get a certificate for: `domains`, or else the hosts of the relay's
+    /// public `urls` that a certificate could name (an `.onion` twin or an IP address
+    /// in `urls` has none to get).
+    pub fn names(&self, relay_urls: &[String]) -> Vec<String> {
+        if !self.domains.is_empty() {
+            return self.domains.clone();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for url in relay_urls {
+            let rest = url.strip_prefix("wss://").or_else(|| url.strip_prefix("ws://")).unwrap_or(url);
+            let authority = rest.split(['/', '?']).next().unwrap_or("");
+            let host = authority.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(authority, |(h, _)| h);
+            if let Ok(name) = valid_domain(host) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Default for RelayCfg {
@@ -475,6 +559,7 @@ impl Config {
                     "policy" => apply_policy(&mut cfg.policy, e),
                     "limits" => apply_limits(&mut cfg.limits, e),
                     "store" => apply_store(&mut cfg.store, e),
+                    "tls" => apply_tls(&mut cfg.tls, e),
                     _ => Ok(false),
                 };
                 match applied {
@@ -532,6 +617,46 @@ impl Config {
                     shown("limits", "outbound_buffer_bytes", l.outbound_buffer_bytes),
                     shown("limits", "max_message_bytes", l.max_message_bytes),
                 ),
+            ));
+        }
+        self.check_tls(&blame)
+    }
+
+    /// The `[tls]` rules: a certificate and its key come as a pair, settings that only
+    /// matter when asking a CA are not given alongside files, and what is enabled
+    /// has addresses to listen on and names to be certified for.
+    fn check_tls(&self, blame: &Blame<'_>) -> Result<(), ConfigError> {
+        let t = &self.tls;
+        if t.cert.is_empty() != t.key.is_empty() {
+            let (set, missing) = if t.cert.is_empty() { ("key", "cert") } else { ("cert", "key") };
+            return Err(blame(&[("tls", set)], format!("`{set}` is set but `{missing}` is not: a certificate and its private key go together (leave both empty to get a certificate automatically)")));
+        }
+        if t.staging && !t.directory.is_empty() {
+            return Err(blame(&[("tls", "staging"), ("tls", "directory")], "`staging` and `directory` both choose the certificate authority: set one of them".to_string()));
+        }
+        if t.uses_files() {
+            for (key, given) in [("email", !t.email.is_empty()), ("staging", t.staging), ("directory", !t.directory.is_empty())] {
+                if given {
+                    return Err(blame(&[("tls", key)], format!("`{key}` has no effect with `cert` and `key` set: the relay is not asking a certificate authority for anything then")));
+                }
+            }
+        }
+        if !t.enabled {
+            return Ok(());
+        }
+        let others = [("[relay] bind", Some(self.relay.bind), ("relay", "bind")), ("[tls] http_bind", t.http_bind, ("tls", "http_bind"))];
+        for (what, addr, at) in others {
+            if addr == Some(t.https_bind) {
+                return Err(blame(&[("tls", "https_bind"), at], format!("[tls] https_bind and {what} are both {}: two listeners cannot share an address", t.https_bind)));
+            }
+        }
+        if t.http_bind == Some(self.relay.bind) {
+            return Err(blame(&[("tls", "http_bind"), ("relay", "bind")], format!("[tls] http_bind and [relay] bind are both {}: two listeners cannot share an address", self.relay.bind)));
+        }
+        if !t.uses_files() && t.names(&self.relay.urls).is_empty() {
+            return Err(blame(
+                &[("tls", "enabled"), ("tls", "domains")],
+                "[tls] has no names to get a certificate for: list them in `domains`, or give the relay's address in [relay] urls, like \"wss://relay.example.com\"".to_string(),
             ));
         }
         Ok(())
@@ -687,18 +812,21 @@ fn kind_list(e: &Entry) -> Result<Vec<u64>, String> {
     ints.iter().map(|&n| u64::try_from(n).map_err(|_| format!("`{}` holds {n}, but event kinds are not negative", e.key))).collect()
 }
 
+/// An address to listen on, with the usual slips explained. `port` is the one the
+/// examples show.
+fn bind_addr(key: &str, s: &str, port: u16) -> Result<SocketAddr, String> {
+    s.parse().map_err(|_| {
+        if s.contains(':') {
+            format!("`{key}` is not an address and port: \"{s}\". Use an IP address and port, like \"127.0.0.1:{port}\", \"0.0.0.0:{port}\" or \"[::]:{port}\" (host names such as localhost are not accepted)")
+        } else {
+            format!("`{key}` needs a port as well as an address: write \"{s}:{port}\"")
+        }
+    })
+}
+
 fn apply_relay(c: &mut RelayCfg, e: &Entry) -> Result<bool, String> {
     match e.key.as_str() {
-        "bind" => {
-            let s = string(e)?;
-            c.bind = s.parse().map_err(|_| {
-                if s.contains(':') {
-                    format!("`bind` is not an address and port: \"{s}\". Use an IP address and port, like \"127.0.0.1:7777\", \"0.0.0.0:7777\" or \"[::]:7777\" (host names such as localhost are not accepted)")
-                } else {
-                    format!("`bind` needs a port as well as an address: write \"{s}:7777\"")
-                }
-            })?;
-        }
+        "bind" => c.bind = bind_addr("bind", string(e)?, 7777)?,
         "threads" => c.threads = int(e, 0, 1024)? as usize,
         "compression" => {
             c.compression = match string(e)? {
@@ -831,6 +959,113 @@ fn apply_store(c: &mut StoreCfg, e: &Entry) -> Result<bool, String> {
             c.segment_mb = n as u32;
         }
         "memory_mb" => c.memory_mb = int(e, 1, 65536)? as u32,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// A certificate name as `domains` takes it, lowercased, or why it will not do.
+fn valid_domain(raw: &str) -> Result<String, String> {
+    let d = raw.to_ascii_lowercase();
+    if d.is_empty() {
+        return Err("is empty".to_string());
+    }
+    if d.starts_with("*.") {
+        return Err("is a wildcard, which needs DNS-based proof of ownership the relay does not do; list each name instead".to_string());
+    }
+    if d.parse::<std::net::IpAddr>().is_ok() || d.starts_with('[') {
+        return Err("is an IP address, but certificates are issued for names such as relay.example.com".to_string());
+    }
+    if !d.is_ascii() {
+        return Err("has characters outside a-z, 0-9 and \"-\"; write international names in their ASCII (xn--) form".to_string());
+    }
+    if d.ends_with('.') {
+        return Err("ends with a dot; leave the last dot off".to_string());
+    }
+    if d.len() > 253 {
+        return Err("is longer than a host name can be".to_string());
+    }
+    let labels: Vec<&str> = d.split('.').collect();
+    if labels.len() < 2 {
+        return Err("is not a full name; write it like relay.example.com".to_string());
+    }
+    for l in &labels {
+        let ok = (1..=63).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !l.starts_with('-') && !l.ends_with('-');
+        if !ok {
+            return Err(format!("has an invalid part \"{l}\": parts are 1 to 63 letters, digits or \"-\", and do not start or end with \"-\""));
+        }
+    }
+    if labels.last().is_some_and(|t| t.bytes().all(|b| b.is_ascii_digit())) {
+        return Err("does not end in a top-level domain such as .com".to_string());
+    }
+    if [".onion", ".i2p", ".local", ".localhost"].iter().any(|private| d.ends_with(private)) {
+        return Err("is a private-network name that no public certificate authority will certify".to_string());
+    }
+    Ok(d)
+}
+
+/// An ACME contact address, as far as can be told without sending mail to it.
+fn valid_email(s: &str) -> Result<(), String> {
+    let bad_char = |b: u8| b <= b' ' || b >= 0x7F || b"<>,;:?#%\"\\".contains(&b);
+    match s.split_once('@') {
+        Some((local, host)) if !local.is_empty() && host.contains('.') && !host.contains('@') && !host.starts_with('.') && !host.ends_with('.') && !s.bytes().any(bad_char) => Ok(()),
+        _ => Err(format!("`email` should be an address like admin@example.com, but this is \"{s}\"")),
+    }
+}
+
+/// The text of a path setting. Empty is allowed: it means "not set".
+fn path_setting(e: &Entry) -> Result<String, String> {
+    let s = string(e)?;
+    if s.chars().any(char::is_control) {
+        return Err(format!("`{}` contains a control character such as a tab or line break. In a Windows path, double each backslash (\"C:\\\\certs\\\\chain.pem\") or use 'single quotes' (nothing inside them is escaped)", e.key));
+    }
+    Ok(s.to_string())
+}
+
+/// A certificate authority's directory address: https, or http for a CA on this machine.
+fn valid_directory(s: &str) -> Result<(), String> {
+    let url = relay_tls::http::Url::parse(s).map_err(|_| format!("`directory` must be an https:// address, but this is \"{s}\""))?;
+    if !url.tls && !matches!(url.host.as_str(), "localhost" | "127.0.0.1" | "::1") {
+        return Err(format!("`directory` \"{s}\" is plain http, which is only accepted for a certificate authority on this computer (localhost); use https://"));
+    }
+    Ok(())
+}
+
+fn apply_tls(c: &mut TlsCfg, e: &Entry) -> Result<bool, String> {
+    match e.key.as_str() {
+        "enabled" => c.enabled = boolean(e)?,
+        "domains" => {
+            let mut names: Vec<String> = Vec::new();
+            for d in strings(e)? {
+                let name = valid_domain(d).map_err(|why| format!("`domains` entry \"{d}\" {why}"))?;
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            c.domains = names;
+        }
+        "email" => {
+            let s = string(e)?;
+            if !s.is_empty() {
+                valid_email(s)?;
+            }
+            c.email = s.to_string();
+        }
+        "https_bind" => c.https_bind = bind_addr("https_bind", string(e)?, 443)?,
+        "http_bind" => {
+            let s = string(e)?;
+            c.http_bind = if s.is_empty() { None } else { Some(bind_addr("http_bind", s, 80)?) };
+        }
+        "cert" => c.cert = path_setting(e)?,
+        "key" => c.key = path_setting(e)?,
+        "staging" => c.staging = boolean(e)?,
+        "directory" => {
+            let s = string(e)?;
+            if !s.is_empty() {
+                valid_directory(s)?;
+            }
+            c.directory = s.to_string();
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -1067,6 +1302,51 @@ const TEMPLATE: &str = r##"# {name} settings
 # The relay never needs the whole database in memory; spare RAM simply becomes
 # cache. Lower this on a very small machine, raise it on a busy one.
 # memory_mb = 64
+
+[tls]
+# HTTPS (wss://) served by the relay itself, with a free certificate from Let's
+# Encrypt that it gets and renews on its own, so nothing has to sit in front of it.
+# Off by default: the relay then speaks plain ws:// on the [relay] bind address,
+# meant for a web server such as nginx or Caddy to put HTTPS in front of.
+#
+# Before turning it on: the names (below) must already point at this computer, and
+# the internet must be able to reach it on port 443 and, for the redirect and as a
+# second way to prove the names are yours, on port 80. Ports below 1024 need the
+# program to run as root, or on Linux to hold the CAP_NET_BIND_SERVICE capability.
+#
+# Turning it on means you accept the certificate authority's terms of service (for
+# Let's Encrypt: https://letsencrypt.org/repository/). The relay prints the address
+# the first time it asks. The plain [relay] bind keeps listening as well, so one
+# relay can serve both; keep that address on 127.0.0.1 to face only this computer.
+# enabled = false
+
+# The names the certificate is for, like ["relay.example.com"]. Empty means the host
+# names in [relay] urls. Names only: no IP addresses, no wildcards (*.example.com).
+# domains = []
+
+# An address Let's Encrypt can write to when something needs attention. Optional.
+# email = ""
+
+# Where to listen for HTTPS, and for plain HTTP on port 80. Port 80 answers the
+# certificate authority's checks and sends everyone else to the https:// address.
+# "" turns port 80 off; the check on port 443 can still prove the names are yours.
+# https_bind = "0.0.0.0:443"
+# http_bind = "0.0.0.0:80"
+
+# A certificate and private key of your own, as PEM files (certbot's fullchain.pem
+# and privkey.pem, for example). With both set the relay asks no authority for
+# anything: it serves these, and picks up new files within a minute of them
+# changing, so renewing them needs no restart.
+# cert = ""
+# key = ""
+
+# true: use Let's Encrypt's test service, to try this out. Apps will not trust its
+# certificates, but its limits are generous, so mistakes cost nothing.
+# staging = false
+
+# Another ACME certificate authority, as its directory address (an https:// URL).
+# Empty means Let's Encrypt.
+# directory = ""
 "##;
 
 #[cfg(test)]
@@ -1254,7 +1534,7 @@ segment_mb = 64
         fails("[info]\nsync = true", Some(2), "belongs in [store]");
         fails("[store]\nzzzzzzzz = 1", Some(2), "The settings in [store] are data, sync, segment_mb, memory_mb");
         fails("[limit]\nmax_limit = 5", Some(1), "did you mean [limits]?");
-        fails("[servers]\n", Some(1), "The sections are [relay], [info], [policy], [limits], [store]");
+        fails("[servers]\n", Some(1), "The sections are [relay], [info], [policy], [limits], [store], [tls]");
         // Hints come from the first problem in the file, by line.
         fails("[relay]\nthreads = 1\n\n[info]\nnmae = \"x\"\n[bogus]\n", Some(5), "did you mean `name`?");
         // A very short unknown key does not match every short known key.
@@ -1302,6 +1582,156 @@ segment_mb = 64
         fails("[store]\nsegment_mb = 100", Some(2), "power of two");
         assert_eq!(ok("[store]\nsegment_mb = 16").store.segment_mb, 16);
         assert_eq!(ok("[store]\nsegment_mb = 4096").store.segment_mb, 4096);
+    }
+
+    // ----- [tls] -----
+
+    #[test]
+    fn tls_is_off_by_default_and_leaves_the_plain_listener_alone() {
+        let c = Config::default();
+        assert!(!c.tls.enabled);
+        assert_eq!(c.tls.https_bind, "0.0.0.0:443".parse().unwrap());
+        assert_eq!(c.tls.http_bind, Some("0.0.0.0:80".parse().unwrap()));
+        assert_eq!(c.relay.bind, "127.0.0.1:7777".parse().unwrap());
+        assert_eq!((c.tls.directory_url(), c.tls.uses_files()), (LETS_ENCRYPT, false));
+        assert!(c.tls.names(&[]).is_empty());
+        // Settings given while it is off are checked, but need nothing else.
+        assert!(!ok("[tls]\nemail = \"admin@example.com\"\ndomains = [\"relay.example.com\"]").tls.enabled);
+        // Turning it on needs only the names (here from the public address).
+        let c = ok("[relay]\nurls = [\"wss://relay.example.com\"]\n[tls]\nenabled = true");
+        assert_eq!(c.tls.names(&c.relay.urls), ["relay.example.com"]);
+    }
+
+    #[test]
+    fn tls_full_file() {
+        let c = ok("[tls]\nenabled = true\ndomains = [\"Relay.Example.com\", \"www.example.com\", \"relay.example.com\"]\nemail = \"admin@example.com\"\n\
+                    https_bind = \"[::]:8443\"\nhttp_bind = \"\"\nstaging = true\n");
+        assert_eq!(
+            c.tls,
+            TlsCfg {
+                enabled: true,
+                domains: vec!["relay.example.com".into(), "www.example.com".into()],
+                email: "admin@example.com".into(),
+                https_bind: "[::]:8443".parse().unwrap(),
+                http_bind: None,
+                staging: true,
+                ..TlsCfg::default()
+            }
+        );
+        assert_eq!(c.tls.directory_url(), LETS_ENCRYPT_STAGING);
+        let c = ok("[tls]\nenabled = true\ncert = \"/etc/relay/fullchain.pem\"\nkey = \"/etc/relay/privkey.pem\"");
+        assert!(c.tls.uses_files());
+        assert_eq!((c.tls.cert.as_str(), c.tls.key.as_str()), ("/etc/relay/fullchain.pem", "/etc/relay/privkey.pem"));
+        let c = ok("[tls]\ndirectory = \"https://acme.example/dir\"");
+        assert_eq!(c.tls.directory_url(), "https://acme.example/dir");
+    }
+
+    #[test]
+    fn tls_names_come_from_domains_or_the_public_urls() {
+        let t = |domains: &[&str]| TlsCfg { domains: domains.iter().map(|d| d.to_string()).collect(), ..TlsCfg::default() };
+        let urls = |u: &[&str]| u.iter().map(|d| d.to_string()).collect::<Vec<_>>();
+        assert_eq!(t(&["a.example.com"]).names(&urls(&["wss://other.example.com"])), ["a.example.com"], "domains win");
+        // Hosts of the urls, without scheme, port or path; names a CA could not certify are skipped.
+        let u = urls(&["wss://relay.example.com", "ws://Relay.Example.com:7777/nostr", "wss://www.example.com/", "ws://abcdefghij.onion", "wss://203.0.113.5", "wss://[2001:db8::1]:443", "wss://localhost"]);
+        assert_eq!(t(&[]).names(&u), ["relay.example.com", "www.example.com"]);
+        assert!(t(&[]).names(&urls(&["ws://abcdefghij.onion"])).is_empty());
+    }
+
+    #[test]
+    fn tls_domain_validation() {
+        for (bad, why) in [
+            ("\"*.example.com\"", "wildcard"),
+            ("\"203.0.113.5\"", "IP address"),
+            ("\"[::1]\"", "IP address"),
+            ("\"localhost\"", "not a full name"),
+            ("\"\"", "is empty"),
+            ("\"example.com.\"", "ends with a dot"),
+            ("\"exa mple.com\"", "invalid part"),
+            ("\"-a.example.com\"", "invalid part"),
+            ("\"a..example.com\"", "invalid part"),
+            ("\"caf\u{e9}.example.com\"", "xn--"),
+            ("\"relay.example.1\"", "top-level domain"),
+            ("\"abc.onion\"", "private-network"),
+            ("\"relay.local\"", "private-network"),
+        ] {
+            fails(&format!("[tls]\ndomains = [{bad}]"), Some(2), why);
+        }
+        fails("[tls]\ndomains = \"relay.example.com\"", Some(2), "put it in a list");
+        fails(&format!("[tls]\ndomains = [\"{}.example.com\"]", "a".repeat(64)), Some(2), "invalid part");
+        // The message names the entry.
+        fails("[tls]\ndomains = [\"ok.example.com\", \"*.example.com\"]", Some(2), "`domains` entry \"*.example.com\"");
+        assert_eq!(ok("[tls]\ndomains = [\"xn--caf-dma.example.com\", \"a-b.c-d.example.org\"]").tls.domains.len(), 2);
+    }
+
+    #[test]
+    fn tls_email_validation() {
+        assert_eq!(ok("[tls]\nemail = \"ops+relay@mail.example.com\"").tls.email, "ops+relay@mail.example.com");
+        assert_eq!(ok("[tls]\nemail = \"\"").tls.email, "");
+        for bad in ["admin", "admin@", "@example.com", "admin@example", "a b@example.com", "a@b@example.com", "admin@example.com?cc=x", "mailto:admin@example.com", "admin@.example.com"] {
+            fails(&format!("[tls]\nemail = \"{bad}\""), Some(2), "address like admin@example.com");
+        }
+    }
+
+    #[test]
+    fn tls_bind_validation() {
+        assert_eq!(ok("[tls]\nhttps_bind = \"127.0.0.1:8443\"").tls.https_bind.port(), 8443);
+        assert_eq!(ok("[tls]\nhttp_bind = \"0.0.0.0:8080\"").tls.http_bind.unwrap().port(), 8080);
+        assert_eq!(ok("[tls]\nhttp_bind = \"\"").tls.http_bind, None);
+        fails("[tls]\nhttps_bind = \"0.0.0.0\"", Some(2), "`https_bind` needs a port as well as an address: write \"0.0.0.0:443\"");
+        fails("[tls]\nhttp_bind = \"example.com:80\"", Some(2), "`http_bind` is not an address and port");
+        fails("[tls]\nhttps_bind = \"\"", Some(2), "needs a port");
+        fails("[tls]\nhttps_bind = 443", Some(2), "must be a string");
+    }
+
+    #[test]
+    fn tls_certificate_and_key_go_together() {
+        fails("[tls]\ncert = \"chain.pem\"", Some(2), "`cert` is set but `key` is not");
+        fails("[tls]\nkey = \"key.pem\"", Some(2), "`key` is set but `cert` is not");
+        // Even with TLS off: a half-written pair is a mistake worth hearing about.
+        fails("[tls]\nenabled = false\nkey = \"key.pem\"", Some(3), "`cert`");
+        assert!(Config::from_toml("[tls]\ncert = \"a\"\nkey = \"b\"").is_ok());
+        fails("[tls]\ncert = \"a\\tb\"\nkey = \"k\"", Some(2), "control character");
+        // A CA's settings mean nothing when files are given.
+        fails("[tls]\ncert = \"a\"\nkey = \"b\"\nemail = \"x@example.com\"", Some(4), "`email` has no effect");
+        fails("[tls]\ncert = \"a\"\nkey = \"b\"\nstaging = true", Some(4), "`staging` has no effect");
+        fails("[tls]\ncert = \"a\"\nkey = \"b\"\ndirectory = \"https://x.example/d\"", Some(4), "`directory` has no effect");
+    }
+
+    #[test]
+    fn tls_directory_choice() {
+        fails("[tls]\nstaging = true\ndirectory = \"https://x.example/d\"", Some(2), "both choose the certificate authority");
+        fails("[tls]\ndirectory = \"ftp://x.example/d\"", Some(2), "https:// address");
+        fails("[tls]\ndirectory = \"acme.example.com\"", Some(2), "https:// address");
+        fails("[tls]\ndirectory = \"http://acme.example.com/dir\"", Some(2), "only accepted for a certificate authority on this computer");
+        // Plain http is fine for a CA on this machine (a test CA, for instance).
+        for ok_dir in ["http://127.0.0.1:14000/dir", "http://localhost:14000/dir", "http://[::1]:14000/dir", "https://acme.example.com/directory"] {
+            assert_eq!(ok(&format!("[tls]\ndirectory = \"{ok_dir}\"")).tls.directory, ok_dir);
+        }
+    }
+
+    #[test]
+    fn tls_needs_names_and_distinct_addresses_once_enabled() {
+        fails("[tls]\nenabled = true", Some(2), "no names to get a certificate for");
+        fails("[relay]\nurls = [\"ws://abcdefghij.onion\"]\n[tls]\nenabled = true", Some(4), "no names");
+        // Files need no names.
+        assert!(Config::from_toml("[tls]\nenabled = true\ncert = \"a\"\nkey = \"b\"").is_ok());
+        let named = "[tls]\nenabled = true\ndomains = [\"relay.example.com\"]\n";
+        fails(&format!("[relay]\nbind = \"0.0.0.0:443\"\n{named}"), Some(2), "https_bind and [relay] bind are both 0.0.0.0:443");
+        fails(&format!("{named}http_bind = \"0.0.0.0:443\""), Some(4), "https_bind and [tls] http_bind are both");
+        fails(&format!("[relay]\nbind = \"0.0.0.0:80\"\n{named}"), Some(2), "http_bind and [relay] bind are both 0.0.0.0:80");
+        // A disabled section is not held to any of this.
+        assert!(Config::from_toml("[relay]\nbind = \"0.0.0.0:443\"\n[tls]\nenabled = false").is_ok());
+        assert!(Config::from_toml(&format!("[relay]\nbind = \"127.0.0.1:7777\"\n{named}")).is_ok());
+    }
+
+    #[test]
+    fn tls_unknown_names_get_hints() {
+        fails("[tls]\ndomain = [\"a.example.com\"]", Some(2), "did you mean `domains`?");
+        fails("[tls]\nenable = true", Some(2), "did you mean `enabled`?");
+        fails("[tls]\nstagging = true", Some(2), "did you mean `staging`?");
+        fails("[relay]\nhttps_bind = \"0.0.0.0:443\"", Some(2), "belongs in [tls]");
+        fails("[ssl]\n", Some(1), "unknown section [ssl]");
+        fails("[tls]\nenabled = \"true\"", Some(2), "remove the quotes");
     }
 
     #[test]
