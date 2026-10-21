@@ -51,7 +51,10 @@ pub enum Done {
     /// (hot numbers, or `COLD_BASE + n` for cold ones).
     LogCompacted { runs: Vec<ColdRun>, moves: Vec<(u64, u64)>, retire: Vec<u64> },
     LogRelinked { moves: Vec<(u64, u64)> },
-    Failed(String),
+    /// A flush failed: its memory runs stay, to be flushed again.
+    FlushFailed(String),
+    /// A compaction failed: its input segments stay.
+    CompactFailed(String),
     /// A log compaction or relink failed.
     LogFailed(String),
 }
@@ -80,14 +83,14 @@ pub fn worker(dir: PathBuf, rx: Receiver<Job>, tx: Sender<Done>, stop: Stop) {
                 let srcs = runs.iter().map(|r| Src::Mem { run: r, i: 0 }).collect();
                 match write(&dir, id, srcs, &dead, stop) {
                     Ok(seg) => Done::Flushed { seg, frozen, covered, replay_from },
-                    Err(e) => Done::Failed(format!("flush to segment {id}: {e}")),
+                    Err(e) => Done::FlushFailed(format!("flush to segment {id}: {e}")),
                 }
             }
             Job::Compact { id, segs, dead } => {
                 let srcs = segs.iter().map(|s| Src::Seg(s.range(&[], &[0xFF; 2]))).collect();
                 match write(&dir, id, srcs, &dead, stop) {
                     Ok(seg) => Done::Compacted { seg, replaced: segs.iter().map(|s| s.id).collect() },
-                    Err(e) => Done::Failed(format!("compaction into segment {id}: {e}")),
+                    Err(e) => Done::CompactFailed(format!("compaction into segment {id}: {e}")),
                 }
             }
             Job::LogCompact { hot, first_cold, seg_size, log_dir, dead, version, chunk } => match compact_log(&hot, first_cold, seg_size, &log_dir, &dead, &version, chunk, stop) {

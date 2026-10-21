@@ -112,6 +112,9 @@ pub struct LogWriter {
     buf_start: u64,
     /// Global segment indexes written since the last sync.
     touched: BTreeSet<u64>,
+    /// What an append that failed may have left on disk from the head on
+    /// (global offsets), still to be zeroed: see `abandon`.
+    junk: Option<(u64, u64)>,
 }
 
 /// Scans the frames of one segment from byte `o`, calling `f` for each good one.
@@ -259,6 +262,7 @@ impl LogWriter {
             buf: Vec::new(),
             buf_start: head,
             touched: BTreeSet::new(),
+            junk: None,
         })
     }
 
@@ -298,6 +302,9 @@ impl LogWriter {
     /// Queues a frame; returns its global offset. Nothing is on disk until
     /// [`flush`](Self::flush) and [`sync`](Self::sync).
     pub fn append(&mut self, seq: u64, record: &[u8]) -> io::Result<u64> {
+        if self.junk.is_some() {
+            self.clear_junk()?;
+        }
         let frame = FRAME_HEADER + record.len();
         assert!(record.len() <= MAX_RECORD && frame as u64 <= self.seg_size, "record too large for a segment");
         if self.head % self.seg_size + frame as u64 > self.seg_size {
@@ -334,6 +341,49 @@ impl LogWriter {
         self.touched.insert(si);
         self.buf.clear();
         self.buf_start = self.head;
+        Ok(())
+    }
+
+    /// Forgets the frames queued or written from `start` on by an append that
+    /// failed: the next frame goes to `start` again, under the same seq. What
+    /// the failed append put on disk is zeroed first (now if it can be, else
+    /// before the next append), and synced with the next frames: a restart
+    /// must never replay a frame whose seq was given out again, which would
+    /// point one event's index entries at another's record.
+    pub fn abandon(&mut self, start: u64) {
+        let end = self.head.max(self.junk.map_or(0, |j| j.1));
+        let from = self.junk.map_or(start, |j| j.0.min(start));
+        self.buf.clear();
+        self.head = start;
+        self.buf_start = start;
+        if end > from {
+            self.junk = Some((from, end));
+            let _ = self.clear_junk();
+        }
+    }
+
+    /// Zeroes `junk` from its end back: if that is cut short, what is left is
+    /// still a run of frames straight after the head, which a restart may
+    /// replay as a prefix of the failed batch. Zeroed from the front instead,
+    /// a restart could find frames past a gap, under seqs never given out.
+    fn clear_junk(&mut self) -> io::Result<()> {
+        static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+        while let Some((from, end)) = self.junk {
+            if from >= end {
+                self.junk = None;
+                break;
+            }
+            let si = (end - 1) / self.seg_size;
+            let start = from.max(si * self.seg_size).max(end.saturating_sub(ZEROS.len() as u64));
+            if let Some(seg) = self.file(si).cloned() {
+                let o = start % self.seg_size;
+                if !seg.punch_hole(o, o + (end - start)) {
+                    seg.write_at(o, &ZEROS[..(end - start) as usize])?;
+                }
+                self.touched.insert(si);
+            }
+            self.junk = Some((from, start));
+        }
         Ok(())
     }
 

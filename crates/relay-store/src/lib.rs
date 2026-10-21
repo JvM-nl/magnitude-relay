@@ -36,6 +36,9 @@ pub mod segment;
 pub mod version;
 pub mod writer;
 
+#[cfg(test)]
+mod fault_tests;
+
 pub use version::{Hit, Matching, Plan, Version};
 pub use writer::{Outcome, Staged, SyncTicket, Writer};
 

@@ -555,14 +555,23 @@ impl Writer {
     /// Writes a batch's new records to the log (not yet synced).
     fn append(&mut self, b: Batch) -> io::Result<Staged> {
         let base_count = self.next_seq;
+        let start = self.log.head();
         let mut offs = Vec::with_capacity(b.new.len());
-        for (i, rec) in b.new.iter().enumerate() {
-            offs.push(self.log.append(base_count + i as u64, rec)?);
-        }
-        self.log.flush()?;
-        crash_point!("writer.appended");
-        for (i, &off) in offs.iter().enumerate() {
-            self.locs.set(base_count + i as u64, off)?;
+        let written = (|| {
+            for (i, rec) in b.new.iter().enumerate() {
+                offs.push(self.log.append(base_count + i as u64, rec)?);
+            }
+            self.log.flush()?;
+            crash_point!("writer.appended");
+            for (i, &off) in offs.iter().enumerate() {
+                self.locs.set(base_count + i as u64, off)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = written {
+            // Nothing of the batch happened: its seqs and log space go to the next.
+            self.log.abandon(start);
+            return Err(e);
         }
         self.next_seq += b.new.len() as u64;
         Ok(Staged { b, offs, base_count })
@@ -584,14 +593,22 @@ impl Writer {
         }
         self.epoch += 1;
         let mut zero = Vec::with_capacity(b.kills.len());
+        let mut later = Vec::new();
         for &seq in &b.kills {
             let off = if seq >= base_count { offs[(seq - base_count) as usize] } else { locs::get(&b.base.locs, seq) };
-            self.log.mark_dead(off)?;
+            // A kill whose flag cannot be written (a failing disk) happens all
+            // the same: a restart re-derives a rule's kill from the log, and the
+            // next checkpoint records any kill. Its bytes stay until then.
+            let flagged = self.log.mark_dead(off).is_ok();
             if seq >= self.covered && keys::rule_bearing(b.record(seq), &self.vanish) {
-                zero.push(off | SCRUB);
-                self.zero_when_covered.push((seq, off, std::time::Instant::now()));
-            } else {
+                if flagged {
+                    zero.push(off | SCRUB);
+                }
+                later.push((seq, off, std::time::Instant::now()));
+            } else if flagged {
                 zero.push(off);
+            } else {
+                later.push((seq, off, std::time::Instant::now()));
             }
         }
         crash_point!("writer.marked_dead");
@@ -614,9 +631,14 @@ impl Writer {
         }
         drop(self.publish());
         crash_point!("writer.published");
+        self.zero_when_covered.extend(later);
         self.defer_zero(zero);
-        self.reclaim()?;
-        self.maybe_flush()?;
+        // The batch is published and owes only its sync: housekeeping that
+        // fails now (a full disk) must not make it look failed. It is tried
+        // again after the next batch.
+        if let Err(e) = self.reclaim().and_then(|()| self.maybe_flush()) {
+            eprintln!("store: after a write: {e}");
+        }
         lap(3, &mut t);
         Ok(self.ticket(files))
     }
@@ -1104,10 +1126,16 @@ impl Writer {
                 self.write_checkpoint()?;
                 crash_point!("relink.checkpointed");
             }
-            Done::Failed(msg) => {
+            // Each failure resets only its own job's state: a flush and a
+            // compaction can be in flight together, and a flush wrongly taken
+            // for done is drained from the memory runs twice.
+            Done::FlushFailed(msg) => {
                 eprintln!("store: background job failed: {msg}");
                 self.flushing = false;
                 self.frozen = 0;
+            }
+            Done::CompactFailed(msg) => {
+                eprintln!("store: background job failed: {msg}");
                 self.compacting = false;
             }
             Done::LogFailed(msg) => {
@@ -1230,13 +1258,14 @@ impl Writer {
             if w.strong_count() > 0 || *epoch > synced {
                 break;
             }
-            let (_, _, offs, _) = self.pending_zero.pop_front().unwrap();
-            for off in offs {
+            let (gen, w, offs, epoch) = self.pending_zero.pop_front().unwrap();
+            for (i, &off) in offs.iter().enumerate() {
                 crash_point!("reclaim.zeroing");
-                if off & SCRUB != 0 {
-                    self.log.scrub_content(off & !SCRUB)?;
-                } else {
-                    self.log.zero_record(off)?;
+                let r = if off & SCRUB != 0 { self.log.scrub_content(off & !SCRUB) } else { self.log.zero_record(off) };
+                if let Err(e) = r {
+                    // The rest waits for the next call.
+                    self.pending_zero.push_front((gen, w, offs[i..].to_vec(), epoch));
+                    return Err(e);
                 }
             }
         }
@@ -1401,5 +1430,45 @@ fn vanish_kills(b: &mut Batch, pk: &[u8; 32], upto: u64) {
     }
     for s in kills {
         b.kill(s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fault_tests::{ev, id_of, opts, tmpdir, write};
+    use crate::Store;
+
+    /// Found by the adversarial suite's disk-fault torture: a failed index
+    /// compaction also reset the state of a flush in flight. A second flush
+    /// then started over the same memory runs, and when the two came back the
+    /// first drained runs the second had also written (keys indexed twice),
+    /// and the second drained runs that were no longer there: a panic in the
+    /// writer.
+    #[test]
+    fn a_failed_compaction_leaves_a_flush_in_flight_alone() {
+        let dir = tmpdir("compact-fails");
+        let (store, mut w) = Store::open(&dir, opts()).unwrap();
+        write(&mut w, &[ev(1, 1, 10)]).unwrap();
+        w.start_flush().unwrap();
+        // Word of a compaction that failed arrives while the flush runs.
+        w.compacting = true;
+        w.finish_job(Done::CompactFailed("compaction into segment 9: no space".into())).unwrap();
+        assert!(w.flushing && !w.compacting);
+        write(&mut w, &[ev(2, 1, 10)]).unwrap();
+        write(&mut w, &[ev(3, 1, 10)]).unwrap();
+        w.flush_all().unwrap();
+        w.flush_all().unwrap();
+        write(&mut w, &[ev(4, 1, 10)]).unwrap();
+        w.flush_all().unwrap();
+        let v = store.snapshot();
+        for n in 1..=4 {
+            assert!(v.lookup_id(&id_of(n)).is_some(), "event {n} is not in the index");
+        }
+        let f = relay_proto::Filter::parse(&mut relay_proto::json::Scanner::new(r#"{"kinds":[1]}"#)).unwrap();
+        assert_eq!(v.query(&f, 100, 10_000).len(), 4, "each event once");
+        drop(v);
+        drop((store, w));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

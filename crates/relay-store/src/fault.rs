@@ -69,6 +69,12 @@ pub fn fail_writes(dir: &Path, budget: u64) {
     b.push((dir.to_path_buf(), budget));
 }
 
+/// What is left of the budget on `dir`, if it has one: with a large budget,
+/// measures what an operation writes.
+pub fn remaining(dir: &Path) -> Option<u64> {
+    budgets().lock().unwrap().iter().find(|(d, _)| d == dir).map(|b| b.1)
+}
+
 /// Lifts the budget on `dir`: the disk has room again.
 pub fn clear(dir: &Path) {
     budgets().lock().unwrap().retain(|(d, _)| d != dir);
