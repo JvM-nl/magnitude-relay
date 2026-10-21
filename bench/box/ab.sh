@@ -5,7 +5,8 @@
 # suite.sh does. Per workload: ops/s from relay-bench, and the relay's CPU time
 # (user + system) for that workload, which a noisy box disturbs far less than
 # throughput. Workloads (default all): ingest dup classic vector count neg fanout.
-# ingest always runs: the others read what it loads.
+# ingest always runs: the others read what it loads. DATA=<file.jsonl> uses
+# that dataset instead of d1m (a `relay-bench gen` file, the workloads need its shape).
 set -uo pipefail
 export RELAY_CPUS=${RELAY_CPUS:-0,1,4,5}
 export LOADGEN_CPUS=${LOADGEN_CPUS:-2,3}
@@ -15,7 +16,8 @@ a=${1:?binary a} b=${2:?binary b}
 rounds=${3:-2}
 shift 3 2>/dev/null || shift $#
 want=" ${*:-ingest dup classic vector count neg fanout} "
-data=$BENCH_ROOT/data/d1m.jsonl
+data=${DATA:-$BENCH_ROOT/data/d1m.jsonl}
+assert_in_bench "$data"
 url=ws://127.0.0.1:$PORT_OURS
 hz=$(getconf CLK_TCK)
 cpu() { awk '{print $14 + $15}' /proc/"$1"/stat; }
