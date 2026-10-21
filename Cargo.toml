@@ -8,6 +8,9 @@ members = [
     "crates/relay-server",
     "crates/relay-bench",
 ]
+# The adversarial suite is its own workspace: it builds the store with fault
+# injection, which must never be unified into a release build of the relay.
+exclude = ["adversarial"]
 
 [workspace.package]
 version = "0.1.0"
