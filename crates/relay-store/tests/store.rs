@@ -506,6 +506,44 @@ fn a_kill_during_an_interrupted_log_compaction_survives() {
     assert_eq!(v.lookup_id(&id), None);
 }
 
+/// Found by the adversarial suite's crash torture (checking every live
+/// record's frame): an operator's removal flagged its victims' frames dead at
+/// once, but a restart reads flags only in the log tail. A crash before the
+/// removal's checkpoint brought older victims back live with dead frames, and
+/// the next log compaction, which skips frames flagged dead, dropped their
+/// bytes: reading them then panicked.
+#[test]
+fn an_interrupted_removal_leaves_no_live_event_with_a_dead_frame() {
+    let dir = tmpdir("removal-crash");
+    let (store, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+    let recs: Vec<Vec<u8>> = (0..200).map(|n| ev(n, 1, 1000 + n, 1, "[]", &"x".repeat(900))).collect();
+    for c in recs.chunks(10) {
+        write(&mut w, c);
+    }
+    // Everything indexed and checkpointed: the victim is older than the tail.
+    w.flush_all().unwrap();
+    let victim = store.snapshot().lookup_id(&id_of(0)).unwrap();
+    assert_eq!(w.kill_live(&[victim]).unwrap(), 1);
+    // The crash, before the removal's checkpoint.
+    w.close();
+    drop(store);
+    let (store, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+    // The kill was never made durable: the event is back, whole...
+    assert_eq!(store.snapshot().record(victim).map(|r| *r.id()), Some(id_of(0)));
+    // ...and stays so through a log compaction of its segment.
+    w.compact_log_hot().unwrap();
+    assert!(w.cold_runs() > 0);
+    assert_eq!(store.snapshot().record(victim).map(|r| *r.id()), Some(id_of(0)));
+    // Removed for good once checkpointed, whatever comes after.
+    assert_eq!(w.kill_live(&[victim]).unwrap(), 1);
+    w.write_checkpoint().unwrap();
+    w.close();
+    drop(store);
+    let (store, _w) = Store::open(&dir, log_opts(0)).unwrap();
+    assert_eq!(store.snapshot().lookup_id(&id_of(0)), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A log whose last frame filled its segment exactly, reopened: the first
 /// append goes to the start of a segment that does not exist yet.
 #[test]

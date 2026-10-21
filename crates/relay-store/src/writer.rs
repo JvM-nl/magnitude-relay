@@ -121,7 +121,8 @@ pub const DELETE_BATCH: usize = 4096;
 const SCRUB: u64 = 1 << 63;
 
 /// How long a killed record the last checkpoint does not cover may keep its
-/// bytes before a flush is started to cover it (see `zero_when_covered`).
+/// bytes before a checkpoint (or a flush) is started to cover it (see
+/// `zero_when_covered`).
 const ZERO_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A segment tier: segments within a factor of 4 in size share a level, and a
@@ -179,14 +180,23 @@ pub struct Writer {
     /// files the backup lacks) until the backup ends.
     backup_hold: bool,
     held_done: Vec<Done>,
-    /// Killed rule-bearing records (replaceable, addressable, deletions,
-    /// vanish requests) that the last checkpoint does not cover: (seq, offset,
-    /// when). After a crash before the next flush, the replayed log rebuilds
-    /// what they decided (the slot a replacement took from an older event, a
-    /// deletion's tombstones, a vanish) from their bytes. So their content is
-    /// scrubbed as soon as no reader can see them (see `SCRUB`), and the rest
-    /// zeroed only once that flush is done; a flush is started for them after
-    /// `ZERO_WAIT`. Other records decide nothing and are zeroed whole at once.
+    /// Killed records whose bytes must stay until a checkpoint covers them:
+    /// (seq, offset, when). Released once a checkpoint is written with `seq`
+    /// below its `covered`; one is forced after `ZERO_WAIT`.
+    ///
+    /// - Rule-bearing records (replaceable, addressable, deletions, vanish
+    ///   requests) in the log tail: after a crash before the next flush, the
+    ///   replayed log rebuilds what they decided (the slot a replacement took
+    ///   from an older event, a deletion's tombstones, a vanish) from their
+    ///   bytes. Their content is scrubbed as soon as no reader can see them
+    ///   (see `SCRUB`).
+    /// - Operator kills of records older than the tail: nothing replays their
+    ///   frames' dead flags, so until a checkpoint records the kill a crash
+    ///   brings them back. They are not flagged either: a live record with a
+    ///   dead flag would be dropped by the next log compaction.
+    /// - Kills whose dead flag could not be written.
+    ///
+    /// Other records are flagged dead and zeroed whole at once.
     zero_when_covered: Vec<(u64, u64, std::time::Instant)>,
     scratch: Vec<u8>,
 }
@@ -204,6 +214,8 @@ struct Batch {
     new: Vec<Vec<u8>>,
     kills: Vec<u64>,
     killed: HashSet<u64>,
+    /// An operator's removal: its kills are durable only once checkpointed.
+    operator: bool,
 }
 
 impl Batch {
@@ -216,6 +228,7 @@ impl Batch {
             new: Vec::new(),
             kills: Vec::new(),
             killed: HashSet::new(),
+            operator: false,
         }
     }
 
@@ -599,7 +612,7 @@ impl Writer {
             // A kill whose flag cannot be written (a failing disk) happens all
             // the same: a restart re-derives a rule's kill from the log, and the
             // next checkpoint records any kill. Its bytes stay until then.
-            let flagged = self.log.mark_dead(off).is_ok();
+            let flagged = !(b.operator && seq < self.covered) && self.log.mark_dead(off).is_ok();
             if seq >= self.covered && keys::rule_bearing(b.record(seq), &self.vanish) {
                 if flagged {
                     zero.push(off | SCRUB);
@@ -660,12 +673,18 @@ impl Writer {
         Ok(())
     }
 
-    /// Kills seqs outside of a client batch (repair, expiry sweeps).
+    /// Kills seqs outside of a client batch (repair, expiry sweeps: a restart
+    /// re-derives these).
     pub(crate) fn kill_seqs(&mut self, seqs: &[u64]) -> io::Result<()> {
+        self.kill_seqs_as(seqs, false)
+    }
+
+    fn kill_seqs_as(&mut self, seqs: &[u64], operator: bool) -> io::Result<()> {
         if seqs.is_empty() {
             return Ok(());
         }
         let mut b = Batch::new(self.current());
+        b.operator = operator;
         for &s in seqs {
             b.kill(s);
         }
@@ -675,15 +694,17 @@ impl Writer {
     }
 
     /// Kills whichever of `seqs` are still live, in one commit. Returns how many were.
-    /// The kills reach disk as dead flags in the log but not yet in a checkpoint:
-    /// call [`write_checkpoint`](Self::write_checkpoint) once the last batch is in.
+    /// The kills are not durable until a checkpoint records them (only kills in
+    /// the log tail reach disk before, as dead flags): call
+    /// [`write_checkpoint`](Self::write_checkpoint) once the last batch is in.
+    /// Until then their bytes stay, so a crash brings them back whole.
     pub fn kill_live(&mut self, seqs: &[u64]) -> io::Result<usize> {
         let v = self.current();
         let mut live: Vec<u64> = seqs.iter().copied().filter(|&s| v.is_live(s)).collect();
         drop(v);
         live.sort_unstable();
         live.dedup();
-        self.kill_seqs(&live)?;
+        self.kill_seqs_as(&live, true)?;
         Ok(live.len())
     }
 
@@ -819,9 +840,15 @@ impl Writer {
         while let Ok(d) = self.done.try_recv() {
             self.finish_job(d)?;
         }
-        // Deleted bytes waiting for a flush do not wait for long.
-        if !self.flushing && self.zero_when_covered.first().is_some_and(|z| z.2.elapsed() >= ZERO_WAIT) {
-            self.start_flush()?;
+        // Deleted bytes waiting for a checkpoint do not wait for long.
+        if let Some(&(seq, _, at)) = self.zero_when_covered.first() {
+            if at.elapsed() >= ZERO_WAIT {
+                if seq < self.covered {
+                    self.write_checkpoint()?;
+                } else if !self.flushing {
+                    self.start_flush()?;
+                }
+            }
         }
         self.reclaim()?;
         self.step_log_compaction();
@@ -1045,11 +1072,8 @@ impl Writer {
                 self.covered = covered;
                 self.replay_from = replay_from;
                 drop(self.publish());
+                // Also releases the killed records now below `covered`.
                 self.write_checkpoint()?;
-                // Killed records now below `covered` are no longer needed for a replay.
-                let (ready, wait): (Vec<_>, Vec<_>) = self.zero_when_covered.drain(..).partition(|z| z.0 < covered);
-                self.zero_when_covered = wait;
-                self.defer_zero(ready.into_iter().map(|z| z.1).collect());
                 self.maybe_compact();
                 self.maybe_flush()?;
             }
@@ -1221,7 +1245,15 @@ impl Writer {
                 intent_cold: self.intent.0.clone(),
                 intent_retire: self.intent.1.clone(),
             },
-        )
+        )?;
+        // Killed records it now covers may lose their bytes.
+        if !self.zero_when_covered.is_empty() {
+            let covered = self.covered;
+            let (ready, wait): (Vec<_>, Vec<_>) = self.zero_when_covered.drain(..).partition(|z| z.0 < covered);
+            self.zero_when_covered = wait;
+            self.defer_zero(ready.into_iter().map(|z| z.1).collect());
+        }
+        Ok(())
     }
 
     fn publish(&mut self) -> Arc<Version> {
