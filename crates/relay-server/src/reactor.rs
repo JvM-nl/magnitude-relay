@@ -273,7 +273,10 @@ pub fn listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
 /// a socket, is refused.
 pub fn unix_listener(path: &std::path::Path, mode: u32) -> io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    crate::admin::check_len(path)?;
+    // sun_path: 104 bytes with the NUL on macOS, 108 on Linux.
+    if path.as_os_str().len() > 103 {
+        return Err(io::Error::other("the path is too long for a Unix socket (at most 103 bytes): choose a shorter unix_socket"));
+    }
     match std::fs::symlink_metadata(path) {
         Ok(m) if !m.file_type().is_socket() => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a file that is not a socket is in the way")),
         Ok(_) => match std::os::unix::net::UnixStream::connect(path) {
@@ -288,6 +291,10 @@ pub fn unix_listener(path: &std::path::Path, mode: u32) -> io::Result<std::os::u
     Ok(l)
 }
 
+/// Send and receive buffer asked for on each Unix connection (see
+/// `relay_net::conn::unix_buffers`).
+const UNIX_BUFFER: usize = 2 << 20;
+
 /// [`accept_loop`] for the Unix socket. Its connections have no address: the
 /// web server in front names the client in `real_ip_header`, and without that
 /// they count as 127.0.0.1, like any local connection.
@@ -297,6 +304,7 @@ pub fn accept_loop_unix(l: std::os::unix::net::UnixListener, conns: Vec<mpsc::Un
     loop {
         match l.accept() {
             Ok((s, _)) => {
+                relay_net::conn::unix_buffers(std::os::fd::AsRawFd::as_raw_fd(&s), UNIX_BUFFER);
                 if s.set_nonblocking(true).is_ok() {
                     let _ = conns[next % conns.len()].send((Stream::Unix(s), local, None));
                     next = next.wrapping_add(1);

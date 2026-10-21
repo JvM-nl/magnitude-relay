@@ -13,6 +13,8 @@ tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [dependencies]
 tokio.workspace = true
+# setsockopt for Unix sockets' buffers (unix_buffers in conn.rs).
+libc.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }

@@ -9,7 +9,8 @@
 //! [`connector`] opens a client connection by URL, `wss://` included when the `tls`
 //! feature brings in rustls (the relay uses it to sync from other relays).
 //!
-//! The only other dependency is `tokio`, and only [`conn`] uses it; SHA-1 and base64 are
+//! The only other dependencies are `tokio`, which only [`conn`] uses, and `libc` for
+//! one socket option ([`conn::unix_buffers`]); SHA-1 and base64 are
 //! in-house because the handshake needs nothing more than a correct hash of 60
 //! bytes per connection. DEFLATE ([`deflate`]) is in-house too, for the
 //! permessage-deflate extension ([`ws::pmd`]): a decoder and a speed-first encoder

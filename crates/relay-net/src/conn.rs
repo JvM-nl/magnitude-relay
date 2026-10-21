@@ -265,6 +265,21 @@ impl ClientDeflate {
     }
 }
 
+/// Asks for `bytes` of send and receive buffer on a Unix stream socket (the
+/// kernel caps it). macOS gives one 8 KB (Linux about 200 KB), so a large answer
+/// would otherwise cross 8 KB per wakeup: slower than loopback TCP, whose buffers
+/// grow on their own. Best effort: a refusal leaves the default.
+#[cfg(unix)]
+pub fn unix_buffers(fd: std::os::fd::RawFd, bytes: usize) {
+    let n = bytes.min(i32::MAX as usize) as libc::c_int;
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: a valid descriptor and a c_int option value of the right size.
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&n as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        }
+    }
+}
+
 /// Connects to `addr` and performs the client handshake. `host` is the `Host`
 /// header value and `path` the request target (`"/"`, `"/nostr"`).
 pub async fn client_connect(addr: impl ToSocketAddrs, host: &str, path: &str) -> io::Result<ClientConn<TcpStream>> {

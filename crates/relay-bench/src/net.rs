@@ -120,7 +120,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub async fn connect(t: &Target, src: Option<IpAddr>) -> io::Result<Conn> {
     let attempt = async {
         if let Some(path) = &t.unix {
-            return client_handshake(Stream::Unix(UnixStream::connect(path).await?), &t.host, &t.path).await;
+            let s = UnixStream::connect(path).await?;
+            relay_net::conn::unix_buffers(std::os::fd::AsRawFd::as_raw_fd(&s), 2 << 20);
+            return client_handshake(Stream::Unix(s), &t.host, &t.path).await;
         }
         let sock = if t.addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
         if let (Some(ip), true) = (src, t.addr.is_ipv4() && t.addr.ip().is_loopback()) {
