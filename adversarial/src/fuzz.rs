@@ -279,3 +279,49 @@ pub fn minimize(t: &Target, input: &[u8], slow: Duration) -> Vec<u8> {
     }
     cur
 }
+
+/// One input under libFuzzer (`adversarial/fuzz`, on the box): the target's
+/// own checks, and its memory budget (a breach panics, which libFuzzer
+/// reports as a crash with the input). Hangs are libFuzzer's `-timeout`.
+/// The binary must install [`alloc::Counting`] as its global allocator.
+pub fn libfuzzer_one(name: &str, data: &[u8]) {
+    static TARGETS: OnceLock<HashMap<&'static str, Target>> = OnceLock::new();
+    let t = &TARGETS.get_or_init(|| crate::targets::all().into_iter().map(|t| (t.name, t)).collect())[name];
+    if data.len() > t.max_len {
+        return;
+    }
+    let base = alloc::live();
+    alloc::reset();
+    (t.run)(data);
+    let peak = alloc::peak_since(base);
+    let cap = (t.mem_cap)(data.len());
+    assert!(peak <= cap, "peak heap {peak} bytes (largest allocation {}) for a {}-byte input; budget {cap}", alloc::largest(), data.len());
+}
+
+/// Writes every target's seeds (`DIR/NAME/seed-N`) and dictionary
+/// (`DIR/NAME.dict`, libFuzzer's format), to start libFuzzer from.
+pub fn export_seeds(dir: &Path) -> std::io::Result<usize> {
+    let mut n = 0;
+    for t in crate::targets::all() {
+        let d = dir.join(t.name);
+        std::fs::create_dir_all(&d)?;
+        for (i, s) in (t.seeds)().into_iter().enumerate() {
+            std::fs::write(d.join(format!("seed-{i}")), s)?;
+            n += 1;
+        }
+        let mut dict = String::new();
+        for tok in t.dict {
+            dict.push('"');
+            for &b in *tok {
+                if b == b'"' || b == b'\\' || !(0x20..0x7f).contains(&b) {
+                    dict.push_str(&format!("\\x{b:02x}"));
+                } else {
+                    dict.push(b as char);
+                }
+            }
+            dict.push_str("\"\n");
+        }
+        std::fs::write(dir.join(format!("{}.dict", t.name)), dict)?;
+    }
+    Ok(n)
+}

@@ -12,16 +12,20 @@ use relay_store::{Store, Writer};
 /// which `check_state` then checks).
 pub fn adopt(m: &mut Model, store: &Store, maybe: &[u64]) {
     let v = store.snapshot();
+    let mut revived = Vec::new();
     for &seq in maybe {
         if (seq as usize) < m.slots.len() {
             let live = v.is_live(seq);
             if live && !m.slots[seq as usize].alive {
                 m.revive_seq(seq);
+                revived.push(seq);
             } else if !live && m.slots[seq as usize].alive {
                 m.kill_seq(seq);
             }
         }
     }
+    // What came back is then subject to every rule of what was stored since.
+    m.settle_revived(&revived);
 }
 
 /// Every seq dead or alive exactly as the model says, every live record byte
@@ -93,6 +97,54 @@ pub fn check_state(m: &Model, store: &Store, w: &Writer) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("{} mismatches: {}", errs.len(), errs.join("; ")))
+    }
+}
+
+/// Every live record's frame on disk too: not flagged dead, checksum intact.
+/// A live record whose frame says otherwise is served now but lost at the next
+/// log compaction (the copy skips it) or crash (replay kills it).
+pub fn check_frames(m: &Model, dir: &std::path::Path, seg_size: u64) -> Result<(), String> {
+    use relay_store::log::{cold_path, hot_path, COLD_BASE, FLAG_DEAD, FRAME_HEADER};
+    use std::os::unix::fs::FileExt;
+    let locs = std::fs::File::open(dir.join("locs")).map_err(|e| format!("locs: {e}"))?;
+    let mut files: std::collections::HashMap<u64, std::fs::File> = std::collections::HashMap::new();
+    let mut errs = Vec::new();
+    for s in m.live_seqs() {
+        let mut b = [0u8; 8];
+        locs.read_exact_at(&mut b, s.seq * 8).map_err(|e| format!("locs of seq {}: {e}", s.seq))?;
+        let off = u64::from_le_bytes(b);
+        let idx = off / seg_size;
+        if let std::collections::hash_map::Entry::Vacant(e) = files.entry(idx) {
+            let path = if idx >= COLD_BASE { cold_path(&dir.join("log"), idx - COLD_BASE) } else { hot_path(&dir.join("log"), idx) };
+            e.insert(std::fs::File::open(&path).map_err(|e| format!("seq {}: {}: {e}", s.seq, path.display()))?);
+        }
+        let f = &files[&idx];
+        let mut h = [0u8; FRAME_HEADER];
+        f.read_exact_at(&mut h, off % seg_size).map_err(|e| format!("frame of seq {}: {e}", s.seq))?;
+        let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+        let flags = u32::from_le_bytes(h[4..8].try_into().unwrap());
+        let seq = u64::from_le_bytes(h[8..16].try_into().unwrap());
+        let crc = u32::from_le_bytes(h[16..20].try_into().unwrap());
+        let mut rec = vec![0u8; len.min(1 << 20)];
+        f.read_exact_at(&mut rec, off % seg_size + FRAME_HEADER as u64).map_err(|e| format!("record of seq {}: {e}", s.seq))?;
+        let what = if seq != s.seq {
+            format!("holds seq {seq}")
+        } else if flags & FLAG_DEAD != 0 {
+            "is flagged dead".to_string()
+        } else if relay_store::crc32c::crc32c(&rec) != crc {
+            "fails its checksum".to_string()
+        } else {
+            continue;
+        };
+        errs.push(format!("live seq {} (n{} kind {}): its frame at {off} {what}", s.seq, s.ev.n, s.ev.kind));
+        if errs.len() > 8 {
+            break;
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} frames: {}", errs.len(), errs.join("; ")))
     }
 }
 

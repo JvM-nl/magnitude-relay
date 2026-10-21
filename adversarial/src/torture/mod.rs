@@ -8,11 +8,19 @@
 //! - nothing deleted, replaced, vanished, expired or removed comes back, and
 //!   the dead set matches the model exactly;
 //! - the operation in flight landed as some prefix of itself (an operator
-//!   removal: any subset of its targets, each intact if alive);
+//!   removal: any subset of its targets, each intact if alive, and what came
+//!   back then subject to the rules of everything stored since);
+//! - every live record's frame on disk is intact and not flagged dead (else
+//!   the next log compaction drops it);
 //! - queries, COUNT, the operator walk and NIP-77 sets match brute force.
 //!
-//! Write faults (a full disk) and on-disk corruption are separate modes on the
-//! same machinery (see `faults.rs`).
+//! With `--faults`, half the children also run on a disk that fills up (see
+//! `child::Faults`): a failed operation is reported and the child carries on,
+//! as the relay does, saying what the store then holds. The parent keeps one
+//! model per outcome the failure may have had, prunes them with what follows,
+//! and after the kill also allows what a crash may make of a failure (a
+//! failed batch's frames still at the end of the log, an unacknowledged
+//! removal undone).
 
 pub mod child;
 pub mod model;
@@ -38,6 +46,7 @@ pub const CRASH_POINTS: &[&str] = &[
     "writer.published",
     "ticket.synced",
     "writer.killed",
+    "writer.flagged",
     "reclaim.zeroing",
     "log.flushing",
     "log.zeroing",
@@ -81,6 +90,11 @@ pub struct Cfg {
     pub epoch_ops: u64,
     /// Queries per verification.
     pub queries: usize,
+    /// Half the children run with a disk that fills up (see `child::Faults`).
+    pub faults: bool,
+    /// Kills at crash points are power cuts: writes not yet synced may be
+    /// lost, page by page (see relay-store's `fault.rs`).
+    pub power: bool,
     pub verbose: bool,
 }
 
@@ -98,6 +112,15 @@ pub struct Stats {
     pub landed: (u64, u64, u64),
     pub queries_checked: u64,
     pub max_events: u64,
+    /// Children run with write faults, operations that failed, and children
+    /// that could not open on a full disk.
+    pub fault_children: u64,
+    pub ops_failed: u64,
+    pub opens_refused: u64,
+    /// Children whose crash point was a power cut.
+    pub power_cuts: u64,
+    /// Failed operations by what the store held afterwards: (nothing, part, all).
+    pub failed_landed: (u64, u64, u64),
 }
 
 /// The files of a store and its checkpoint, for failure reports.
@@ -126,21 +149,41 @@ pub fn describe_dir(dir: &Path) -> String {
     format!("files [{}]; checkpoint {ck}", files.join(", "))
 }
 
+/// A copy of a store directory (copy-on-write where the filesystem has it:
+/// `locs` is large and sparse).
+fn keep_copy(dir: &Path, to: &Path) {
+    let _ = std::fs::remove_dir_all(to);
+    let flags: &[&str] = if cfg!(target_os = "macos") { &["-cR"] } else { &["-R", "--reflink=auto", "--sparse=always"] };
+    let _ = Command::new("cp").args(flags).arg(dir).arg(to).status();
+}
+
+fn panic_text(p: &Box<dyn std::any::Any + Send>) -> String {
+    p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
+}
+
 /// A child's run, as its stdout told it.
 struct Run {
     lines: Vec<String>,
 }
 
-fn spawn_child(dir: &Path, seed: u64, start: u64, shape: &Shape, crash: Option<(String, u64)>, readers: bool, log: &Path) -> std::io::Result<(std::process::Child, mpsc::Receiver<String>)> {
+#[allow(clippy::too_many_arguments)]
+fn spawn_child(dir: &Path, seed: u64, start: u64, shape: &Shape, crash: Option<(String, u64)>, power: Option<u64>, faults: Option<child::Faults>, readers: bool, log: &Path) -> std::io::Result<(std::process::Child, mpsc::Receiver<String>)> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("torture-child").arg("--dir").arg(dir).arg("--seed").arg(seed.to_string()).arg("--start").arg(start.to_string()).arg("--shape").arg(shape.encode());
     if readers {
         cmd.arg("--readers");
     }
+    if let Some(f) = faults {
+        cmd.arg("--faults").arg(f.encode());
+    }
     cmd.env_remove("RELAY_CRASH_AT");
     if let Some((p, n)) = &crash {
         cmd.env("RELAY_CRASH_AT", format!("{p}:{n}")).env("RELAY_CRASH_LOG", log);
+    }
+    cmd.env_remove("RELAY_POWER_CUT");
+    if let Some(seed) = power {
+        cmd.env("RELAY_POWER_CUT", seed.to_string());
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
     let mut child = cmd.spawn()?;
@@ -176,6 +219,7 @@ fn shape_for(rng: &mut Rng) -> Shape {
 }
 
 /// Where an admin delete stands in the model while its steps are acknowledged.
+#[derive(Clone)]
 struct AdminRun {
     targets: Vec<u64>,
     /// Steps fully applied (kill chunk then client batch).
@@ -207,6 +251,14 @@ fn steps_of(run: &AdminRun, between: &[Vec<work::Ev>]) -> usize {
 
 fn parse_tokens(t: &str) -> Result<Vec<Out>, String> {
     t.split_whitespace().map(|x| Out::parse(x).ok_or(format!("bad token {x:?}"))).collect()
+}
+
+/// An operation in full: each event of a batch as kind and id prefix.
+pub fn describe_op(op: &Op) -> String {
+    match op {
+        Op::Batch(v) => format!("batch: {}", v.iter().map(|e| format!("n{} kind {}", e.n, e.kind)).collect::<Vec<_>>().join(", ")),
+        other => op_name(other),
+    }
 }
 
 fn op_name(op: &Op) -> String {
@@ -278,6 +330,124 @@ fn candidates(base: &Model, op: &Op, admin: Option<&AdminRun>) -> Vec<(String, M
     out
 }
 
+/// One state the store may be in, as far as the child's lines tell. Without
+/// write faults there is always exactly one; a failed operation forks one per
+/// outcome it may have had, and the next lines prune them.
+#[derive(Clone)]
+struct World {
+    label: String,
+    m: Model,
+    admin: Option<AdminRun>,
+    admin_op: Option<u64>,
+    /// Failed batches whose frames may still lie at the end of the log, with
+    /// the model's next seq when each failed: while nothing has been stored
+    /// since, a restart may find a prefix of one of them there (as for a
+    /// crash). Which one: the last whose frames got written before it failed.
+    trailing: Vec<(Vec<work::Ev>, u64)>,
+    /// Seqs a failed removal killed: the kill was never acknowledged, so it may
+    /// not survive a crash (an operator's kill is durable only once its
+    /// checkpoint is written). The store's word decides them at the reopen.
+    unsure: Vec<u64>,
+}
+
+impl World {
+    fn new(m: Model) -> World {
+        World { label: String::new(), m, admin: None, admin_op: None, trailing: Vec::new(), unsure: Vec::new() }
+    }
+
+    /// Applies one acknowledgement line ("P" or "A") and checks its outcomes.
+    fn ack(&mut self, eseed: u64, tag: &str, i: u64, step: usize, got: &[Out]) -> Result<(), String> {
+        let op = work::op(eseed, i);
+        if tag == "P" {
+            let Op::AdminDelete { filters, between } = &op else { return Err("progress line for a non-admin op".into()) };
+            let fs: Vec<_> = filters.iter().map(|f| model::parse_filter(f)).collect();
+            if self.admin_op != Some(i) {
+                self.admin = Some(AdminRun { targets: self.m.matching(&fs, None, NOW), done: 0, killed: 0, op_killed: Vec::new() });
+                self.admin_op = Some(i);
+            }
+            let a = self.admin.as_mut().expect("admin run");
+            let mut outs = Vec::new();
+            while a.done <= step {
+                let d = a.done;
+                outs = admin_step(&mut self.m, a, between, d, None);
+                a.done += 1;
+            }
+            if outs != got {
+                return Err(format!("admin step {step} outcomes: store said {got:?}, model expects {outs:?}"));
+            }
+            return Ok(());
+        }
+        let want = match &op {
+            Op::AdminDelete { filters, between } => {
+                let fs: Vec<_> = filters.iter().map(|f| model::parse_filter(f)).collect();
+                if self.admin_op != Some(i) {
+                    self.admin = Some(AdminRun { targets: self.m.matching(&fs, None, NOW), done: 0, killed: 0, op_killed: Vec::new() });
+                }
+                let a = self.admin.as_mut().expect("admin run");
+                let total = steps_of(a, between);
+                while a.done < total {
+                    let d = a.done;
+                    admin_step(&mut self.m, a, between, d, None);
+                    a.done += 1;
+                }
+                let k = a.killed;
+                self.admin = None;
+                self.admin_op = None;
+                vec![Out::Stored(k)]
+            }
+            other => self.m.apply_op(other, NOW),
+        };
+        if want != got {
+            return Err(format!("{}: store said {got:?}, model expects {want:?}", op_name(&op)));
+        }
+        if want.iter().any(|o| matches!(o, Out::Stored(_))) && matches!(op, Op::Batch(_)) {
+            self.trailing.clear();
+        }
+        Ok(())
+    }
+}
+
+/// The outcomes a failed operation may have had, each with the seqs whose
+/// fate the child's view of the store decides.
+type Forks = Vec<(World, Vec<u64>)>;
+
+/// Keeps the worlds `f` accepts; when none does, the error of the first.
+fn prune(worlds: Vec<World>, mut f: impl FnMut(&mut World) -> Result<(), String>) -> Result<Vec<World>, String> {
+    let mut kept = Vec::new();
+    let mut first_err = None;
+    for mut w in worlds {
+        match f(&mut w) {
+            Ok(()) => kept.push(w),
+            Err(e) => {
+                first_err.get_or_insert(if w.label.is_empty() { e } else { format!("[{}] {e}", w.label) });
+            }
+        }
+    }
+    if kept.is_empty() {
+        return Err(first_err.unwrap_or_else(|| "no state left".into()));
+    }
+    Ok(kept)
+}
+
+/// Whether a world holds what the child said it holds after a failure.
+fn matches_view(w: &World, next_seq: u64, published: u64, live: &[u64]) -> Result<(), String> {
+    if published != next_seq {
+        return Err(format!("the store took seqs up to {next_seq} but published only {published}"));
+    }
+    if w.m.next_seq() != next_seq {
+        return Err(format!("next_seq {next_seq}, model has {}", w.m.next_seq()));
+    }
+    let model_live: Vec<u64> = w.m.live_seqs().map(|s| s.seq).collect();
+    if model_live != live {
+        let a: std::collections::BTreeSet<u64> = model_live.iter().copied().collect();
+        let b: std::collections::BTreeSet<u64> = live.iter().copied().collect();
+        let only_model: Vec<_> = a.difference(&b).take(8).collect();
+        let only_store: Vec<_> = b.difference(&a).take(8).collect();
+        return Err(format!("live sets differ: model only {only_model:?}, store only {only_store:?}"));
+    }
+    Ok(())
+}
+
 pub fn run(cfg: &Cfg) -> Result<Stats, String> {
     let mut st = Stats::default();
     let mut rng = Rng::new(cfg.seed);
@@ -301,7 +471,16 @@ pub fn run(cfg: &Cfg) -> Result<Stats, String> {
             st.iterations += 1;
             let crash = (cfg.crash_points && rng.chance(1, 2)).then(|| (rng.pick(CRASH_POINTS).to_string(), 1 + rng.skewed(30)));
             let _ = std::fs::remove_file(&crash_log);
-            let (mut child, rx) = spawn_child(&dir, eseed, next_op, &shape, crash.clone(), cfg.readers, &crash_log).map_err(|e| e.to_string())?;
+            let faults = (cfg.faults && rng.chance(1, 2)).then(|| child::Faults { budget: rng.skewed(1 << 21), hold: rng.below(4), at_open: rng.chance(1, 8) });
+            if faults.is_some() {
+                st.fault_children += 1;
+            }
+            // A power cut instead of a crash: what was not synced may be lost.
+            let power = (cfg.power && crash.is_some()).then(|| rng.next_u64());
+            if power.is_some() {
+                st.power_cuts += 1;
+            }
+            let (mut child, rx) = spawn_child(&dir, eseed, next_op, &shape, crash.clone(), power, faults, cfg.readers, &crash_log).map_err(|e| e.to_string())?;
             let delay = Duration::from_millis(1 + rng.skewed(cfg.max_kill_ms));
             let deadline = Instant::now() + if crash.is_some() { delay * 4 } else { delay };
             let mut lines = Vec::new();
@@ -331,94 +510,171 @@ pub fn run(cfg: &Cfg) -> Result<Stats, String> {
             if exited && status.success() {
                 st.clean_exits += 1;
             }
+            if crate::env_flag("ADV_TRACE") {
+                eprintln!("child {it} from op {next_op} (crash {crash:?}, faults {faults:?}, {status}):");
+                for l in &lines {
+                    eprintln!("  {}", l.chars().take(300).collect::<String>());
+                }
+            }
             let run = Run { lines };
             let first_op = next_op;
+            let mut pending: Option<(u64, Forks)> = None;
             let ctx = |msg: String| format!("epoch {epoch} (seed {eseed:#x}, shape {shape:?}) iteration {it}, child from op {first_op}: {msg}");
 
-            // Replay the acknowledgements into the model.
-            let mut admin: Option<AdminRun> = None;
-            let mut admin_op: Option<u64> = None;
+            // Replay the child's lines into the model: one world, unless a
+            // write failed.
+            let mut worlds = vec![World::new(m)];
             for l in &run.lines {
                 let (tag, rest) = l.split_once(' ').unwrap_or((l.as_str(), ""));
                 match tag {
                     "O" => {
                         let n: u64 = rest.trim().parse().map_err(|_| ctx(format!("bad line {l:?}")))?;
-                        if n != m.next_seq() {
-                            return Err(ctx(format!("child opened with next_seq {n}, model has {}", m.next_seq())));
-                        }
+                        worlds = prune(worlds, |w| if w.m.next_seq() == n { Ok(()) } else { Err(format!("child opened with next_seq {n}, model has {}", w.m.next_seq())) }).map_err(&ctx)?;
                     }
-                    "P" => {
-                        let mut parts = rest.splitn(3, ' ');
-                        let i: u64 = parts.next().and_then(|x| x.parse().ok()).ok_or(ctx(format!("bad line {l:?}")))?;
-                        let s: usize = parts.next().and_then(|x| x.parse().ok()).ok_or(ctx(format!("bad line {l:?}")))?;
-                        let got = parse_tokens(parts.next().unwrap_or("")).map_err(&ctx)?;
+                    "P" | "A" => {
+                        let (i, step, toks) = if tag == "P" {
+                            let mut parts = rest.splitn(3, ' ');
+                            let i: u64 = parts.next().and_then(|x| x.parse().ok()).ok_or(ctx(format!("bad line {l:?}")))?;
+                            let s: usize = parts.next().and_then(|x| x.parse().ok()).ok_or(ctx(format!("bad line {l:?}")))?;
+                            (i, s, parts.next().unwrap_or(""))
+                        } else {
+                            let (i, toks) = rest.split_once(' ').unwrap_or((rest, ""));
+                            (i.parse().map_err(|_| ctx(format!("bad line {l:?}")))?, 0, toks)
+                        };
                         if i != next_op {
-                            return Err(ctx(format!("progress for op {i}, expected op {next_op}")));
-                        }
-                        let Op::AdminDelete { filters, between } = work::op(eseed, i) else { return Err(ctx("progress line for a non-admin op".into())) };
-                        let fs: Vec<_> = filters.iter().map(|f| model::parse_filter(f)).collect();
-                        if admin_op != Some(i) {
-                            admin = Some(AdminRun { targets: m.matching(&fs, None, NOW), done: 0, killed: 0, op_killed: Vec::new() });
-                            admin_op = Some(i);
-                        }
-                        let a = admin.as_mut().expect("admin run");
-                        let mut outs = Vec::new();
-                        while a.done <= s {
-                            let d = a.done;
-                            outs = admin_step(&mut m, a, &between, d, None);
-                            a.done += 1;
-                        }
-                        if outs != got {
-                            return Err(ctx(format!("admin step {s} outcomes: store said {got:?}, model expects {outs:?}")));
-                        }
-                    }
-                    "A" => {
-                        let (i, toks) = rest.split_once(' ').unwrap_or((rest, ""));
-                        let i: u64 = i.parse().map_err(|_| ctx(format!("bad line {l:?}")))?;
-                        if i != next_op {
-                            return Err(ctx(format!("ack for op {i}, expected op {next_op}")));
+                            return Err(ctx(format!("line for op {i}, expected op {next_op}")));
                         }
                         let got = parse_tokens(toks).map_err(&ctx)?;
-                        let op = work::op(eseed, i);
-                        let want = match &op {
-                            Op::AdminDelete { filters, between } => {
-                                let fs: Vec<_> = filters.iter().map(|f| model::parse_filter(f)).collect();
-                                if admin_op != Some(i) {
-                                    admin = Some(AdminRun { targets: m.matching(&fs, None, NOW), done: 0, killed: 0, op_killed: Vec::new() });
-                                }
-                                let a = admin.as_mut().expect("admin run");
-                                let total = steps_of(a, between);
-                                while a.done < total {
-                                    let d = a.done;
-                                    admin_step(&mut m, a, between, d, None);
-                                    a.done += 1;
-                                }
-                                let k = a.killed;
-                                admin = None;
-                                admin_op = None;
-                                vec![Out::Stored(k)]
+                        let many = worlds.len() > 1;
+                        worlds = prune(worlds, |w| w.ack(eseed, tag, i, step, &got)).map_err(|e| ctx(if many { format!("after a failed write, no outcome it may have had explains op {i}: {e}") } else { e }))?;
+                        if tag == "A" {
+                            let op = work::op(eseed, i);
+                            st.ops_acked += 1;
+                            if let Op::Batch(v) = &op {
+                                st.events_acked += v.len() as u64;
                             }
-                            other => m.apply_op(other, NOW),
-                        };
-                        if want != got {
-                            return Err(ctx(format!("{}: store said {got:?}, model expects {want:?}", op_name(&op))));
+                            next_op += 1;
                         }
-                        st.ops_acked += 1;
-                        if let Op::Batch(v) = &op {
-                            st.events_acked += v.len() as u64;
+                    }
+                    "E" if faults.is_some() => {
+                        let (i, _) = rest.split_once(' ').unwrap_or((rest, ""));
+                        let i: u64 = i.parse().map_err(|_| ctx(format!("bad line {l:?}")))?;
+                        if i != next_op {
+                            return Err(ctx(format!("failure of op {i}, expected op {next_op}")));
                         }
+                        st.ops_failed += 1;
+                        // Every outcome the failed operation may have had; the child's
+                        // next line says which it was.
+                        let op = work::op(eseed, i);
+                        let mut forks = Vec::new();
+                        for w in &worlds {
+                            for (label, c, maybe) in candidates(&w.m, &op, w.admin.as_ref()) {
+                                let mut trailing = w.trailing.clone();
+                                if let Op::Batch(evs) = &op {
+                                    trailing.push((evs.clone(), w.m.next_seq()));
+                                }
+                                forks.push((World { label: format!("op {i} failed: {label}"), m: c, admin: None, admin_op: None, trailing, unsure: w.unsure.clone() }, maybe));
+                            }
+                        }
+                        // The view decides removals in flight, so keep them with their world.
+                        pending = Some((i, forks));
                         next_op += 1;
                     }
+                    "V" if faults.is_some() => {
+                        let mut parts = rest.splitn(4, ' ');
+                        let mut num = || parts.next().and_then(|x| x.parse::<u64>().ok());
+                        let (Some(i), Some(ns), Some(published)) = (num(), num(), num()) else { return Err(ctx(format!("bad line {l:?}"))) };
+                        let live = child::parse_ranges(rest.splitn(4, ' ').nth(3).unwrap_or("")).ok_or(ctx(format!("bad line {l:?}")))?;
+                        let Some((fi, forks)) = pending.take() else { return Err(ctx(format!("view without a failure: {l:?}"))) };
+                        if fi != i {
+                            return Err(ctx(format!("view of op {i} after the failure of op {fi}")));
+                        }
+                        let live_set: std::collections::HashSet<u64> = live.iter().copied().collect();
+                        let mut kept = Vec::new();
+                        let mut first_err = None;
+                        for (mut w, maybe) in forks {
+                            // A removal in flight: the store's word decides each target.
+                            for &seq in &maybe {
+                                if (seq as usize) < w.m.slots.len() {
+                                    let alive = live_set.contains(&seq);
+                                    if alive && !w.m.slots[seq as usize].alive {
+                                        w.m.revive_seq(seq);
+                                    } else if !alive && w.m.slots[seq as usize].alive {
+                                        w.m.kill_seq(seq);
+                                    }
+                                    if !alive {
+                                        w.unsure.push(seq);
+                                    }
+                                }
+                            }
+                            match matches_view(&w, ns, published, &live) {
+                                Ok(()) => kept.push(w),
+                                Err(e) => {
+                                    first_err.get_or_insert(format!("[{}] {e}", w.label));
+                                }
+                            }
+                        }
+                        if kept.is_empty() {
+                            return Err(ctx(format!("after op {i} ({}) failed, the store holds no state the model allows: {}", op_name(&work::op(eseed, i)), first_err.unwrap_or_default())));
+                        }
+                        let before = worlds.first().map_or(0, |w| w.m.next_seq());
+                        let after = kept[0].m.next_seq();
+                        let n = match work::op(eseed, i) {
+                            Op::Batch(evs) => evs.len() as u64,
+                            _ => 0,
+                        };
+                        if after == before {
+                            st.failed_landed.0 += 1;
+                        } else if after - before < n {
+                            st.failed_landed.1 += 1;
+                        } else {
+                            st.failed_landed.2 += 1;
+                        }
+                        worlds = kept;
+                    }
+                    "N" if faults.is_some_and(|f| f.at_open) => st.opens_refused += 1,
                     "E" => return Err(ctx(format!("operation failed without injected faults: {rest}"))),
                     "R" => return Err(ctx(format!("panic in the child: {rest}"))),
                     "F" => return Err(ctx(format!("the store refused to open: {rest}; {}", describe_dir(&dir)))),
                     _ => return Err(ctx(format!("unexpected line {l:?}"))),
                 }
             }
+            if let Some((i, _)) = pending {
+                // Killed between a failure and its view: the failed op is the one in flight.
+                next_op = i;
+                st.ops_failed -= 1;
+            }
 
             // The operation in flight, and what the store may hold because of it.
             let op = work::op(eseed, next_op);
-            let cands = candidates(&m, &op, admin.as_ref());
+            let mut cands = Vec::new();
+            for w in &worlds {
+                cands.extend(candidates(&w.m, &op, w.admin.as_ref()).into_iter().map(|(l, c, mut maybe)| {
+                    maybe.extend(&w.unsure);
+                    (l, c, maybe)
+                }));
+            }
+            // A failed batch still at the end of the log may land on restart.
+            for w in &worlds {
+                for (evs, ns) in &w.trailing {
+                    if w.m.next_seq() == *ns {
+                        let mut t = w.m.clone();
+                        for (k, e) in evs.iter().enumerate() {
+                            t.apply_event(e);
+                            for (label, c, mut maybe) in candidates(&t, &op, w.admin.as_ref()) {
+                                maybe.extend(&w.unsure);
+                                cands.push((format!("failed batch prefix {}, then {label}", k + 1), c, maybe));
+                            }
+                        }
+                    }
+                }
+            }
+            if crate::env_flag("ADV_KEEP_PREOPEN") {
+                // The store as the crash left it, before this open changes it.
+                // The last few iterations, to replay their children by hand.
+                keep_copy(&dir, &cfg.root.join(format!("pre-open-{it}")));
+                let _ = std::fs::remove_dir_all(cfg.root.join(format!("pre-open-{}", it.saturating_sub(8))));
+            }
             let (store, w) = relay_store::Store::open(&dir, shape.options()).map_err(|e| ctx(format!("reopen after the crash failed: {e}; {}", describe_dir(&dir))))?;
             let mut chosen = None;
             let mut best_err = String::new();
@@ -427,7 +683,8 @@ pub fn run(cfg: &Cfg) -> Result<Stats, String> {
                 c.sweep(work::PAST);
                 // Removals in flight: the store's word decides each target.
                 verify::adopt(&mut c, &store, &maybe);
-                match verify::check_state(&c, &store, &w) {
+                let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify::check_state(&c, &store, &w)));
+                match checked.unwrap_or_else(|p| Err(format!("reading the store panicked: {}", panic_text(&p)))) {
                     Ok(()) => {
                         if let Op::Batch(evs) = &op {
                             let k: usize = label.trim_start_matches("prefix ").parse().unwrap_or(0);
@@ -438,6 +695,9 @@ pub fn run(cfg: &Cfg) -> Result<Stats, String> {
                             } else {
                                 st.landed.1 += 1;
                             }
+                        }
+                        if crate::env_flag("ADV_TRACE") {
+                            eprintln!("reopened as [{label}], next op {next_op}");
                         }
                         chosen = Some(c);
                         break;
@@ -456,6 +716,7 @@ pub fn run(cfg: &Cfg) -> Result<Stats, String> {
                 return Err(ctx(format!("after the crash in {} the store matches no state the model allows; closest: {best_err}", op_name(&op))));
             };
             m = c;
+            verify::check_frames(&m, &dir, shape.segment_size).map_err(|e| ctx(format!("after the reopen: {e}")))?;
             st.queries_checked += verify::check_queries(&m, &store, cfg.queries, &mut rng).map_err(|e| ctx(format!("query check after reopen: {e}")))?;
             st.max_events = st.max_events.max(m.next_seq());
             // Let any background job the open started finish before the next child opens.
@@ -498,6 +759,12 @@ fn write_batch(w: &mut relay_store::Writer, evs: &[work::Ev]) -> std::io::Result
 /// brute force every `check_every` operations. Deterministic: a failure here
 /// reproduces exactly from (seed, shape).
 pub fn replay(dir: &Path, eseed: u64, shape: Shape, ops: u64, check_every: u64, queries: usize) -> Result<u64, String> {
+    replay_model(dir, eseed, shape, ops, check_every, queries).map(|(q, _)| q)
+}
+
+/// `replay`, also returning the model of what the store then holds (before
+/// the expiry sweep its next open makes).
+pub fn replay_model(dir: &Path, eseed: u64, shape: Shape, ops: u64, check_every: u64, queries: usize) -> Result<(u64, Model), String> {
     let _ = std::fs::remove_dir_all(dir);
     let (store, mut w) = relay_store::Store::open(dir, shape.options()).map_err(|e| e.to_string())?;
     let mut m = Model::new(eseed);
@@ -564,5 +831,5 @@ pub fn replay(dir: &Path, eseed: u64, shape: Shape, ops: u64, check_every: u64, 
             }
         }
     }
-    Ok(checked)
+    Ok((checked, m))
 }

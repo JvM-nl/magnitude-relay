@@ -170,6 +170,47 @@ impl Model {
         }
     }
 
+    /// What a restart's repair does with events a crash brought back (see
+    /// `revive_seq`): one that a later event's rule would have removed had it
+    /// been alive (a deletion's tombstone, a vanish) dies again, and a
+    /// replaceable or addressable slot left with two live events keeps the
+    /// newest (ties: the lowest id).
+    pub fn settle_revived(&mut self, revived: &[u64]) {
+        for &r in revived {
+            let s = &self.slots[r as usize];
+            if !s.alive {
+                continue;
+            }
+            let ev = s.ev.clone();
+            let (id, pk, k, ca) = (ev.id, ev.pubkey, ev.kind, ev.created_at);
+            let tombstoned = if k == kind::GIFT_WRAP {
+                p_tags(&ev).iter().any(|p| self.deleted_e.contains(&(id, *p)) || self.vanished.get(p).is_some_and(|&t| t >= ca))
+            } else {
+                self.deleted_e.contains(&(id, pk)) && deletable_by(&ev, &pk)
+            };
+            let vanished = k != kind::VANISH && self.vanished.get(&pk).is_some_and(|&t| t >= ca);
+            let slotted = kind::is_replaceable(k) || kind::is_addressable(k);
+            let d = address_d(&ev);
+            let addr_deleted = slotted && self.addr_deleted.get(&(pk, k, d.clone())).is_some_and(|&t| t >= ca);
+            if tombstoned || vanished || addr_deleted {
+                self.kill(r, "repaired", u64::MAX);
+                continue;
+            }
+            if slotted {
+                let members = self.at_address(&pk, k, &d);
+                let best = members.iter().copied().max_by(|&a, &b| {
+                    let (ea, eb) = (&self.slots[a as usize].ev, &self.slots[b as usize].ev);
+                    ea.created_at.cmp(&eb.created_at).then(eb.id.cmp(&ea.id))
+                });
+                if let Some(best) = best {
+                    for m in members.into_iter().filter(|&m| m != best) {
+                        self.kill(m, "replaced", best);
+                    }
+                }
+            }
+        }
+    }
+
     /// Kills the live copy of `id`, if any (an observation after a crash).
     pub fn kill_id(&mut self, id: &[u8; 32]) {
         if let Some(&s) = self.live.get(id) {

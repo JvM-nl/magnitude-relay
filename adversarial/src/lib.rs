@@ -19,6 +19,7 @@
 #![allow(clippy::explicit_auto_deref)]
 
 pub mod alloc;
+pub mod corrupt;
 pub mod fuzz;
 pub mod gen;
 pub mod hostile;
@@ -28,6 +29,11 @@ pub mod sign;
 pub mod targets;
 pub mod torture;
 pub mod wsframe;
+
+/// A switch in the environment: set, and neither empty nor "0".
+pub fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
+}
 
 // The relay's settings code, compiled here as it is in the relay so the fuzz
 // targets can reach it (the relay is a binary crate with no library to link).
