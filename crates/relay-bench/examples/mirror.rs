@@ -58,8 +58,9 @@ async fn backfill(from: &str, to: &str, since: u64) -> Result<BTreeMap<String, u
                 // Something the live feed did not bring: worth knowing which.
                 println!("{} backfill stored {}", now(), relay_proto::hex::encode_string(&id));
             }
-            let prefix = msg.split(':').next().unwrap_or("").to_string();
-            *tally.entry(format!("{}{}", if accepted { "ok " } else { "refused " }, if prefix.is_empty() { "stored".into() } else { prefix })).or_default() += 1;
+            // Refusals by their whole reason: which rule said no matters.
+            let what = if accepted { msg.split(':').next().unwrap_or("").to_string() } else { msg.clone() };
+            *tally.entry(format!("{}{}", if accepted { "ok " } else { "refused " }, if what.is_empty() { "stored".into() } else { what })).or_default() += 1;
         }
     };
     while until >= since {
