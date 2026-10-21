@@ -89,7 +89,11 @@ pub fn page(shared: &Shared, path: &str) -> String {
 
     let mut nips = String::new();
     for &n in SUPPORTED_NIPS {
-        let _ = write!(nips, "<span class=\"chip\"><i>{n:02}</i>{}</span>", nip_name(n));
+        let _ = write!(
+            nips,
+            "<a class=\"chip\" href=\"https://github.com/nostr-protocol/nips/blob/master/{n:02}.md\" target=\"_blank\" rel=\"noopener\"><i>{n:02}</i>{}</a>",
+            nip_name(n)
+        );
     }
     let policy = match cfg.policy.kinds {
         KindBase::Vector if cfg.policy.restricts_writes() => {
@@ -128,7 +132,19 @@ pub fn page(shared: &Shared, path: &str) -> String {
         )
     };
 
-    TEMPLATE
+    // Tor and I2P cards only where the settings name such an address; the
+    // line inviting a choice only when there is one.
+    let mut html = TEMPLATE.to_string();
+    for (marker, list) in [("TOR", &tor), ("I2P", &i2p)] {
+        if list.is_empty() {
+            let (open, close) = (format!("<!--{marker}-->"), format!("<!--/{marker}-->"));
+            if let (Some(a), Some(b)) = (html.find(&open), html.find(&close)) {
+                html.replace_range(a..b + close.len(), "");
+            }
+        }
+    }
+    let note = if tor.is_empty() && i2p.is_empty() { "" } else { "      <p>Choose your preferred network.</p>\n" };
+    html.replace("{{CONNECT_NOTE}}", note)
         .replace("{{BASE}}", &esc(&base))
         .replace("{{NAME}}", &esc(name))
         .replace("{{DESC}}", &esc(desc))
@@ -137,11 +153,11 @@ pub fn page(shared: &Shared, path: &str) -> String {
         .replace("{{UPTIME}}", &uptime(l.uptime_secs))
         .replace("{{EVENTS}}", &group(l.events))
         .replace("{{OPEN}}", &group(l.connections))
-        .replace("{{ANSWER}}", &format!("{:.2}<small>ms</small>", l.answer_ms))
+        .replace("{{ANSWER}}", &format!("{:.2}", l.answer_ms))
         .replace("{{SERVED}}", &short(l.events_out))
         .replace("{{CLEARNET}}", &addresses(&clearnet, ""))
-        .replace("{{TOR}}", &addresses(&tor, "No onion address set."))
-        .replace("{{I2P}}", &addresses(&i2p, "No I2P address set."))
+        .replace("{{TOR}}", &addresses(&tor, ""))
+        .replace("{{I2P}}", &addresses(&i2p, ""))
         .replace("{{NIPS}}", &nips)
         .replace("{{POLICY}}", policy)
         .replace("{{LIMITS}}", &limits)
