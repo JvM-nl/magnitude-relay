@@ -253,8 +253,8 @@ impl Session {
             return closed(out, sub_id, &msg);
         }
         cx.store.refresh(cx.snap);
-        let n = if filters.len() == 1 {
-            cx.snap.count(&filters[0], cx.now)
+        let (n, approximate) = if filters.len() == 1 {
+            cx.snap.count_approx(&filters[0], cx.now)
         } else {
             // A union: events matched by several filters count once.
             let mut seen = HashSet::new();
@@ -263,13 +263,16 @@ impl Session {
                     seen.insert(h.seq);
                 }
             }
-            seen.len() as u64
+            (seen.len() as u64, false)
         };
         out.text(&mut |b| {
             b.extend_from_slice(b"[\"COUNT\",\"");
             b.extend_from_slice(sub_id.as_bytes());
             b.extend_from_slice(b"\",{\"count\":");
             relay_proto::record::push_u64(b, n);
+            if approximate {
+                b.extend_from_slice(b",\"approximate\":true");
+            }
             b.extend_from_slice(b"}]");
         });
     }

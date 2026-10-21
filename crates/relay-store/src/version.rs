@@ -76,13 +76,15 @@ impl Run {
         }
     }
 
-    fn count(&self, lo: &[u8], hi: &[u8], bloom: Option<&[u8]>) -> u64 {
+    /// Keys in `[lo, hi)`: exact for memory runs, from the block index for
+    /// segments (within two blocks, no decoding).
+    fn estimate(&self, lo: &[u8], hi: &[u8], bloom: Option<&[u8]>) -> u64 {
         if !self.may_contain(bloom) {
             return 0;
         }
         match self {
             Run::Mem(m) => (m.lower_bound(hi) - m.lower_bound(lo)) as u64,
-            Run::Disk(s) => s.count_range(lo, hi),
+            Run::Disk(s) => s.estimate_range(lo, hi),
         }
     }
 
@@ -159,6 +161,11 @@ const ESTIMATE_SAMPLE: usize = 16;
 /// Cartesian products (authors × kinds, values × kinds) above this fall back to
 /// the single-dimension index.
 const MAX_PRODUCT: usize = 4096;
+/// A plan touching at most this many index entries is taken without looking further.
+const GOOD_ENOUGH: u64 = 256;
+/// COUNTs over more entries than this are answered from the block index
+/// (NIP-45 `approximate`) instead of walking every key.
+pub const COUNT_EXACT_LIMIT: u64 = 20_000;
 
 impl Version {
     #[inline]
@@ -254,7 +261,7 @@ impl Version {
     /// Number of index entries under `p` with created_at in `[since, until]`.
     fn estimate(&self, p: &[u8], since: u64, until: u64) -> u64 {
         let (lo, hi) = bounds(p, since, until);
-        self.runs.iter().map(|r| r.count(&lo, &hi, Some(p))).sum()
+        self.runs.iter().map(|r| r.estimate(&lo, &hi, Some(p))).sum()
     }
 
     fn estimate_all(&self, prefixes: &[Vec<u8>], since: u64, until: u64) -> u64 {
@@ -323,14 +330,20 @@ impl Version {
             let (prefixes, exact) = candidates.pop().unwrap();
             return Plan::Scan { prefixes, exact };
         }
-        let best = candidates
-            .into_iter()
-            .map(|(ps, exact)| {
-                let est = self.estimate_all(&ps, since, until);
-                (est, !exact, ps, exact)
-            })
-            .min_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)))
-            .unwrap();
+        // Candidates are in rough order of selectivity (author+kind, tags,
+        // authors, kinds). Estimate in that order and stop as soon as one is
+        // clearly small: estimating the rest would cost more than it could save.
+        let mut best: Option<(u64, bool, Vec<Vec<u8>>, bool)> = None;
+        for (ps, exact) in candidates {
+            let est = self.estimate_all(&ps, since, until);
+            if best.as_ref().is_none_or(|b| (est, !exact) < (b.0, b.1)) {
+                best = Some((est, !exact, ps, exact));
+            }
+            if best.as_ref().is_some_and(|b| b.0 <= GOOD_ENOUGH) {
+                break;
+            }
+        }
+        let best = best.unwrap();
         Plan::Scan { prefixes: best.2, exact: best.3 }
     }
 
@@ -402,24 +415,20 @@ impl Version {
         }
         let since = f.since.unwrap_or(0);
         let until = f.until.unwrap_or(u64::MAX);
-        // Expired but not yet swept: the few seqs in the sweep's gap.
-        let mut expired = std::collections::HashSet::new();
-        self.for_range(&[T_EXPIRY], &prefix(T_EXPIRY, &[&now.saturating_add(1).to_be_bytes()]), |k| {
-            expired.insert(seq_of(k));
-        });
         let mut items = Vec::new();
         for v in &f.tags[0].values {
             for k in kinds {
                 let p = prefix(T_NEG, &[b"p", v, &k.to_be_bytes()]);
                 let lo = prefix(T_NEG, &[b"p", v, &k.to_be_bytes(), &since.to_be_bytes()]);
-                let hi = prefix(T_NEG, &[b"p", v, &k.to_be_bytes(), &until.to_be_bytes(), &[0xFF; 41]]);
+                let hi = prefix(T_NEG, &[b"p", v, &k.to_be_bytes(), &until.to_be_bytes(), &[0xFF; 49]]);
                 for r in self.runs.iter() {
                     r.scan(&lo, &hi, Some(&p), &mut |key| {
                         let n = key.len();
                         let seq = seq_of(key);
-                        if self.is_live(seq) && !expired.contains(&seq) {
-                            let ca = u64::from_be_bytes(key[n - 48..n - 40].try_into().unwrap());
-                            items.push((ca, key[n - 40..n - 8].try_into().unwrap()));
+                        let exp = u64::from_be_bytes(key[n - 16..n - 8].try_into().unwrap());
+                        if self.is_live(seq) && (exp == 0 || exp > now) {
+                            let ca = u64::from_be_bytes(key[n - 56..n - 48].try_into().unwrap());
+                            items.push((ca, key[n - 48..n - 16].try_into().unwrap()));
                         }
                         true
                     });
@@ -431,12 +440,26 @@ impl Version {
 
     /// Number of matching events (NIP-45). Exact plans never read a record.
     pub fn count(&self, f: &Filter, now: u64) -> u64 {
+        self.count_approx(f, now).0
+    }
+
+    /// NIP-45 COUNT with its `approximate` flag. An exact plan over a very large
+    /// range is answered from block counts in O(log n), never walking the keys:
+    /// Vector uses COUNT to size a sync, where "about 255 000" is the answer
+    /// that matters, and it comes back in microseconds.
+    pub fn count_approx(&self, f: &Filter, now: u64) -> (u64, bool) {
         match self.plan(f) {
-            Plan::Nothing => 0,
-            Plan::Ids => self.query(f, usize::MAX, now).len() as u64,
+            Plan::Nothing => (0, false),
+            Plan::Ids => (self.query(f, usize::MAX, now).len() as u64, false),
             Plan::Scan { prefixes, exact } => {
                 let since = f.since.unwrap_or(0);
                 let until = f.until.unwrap_or(u64::MAX);
+                if exact {
+                    let est = self.estimate_all(&prefixes, since, until);
+                    if est > COUNT_EXACT_LIMIT {
+                        return (est, true);
+                    }
+                }
                 let mut m = Merge::new(self, &prefixes, since, until);
                 let mut last = u64::MAX;
                 let mut n = 0;
@@ -457,7 +480,7 @@ impl Version {
                         n += 1;
                     }
                 }
-                n
+                (n, false)
             }
         }
     }

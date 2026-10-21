@@ -410,6 +410,22 @@ impl Segment {
         before + blk.lower_bound(k) as u64
     }
 
+    /// A cheap estimate of the keys in `[lo, hi)` from the block index alone (no
+    /// block is decoded): exact to within two blocks. For planning.
+    pub fn estimate_range(&self, lo: &[u8], hi: &[u8]) -> u64 {
+        if self.nblocks == 0 {
+            return 0;
+        }
+        let a = self.block_for(lo);
+        let b = self.block_for(hi);
+        let (ma, mb) = (self.meta(a), self.meta(b));
+        if a == b {
+            // Both ends in one block: somewhere between 0 and its size.
+            return (ma.2 as u64).div_ceil(2);
+        }
+        (mb.3 - ma.3) + (mb.2 as u64).div_ceil(2) - (ma.2 as u64) / 2
+    }
+
     /// Number of keys in `[lo, hi)`.
     pub fn count_range(&self, lo: &[u8], hi: &[u8]) -> u64 {
         let mut blk = Block::default();

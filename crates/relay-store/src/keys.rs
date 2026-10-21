@@ -18,13 +18,14 @@
 //! DELETED       0A ‖ target id ‖ deleter pubkey          (kind-5 `e` tombstone, permanent)
 //! ADDR_DELETED  0B ‖ pubkey ‖ kind ‖ d-field ‖ created_at (kind-5 `a` tombstone, permanent)
 //! VANISH        0C ‖ pubkey ‖ created_at                  (NIP-62 tombstone, permanent)
-//! NEG           0D ‖ name ‖ field ‖ kind ‖ created_at ‖ id ‖ seq   (NIP-77 covering)
+//! NEG           0D ‖ name ‖ field ‖ kind ‖ created_at ‖ id ‖ expiration ‖ seq   (NIP-77 covering)
 //! ```
 //!
 //! NEG keys carry the event id itself, so a negentropy set for Vector's DM sync
 //! shape (`kinds:[1059] #p:[me]`) is read from index blocks alone: no event is
 //! touched, which is what keeps a large mailbox sync fast on a machine whose
-//! log does not fit in RAM.
+//! log does not fit in RAM. The expiration (0 for none) rides along so an
+//! expired wrap is left out exactly, without waiting for the sweep.
 
 use relay_proto::record::{Field, Record};
 use relay_proto::{hex, kind, varint};
@@ -71,7 +72,7 @@ pub fn bloom_prefix(key: &[u8]) -> &[u8] {
         Some(&T_CREATED | &T_EXPIRY) => &key[..n.min(1)],
         Some(&T_KIND | &T_AUTHOR | &T_AUTHOR_KIND | &T_TAG | &T_TAG_KIND | &T_ADDR) => &key[..n.saturating_sub(16)],
         Some(&T_ADDR_DELETED | &T_VANISH) => &key[..n.saturating_sub(8)],
-        Some(&T_NEG) => &key[..n.saturating_sub(48)],
+        Some(&T_NEG) => &key[..n.saturating_sub(56)],
         _ => key,
     }
 }
@@ -211,6 +212,7 @@ pub fn index_keys(rec: Record<'_>, seq: u64, kb: &mut KeyBuf, scratch: &mut Vec<
             kb.put_u64(k);
             kb.put_u64(ca);
             kb.put(id);
+            kb.put_u64(rec.expiration().unwrap_or(0));
             kb.put_u64(seq);
         }
     }
