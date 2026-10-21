@@ -134,6 +134,49 @@ impl MappedFile {
     }
 }
 
+impl MappedFile {
+    /// Lets the kernel drop `[off, off + len)` from this mapping and from the page
+    /// cache: for bytes read once that should not crowd out what is read often.
+    /// Only whole pages inside the range go. Readers that touch them again just
+    /// fault them back in.
+    pub fn drop_cache(&self, off: usize, len: usize) {
+        // SAFETY: plain sysconf query.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let a = off.div_ceil(page) * page;
+        let b = (off + len).min(self.len) / page * page;
+        if b <= a {
+            return;
+        }
+        // SAFETY: a page-aligned subrange of our own live mapping; advisory.
+        unsafe {
+            libc::madvise(self.ptr.as_ptr().add(a).cast(), b - a, libc::MADV_DONTNEED);
+        }
+        #[cfg(target_os = "linux")]
+        // SAFETY: valid descriptor; advisory.
+        unsafe {
+            libc::posix_fadvise(self.file.as_raw_fd(), a as i64, (b - a) as i64, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+}
+
+/// Memory this process may use: physical memory, or less if its cgroup (v2) is
+/// capped. Sizes work that must fit in memory to run at disk speed.
+pub fn memory_budget() -> u64 {
+    // SAFETY: plain sysconf queries.
+    let phys = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES).max(0) as u64).saturating_mul(libc::sysconf(libc::_SC_PAGESIZE).max(0) as u64) };
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|c| c.lines().find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_string())))
+        .and_then(|p| std::fs::read_to_string(format!("/sys/fs/cgroup{p}/memory.max")).ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    match cgroup {
+        Some(c) if phys > 0 => phys.min(c),
+        Some(c) => c,
+        None if phys > 0 => phys,
+        None => 1 << 30,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum Advice {
     Random,

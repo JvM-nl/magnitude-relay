@@ -19,7 +19,7 @@ fn opts() -> Options {
     // Small log segments so tests cross segment boundaries, and a tiny flush
     // threshold so every test runs through segment files, background flushes,
     // compactions and checkpoints, not just memory runs.
-    Options { segment_size: 64 * 1024, sync: true, flush_bytes: 4096, vanish_urls: vec!["wss://relay.example/nostr".into()], log_compact_segments: 2 }
+    Options { segment_size: 64 * 1024, sync: true, flush_bytes: 4096, vanish_urls: vec!["wss://relay.example/nostr".into()], ..Options::default() }
 }
 
 fn hex32(b: u8, n: u64) -> String {
@@ -522,7 +522,8 @@ fn ev_by(n: u64, pubkey: &str, created_at: u64, kind: u64, tags: &str, content: 
 }
 
 fn log_opts(compact_after: usize) -> Options {
-    Options { log_compact_segments: compact_after, ..opts() }
+    // Tiny clustering chunks, so a compaction streams through many of them.
+    Options { log_compact_segments: compact_after, log_chunk_bytes: 24 * 1024, ..opts() }
 }
 
 /// Every file under `dir`, recursively.
@@ -752,15 +753,18 @@ fn log_compaction_keeps_every_answer() {
         assert!(!cold.is_empty(), "cold segments written");
         assert!((hot.len() as u64) < highest / 2, "retired hot segments removed: {} of {}", hot.len(), highest + 1);
 
-        // Each cold segment is in cluster order: plane traffic by author, DM
-        // wraps by recipient, the rest by author; then by time.
-        let mut checked = 0;
+        // Cold segments hold runs in cluster order (plane traffic by author, DM
+        // wraps by recipient, the rest by author; then by time), one per chunk of
+        // log clustered together. Arrival order would give runs of about two.
+        let (mut checked, mut runs) = (0usize, 0usize);
         for c in &cold {
             let keys: Vec<_> = frames(c).into_iter().filter(|f| f.0 == 0).map(|f| cluster_class(Record(&f.1))).collect();
-            assert!(keys.windows(2).all(|w| w[0] <= w[1]), "{} is out of cluster order", c.display());
+            runs += 1 + keys.windows(2).filter(|w| w[0] > w[1]).count();
             checked += keys.len();
         }
         assert!(checked > 500, "most records live in cold segments ({checked})");
+        eprintln!("cold segments: {checked} records in {runs} sorted runs");
+        assert!(checked >= runs * 10, "{checked} records in {runs} sorted runs: not clustered");
 
         // Nothing that died is left readable on disk, hot or cold.
         for f in files_under(&log) {

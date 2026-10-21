@@ -685,6 +685,7 @@ impl Writer {
             log_dir: self.log.dir().to_path_buf(),
             dead: self.dead.clone(),
             version: self.current(),
+            chunk: self.opts.log_chunk_bytes,
         };
         if self.jobs.send(job).is_ok() {
             self.log_state = LogState::Writing;

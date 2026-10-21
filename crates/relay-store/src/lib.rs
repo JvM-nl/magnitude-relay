@@ -56,11 +56,13 @@ pub struct Options {
     /// Sealed hot log segments that trigger a log compaction (clustering and
     /// space reclaim); 0 never compacts automatically.
     pub log_compact_segments: usize,
+    /// Log bytes clustered together in one sort (0: sized from available memory).
+    pub log_chunk_bytes: u64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { segment_size: 1 << 30, sync: true, flush_bytes: 64 << 20, vanish_urls: Vec::new(), log_compact_segments: 2 }
+        Options { segment_size: 1 << 30, sync: true, flush_bytes: 64 << 20, vanish_urls: Vec::new(), log_compact_segments: 2, log_chunk_bytes: 0 }
     }
 }
 
