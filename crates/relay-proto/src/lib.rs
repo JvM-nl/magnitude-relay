@@ -10,6 +10,7 @@ pub mod hex;
 pub mod json;
 pub mod kind;
 pub mod message;
+pub mod negentropy;
 pub mod record;
 pub mod varint;
 
