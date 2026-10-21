@@ -80,7 +80,7 @@ data_dir_of() {
 conf_of() {
     case "$1" in
         fastr) echo $BENCH_ROOT/fastr.env ;; ditto) echo $BENCH_ROOT/ditto.toml ;;
-        strfry) echo $BENCH_ROOT/strfry-bench.conf ;; ours) echo $BENCH_ROOT/ours.toml ;;
+        strfry) echo $BENCH_ROOT/strfry-bench.conf ;; ours) echo "${OURS_CONF:-$BENCH_ROOT/ours.toml}" ;;
     esac
 }
 
