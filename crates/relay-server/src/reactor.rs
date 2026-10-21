@@ -338,18 +338,36 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
 /// Bytes read per readiness event, into the reactor's shared scratch buffer.
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Decodes and answers every whole frame in `data`. Returns how many bytes were
-/// used (a trailing partial frame is left) and whether the connection is closing.
-fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> (usize, bool) {
+/// Work one connection may do before letting the reactor's other tasks run.
+/// A burst of 64 EVENTs is ~4 ms of signature checks; without a budget, live
+/// deliveries and REQs on the same core would wait behind all of it.
+const TURN_BUDGET: Duration = Duration::from_micros(300);
+
+/// What one pass over a buffer did.
+struct Pass {
+    /// Bytes used (a trailing partial frame, or frames left for the next turn, remain).
+    used: usize,
+    closing: bool,
+    /// Stopped on the time budget with whole frames still unprocessed.
+    more: bool,
+}
+
+/// Decodes and answers whole frames in `data` until the buffer or the turn's
+/// time budget runs out.
+fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> Pass {
     let broadcast = |m: ReactorMsg| shared.broadcast(m);
     let allow_event = || shared.take_event(ip);
+    let started = Instant::now();
     let mut off = 0;
     loop {
+        if off > 0 && started.elapsed() >= TURN_BUDGET {
+            return Pass { used: off, closing: false, more: true };
+        }
         let d = match dec.decode(&mut data[off..]) {
             Ok(d) => d,
             Err(e) => {
                 ws::write_close(&mut out.buf.borrow_mut(), e.close_code(), e.reason());
-                return (off, true);
+                return Pass { used: off, closing: true, more: false };
             }
         };
         off += d.consumed;
@@ -388,9 +406,9 @@ fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &Conn
                     Some((code, _)) => ws::write_close(&mut b, code, ""),
                     None => ws::write_close_empty(&mut b),
                 }
-                return (off, true);
+                return Pass { used: off, closing: true, more: false };
             }
-            None => return (off, false),
+            None => return Pass { used: off, closing: false, more: false },
         }
     }
 }
@@ -415,9 +433,10 @@ async fn serve(
     let mut last_rx = Instant::now();
     let mut pinged = false;
     // Frames that arrived with the handshake.
-    let (used, mut closing) = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
-    buf.drain(..used);
+    let p = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
+    buf.drain(..p.used);
     *buf = buf.to_vec();
+    let (mut closing, mut more) = (p.closing, p.more);
     loop {
         // Flush (taking the buffer, so fan-out keeps appending to a fresh one).
         if out.overflow.get() {
@@ -437,6 +456,17 @@ async fn serve(
         }
         if closing {
             return Ok(());
+        }
+        if more {
+            // Out of budget with frames left: let the reactor's other tasks run.
+            tokio::task::yield_now().await;
+            let p = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
+            buf.drain(..p.used);
+            (closing, more) = (p.closing, p.more);
+            if buf.is_empty() && buf.capacity() > 0 {
+                *buf = Vec::new();
+            }
+            continue;
         }
 
         // Wait for input, queued output, or the idle timer.
@@ -458,14 +488,14 @@ async fn serve(
                         pinged = false;
                         if buf.is_empty() {
                             // The common case: decode straight from the scratch buffer.
-                            let (used, c) = process(&mut scratch[..n], &mut dec, &mut session, out, st, shared, ip);
-                            buf.extend_from_slice(&scratch[used..n]);
-                            closing = c;
+                            let p = process(&mut scratch[..n], &mut dec, &mut session, out, st, shared, ip);
+                            buf.extend_from_slice(&scratch[p.used..n]);
+                            (closing, more) = (p.closing, p.more);
                         } else {
                             buf.extend_from_slice(&scratch[..n]);
-                            let (used, c) = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
-                            buf.drain(..used);
-                            closing = c;
+                            let p = process(&mut buf[..], &mut dec, &mut session, out, st, shared, ip);
+                            buf.drain(..p.used);
+                            (closing, more) = (p.closing, p.more);
                         }
                         if buf.is_empty() && buf.capacity() > 0 {
                             *buf = Vec::new();
