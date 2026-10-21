@@ -1744,3 +1744,83 @@ fn counts_take_each_event_once_whatever_its_keys() {
     drop((store, w));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A store of a few events, flushed and checkpointed, then closed: the
+/// starting point for the damage tests below.
+fn damaged_store(name: &str) -> PathBuf {
+    let dir = tmpdir(name);
+    let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+    let recs: Vec<Vec<u8>> = (0..20).map(|n| ev(n, (n % 3) as u8 + 1, 100 + n, 1, "[]", &format!("event {n}"))).collect();
+    write(&mut w, &recs);
+    write(&mut w, &[ev(20, 1, 200, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 3)), "")]);
+    w.flush_all().unwrap();
+    w.write_checkpoint().unwrap();
+    dir
+}
+
+fn patch(path: &std::path::Path, off: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    std::fs::OpenOptions::new().write(true).open(path).unwrap().write_all_at(bytes, off).unwrap();
+}
+
+fn read_at(path: &std::path::Path, off: u64, len: usize) -> Vec<u8> {
+    use std::os::unix::fs::FileExt;
+    let mut b = vec![0u8; len];
+    std::fs::File::open(path).unwrap().read_exact_at(&mut b, off).unwrap();
+    b
+}
+
+/// Found by the adversarial suite's damage tests: a damaged `locs` entry made
+/// one event read as another (its id looked up to the other's record, and
+/// queries returned it). A record whose frame is not its own is now missing.
+#[test]
+fn a_damaged_location_reads_as_missing_not_as_another_event() {
+    let dir = damaged_store("damaged-locs");
+    // Event 5's location now names event 6's frame.
+    let locs = dir.join("locs");
+    let six = read_at(&locs, 6 * 8, 8);
+    patch(&locs, 5 * 8, &six);
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    let v = store.snapshot();
+    assert!(v.record(5).is_none(), "seq 5 reads as another event");
+    assert_eq!(v.record(6).map(|r| *r.id()), Some(id_of(6)));
+    let got = ids(&store, r#"{"kinds":[1]}"#, 100);
+    assert!(!got.contains(&id_of(5)), "a damaged record was served");
+    assert_eq!(got.iter().filter(|&&i| i == id_of(6)).count(), 1, "another event served twice");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Found by the adversarial suite's damage tests: a record whose frame was
+/// zeroed (or whose segment was cut) panicked the reader that met it. It is
+/// now missing from answers.
+#[test]
+fn a_zeroed_frame_is_missing_not_a_panic() {
+    let dir = damaged_store("damaged-frame");
+    let off = u64::from_le_bytes(read_at(&dir.join("locs"), 7 * 8, 8).try_into().unwrap());
+    patch(&dir.join("log").join("00000000.log"), off, &[0u8; 64]);
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    let got = ids(&store, r#"{"kinds":[1]}"#, 100);
+    assert!(!got.contains(&id_of(7)));
+    assert_eq!(got.len(), 18, "the 20 events but the deleted one and the zeroed one");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Found by the adversarial suite's damage tests: a flipped bit in `dead.bits`
+/// brought a deleted event back (or hid a live one), silently. `dead.bits`
+/// now carries a checksum, and a damaged one is refused.
+#[test]
+fn a_damaged_dead_set_is_refused() {
+    let dir = damaged_store("damaged-dead");
+    let bits = dir.join("dead.bits");
+    assert_eq!(std::fs::metadata(&bits).unwrap().len() % 8, 4, "dead.bits has its checksum");
+    let b = read_at(&bits, 0, 1)[0];
+    patch(&bits, 0, &[b ^ 0b1000]);
+    match Store::open(&dir, opts()) {
+        Ok(_) => panic!("a damaged dead.bits was accepted"),
+        Err(e) => assert!(e.to_string().contains("dead.bits"), "{e}"),
+    }
+    // And one without it is refused too: every removal would be undone.
+    std::fs::remove_file(&bits).unwrap();
+    assert!(Store::open(&dir, opts()).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}

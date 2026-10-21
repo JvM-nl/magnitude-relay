@@ -1279,7 +1279,11 @@ impl Writer {
         }
         self.locs.sync()?;
         let dead_tmp = self.dir.join("dead.bits.tmp");
-        let bits = self.dead.to_bytes(self.next_seq);
+        let mut bits = self.dead.to_bytes(self.next_seq);
+        // A checksum after the words (the length, 4 past a multiple of 8,
+        // tells this form from the older one without).
+        let crc = crate::crc32c::crc32c(&bits);
+        bits.extend_from_slice(&crc.to_le_bytes());
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault::check(&dead_tmp, bits.len())?;
         std::fs::write(&dead_tmp, bits)?;

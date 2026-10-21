@@ -224,9 +224,22 @@ impl Store {
 
         let mut dead = DeadSet::default();
         if have_ck {
-            if let Ok(img) = std::fs::read(dir.join("dead.bits")) {
-                dead.load(&img);
-            }
+            // Every checkpoint is written after its dead.bits: without it, or
+            // with it damaged, every removal since the store began would be
+            // undone. That is a refusal, not a guess.
+            let img = std::fs::read(dir.join("dead.bits")).map_err(step("reading dead.bits"))?;
+            let words = match img.len() % 8 {
+                0 => &img[..],
+                4 => {
+                    let (words, crc) = img.split_at(img.len() - 4);
+                    if crate::crc32c::crc32c(words) != u32::from_le_bytes(crc.try_into().unwrap()) {
+                        return Err(io::Error::other("dead.bits is corrupt (its checksum does not match)"));
+                    }
+                    words
+                }
+                _ => return Err(io::Error::other("dead.bits is corrupt (its length is not whole words)")),
+            };
+            dead.load(words);
         }
 
         let vanish = VanishCfg::new(&opts.vanish_urls);

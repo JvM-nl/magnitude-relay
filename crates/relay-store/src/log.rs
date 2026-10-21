@@ -58,14 +58,22 @@ pub fn cold_path(dir: &Path, n: u64) -> PathBuf {
     dir.join("cold").join(format!("{n:08}.log"))
 }
 
-/// Reads the record at global offset `off`. The caller guarantees `off` is a
-/// published, live frame.
+/// The record at global offset `off`, if the frame there is `seq`'s and whole
+/// by its header. After damage on disk, what `locs` points at may be another
+/// frame, a zeroed or cut one, or a segment that is gone: such a record is
+/// missing, never another event's.
 #[inline]
-pub fn record_at(segs: &Segs, seg_size: u64, off: u64) -> &[u8] {
-    let seg = segs.file(off / seg_size).expect("the segment of a live record");
+pub fn record_of(segs: &Segs, seg_size: u64, off: u64, seq: u64) -> Option<&[u8]> {
+    let seg = segs.file(off / seg_size)?;
     let o = (off % seg_size) as usize;
+    if o + FRAME_HEADER > seg_size as usize {
+        return None;
+    }
     let len = seg.read_u32(o) as usize;
-    seg.slice(o + FRAME_HEADER, len)
+    if seg.read_u64(o + 8) != seq || len < relay_proto::record::HEADER_LEN || o + FRAME_HEADER + len > seg_size as usize {
+        return None;
+    }
+    Some(seg.slice(o + FRAME_HEADER, len))
 }
 
 /// Whether the frame at `off` still matches the checksum it was written with.
@@ -406,6 +414,10 @@ impl LogWriter {
         let Some(seg) = self.file(si).cloned() else { return Ok(()) };
         let o = off % self.seg_size;
         let len = seg.read_u32(o as usize) as usize;
+        if o as usize + FRAME_HEADER + len > self.seg_size as usize {
+            // A damaged header: there is no knowing what to zero.
+            return Ok(());
+        }
         self.touched.insert(si);
         // The header stays (its flag says dead). Whole blocks inside the record
         // are given back; the partial ones at its ends are overwritten. Most
@@ -434,6 +446,9 @@ impl LogWriter {
         let Some(seg) = self.file(si).cloned() else { return Ok(()) };
         let o = (off % self.seg_size) as usize;
         let len = seg.read_u32(o) as usize;
+        if o + FRAME_HEADER + len > self.seg_size as usize {
+            return Ok(());
+        }
         let mut rec = seg.slice(o + FRAME_HEADER, len).to_vec();
         if crc32c(&rec) != seg.read_u32(o + 16) {
             // Already zeroed (or damaged): nothing left to keep.
