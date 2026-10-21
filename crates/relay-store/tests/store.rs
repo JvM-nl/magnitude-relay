@@ -280,6 +280,228 @@ fn deleted_content_is_zeroed_on_disk() {
     assert!(!on_disk(secret));
 }
 
+/// A crash after a killed record was zeroed but before the next checkpoint:
+/// the dead bit is lost (the checkpointed `dead.bits` predates it, and the
+/// record's frame is behind the replay point), so the kill must be re-derived
+/// at open from the tail, without trusting the zeroed bytes. Found by the
+/// crash torture: the deleted event came back as an all-zero record.
+#[test]
+fn zeroed_records_stay_dead_after_a_crash_before_the_checkpoint() {
+    // No flush (so no checkpoint) after the first one.
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let zero_id = [0u8; 32];
+
+    // A kind-5 deletion.
+    let dir = tmpdir("zcrash-del");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    write(&mut w, &[ev(1, 1, 100, 14, "[]", "SECRET-ONE")]);
+    w.flush_all().unwrap();
+    write(&mut w, &[ev(2, 1, 101, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "")]);
+    write(&mut w, &[ev(3, 1, 102, 14, "[]", "later")]);
+    let crashed = tmpdir("zcrash-del-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (store, _w) = Store::open(&crashed, o.clone()).unwrap();
+    let v = store.snapshot();
+    assert_eq!(v.lookup_id(&id_of(1)), None, "the deleted event is back");
+    assert!(v.query(&filter("{}"), 100, 1_000).iter().all(|h| h.id != zero_id), "a zeroed record is served");
+    assert_eq!(ids(&store, "{}", 100), vec![id_of(3), id_of(2)]);
+}
+
+/// The same crash window for a same-second replacement whose newcomer has the
+/// lower id: re-deciding the slot at open, the old profile's zeroed id (all
+/// zeros) won the tie and the acknowledged replacement was killed.
+#[test]
+fn zeroed_replaced_records_do_not_win_their_slot_back_after_a_crash() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let zero_id = [0u8; 32];
+    let dir = tmpdir("zcrash-repl");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    write(&mut w, &[ev(9, 1, 100, 0, "[]", "old profile")]);
+    w.flush_all().unwrap();
+    assert!(matches!(write(&mut w, &[ev(4, 1, 100, 0, "[]", "new profile")])[0], Outcome::Stored(_)));
+    write(&mut w, &[ev(5, 2, 102, 14, "[]", "later")]);
+    let crashed = tmpdir("zcrash-repl-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (store, _w) = Store::open(&crashed, o).unwrap();
+    assert_eq!(ids(&store, r#"{"kinds":[0]}"#, 10), vec![id_of(4)], "the acknowledged replacement must survive");
+    assert!(store.snapshot().query(&filter("{}"), 100, 1_000).iter().all(|h| h.id != zero_id), "a zeroed record is served");
+}
+
+/// Found by the crash torture: an event that replaced an older one and was
+/// then removed itself, both after the last checkpoint. Replaying the log, a
+/// dead frame contributed no index keys, so nothing re-decided the slot and
+/// the older event (its kill lost with the checkpoint that never came, its
+/// bytes already zeroed) came back.
+#[test]
+fn a_replaced_event_stays_dead_when_its_replacement_is_removed_before_a_crash() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let dir = tmpdir("dead-replacer");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    write(&mut w, &[ev(1, 1, 100, 0, "[]", "first profile")]);
+    w.flush_all().unwrap();
+    let Outcome::Stored(b) = write(&mut w, &[ev(2, 1, 101, 0, "[]", "second profile")])[0] else { panic!() };
+    assert_eq!(w.kill_live(&[b]).unwrap(), 1);
+    write(&mut w, &[ev(3, 2, 102, 14, "[]", "later")]);
+    let crashed = tmpdir("dead-replacer-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (store, _w) = Store::open(&crashed, o).unwrap();
+    assert!(ids(&store, r#"{"kinds":[0]}"#, 10).is_empty(), "the replaced profile is back");
+}
+
+/// Found by the crash torture: a kind-5 deletion removed by an operator (its
+/// tombstone stays: a re-publish of what it deleted is refused) lost that
+/// tombstone in a crash before the next checkpoint, because a dead frame of
+/// the replayed log added no keys.
+#[test]
+fn a_removed_deletion_still_blocks_a_republish_after_a_crash() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let dir = tmpdir("dead-deletion");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    let target = ev(1, 1, 100, 14, "[]", "regret");
+    write(&mut w, std::slice::from_ref(&target));
+    w.flush_all().unwrap();
+    let Outcome::Stored(d) = write(&mut w, &[ev(2, 1, 101, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "")])[0] else { panic!() };
+    assert_eq!(w.kill_live(&[d]).unwrap(), 1);
+    assert_eq!(write(&mut w, std::slice::from_ref(&target)), vec![Outcome::Deleted], "the tombstone outlives the deletion");
+    let crashed = tmpdir("dead-deletion-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (_store, mut w) = Store::open(&crashed, o).unwrap();
+    assert_eq!(write(&mut w, &[target]), vec![Outcome::Deleted], "the deleted event could be published again");
+}
+
+/// An operator removal is permanent only from the next checkpoint; a client
+/// re-publishing the removed event before then stores a second copy. Found
+/// by the crash torture: a crash in between left both copies live, so the
+/// event came back twice (in queries, counts and NIP-77 sets).
+#[test]
+fn a_crash_never_leaves_two_live_copies_of_one_event() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let dir = tmpdir("two-copies");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    let e = ev(1, 1, 100, 14, "[]", "twice");
+    write(&mut w, std::slice::from_ref(&e));
+    w.flush_all().unwrap();
+    assert_eq!(w.kill_live(&[0]).unwrap(), 1);
+    assert_eq!(write(&mut w, &[e]), vec![Outcome::Stored(1)]);
+    let crashed = tmpdir("two-copies-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (store, _w) = Store::open(&crashed, o).unwrap();
+    let v = store.snapshot();
+    assert!(!v.is_live(0) && v.is_live(1), "exactly the newer copy is live");
+    assert_eq!(v.count(&filter("{}"), 1_000), 1);
+}
+
+/// A kill re-derived at open from the replayed tail must outlast the tail
+/// event it was derived from. Found by the crash torture: the newer copy of a
+/// twice-stored event decided at open that the older copy dies; the newer one
+/// was then removed and, after a second crash, nothing remembered the older
+/// one's death.
+#[test]
+fn kills_re_derived_at_open_survive_the_next_crash() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let dir = tmpdir("rederived");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    let e = ev(1, 1, 100, 14, "[]", "twice");
+    write(&mut w, std::slice::from_ref(&e));
+    w.flush_all().unwrap();
+    assert_eq!(w.kill_live(&[0]).unwrap(), 1);
+    assert_eq!(write(&mut w, &[e]), vec![Outcome::Stored(1)]);
+    let crash1 = tmpdir("rederived-1");
+    copy_dir(&dir, &crash1);
+    drop((store, w));
+    let (store, mut w) = Store::open(&crash1, o.clone()).unwrap();
+    assert!(!store.snapshot().is_live(0) && store.snapshot().is_live(1));
+    // The newer copy goes too (an operator removal, not yet checkpointed)...
+    assert_eq!(w.kill_live(&[1]).unwrap(), 1);
+    let crash2 = tmpdir("rederived-2");
+    copy_dir(&crash1, &crash2);
+    drop((store, w));
+    // ...which may be undone by the crash; the older copy's death may not.
+    let (store, _w) = Store::open(&crash2, o).unwrap();
+    assert!(!store.snapshot().is_live(0), "the older copy is back");
+}
+
+/// Sets the dead flag on the frame holding `seq` in a log segment file, as
+/// the writer does when it kills that copy of the event.
+fn flag_dead(path: &std::path::Path, seq: u64) -> bool {
+    let mut data = std::fs::read(path).unwrap();
+    let mut o = 0usize;
+    while o + 20 <= data.len() {
+        let len = u32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as usize;
+        if len == 0 {
+            return false;
+        }
+        if u64::from_le_bytes(data[o + 8..o + 16].try_into().unwrap()) == seq {
+            data[o + 4..o + 8].copy_from_slice(&1u32.to_le_bytes());
+            std::fs::write(path, data).unwrap();
+            return true;
+        }
+        o += 20 + len;
+    }
+    false
+}
+
+/// Found by the crash torture: an event removed while a log compaction was
+/// copying its segment (after its copy was taken), then a crash before the
+/// exchange finished. Its kill lived only in the old segment's dead flag; open
+/// finished the exchange from the copies and retired the old segment, and the
+/// event was back. Flags in the segments an exchange retires now carry over.
+#[test]
+fn a_kill_during_an_interrupted_log_compaction_survives() {
+    let dir = tmpdir("intent-kill");
+    let mut wl = Workload::new();
+    {
+        let (_s, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+        for _ in 0..60 {
+            let b = wl.batch(12);
+            write(&mut w, &b);
+        }
+        w.flush_all().unwrap();
+    }
+    let before = tmpdir("intent-kill-before");
+    copy_dir(&dir, &before);
+    let ck_before = relay_store::checkpoint::read(&dir).unwrap().unwrap();
+    {
+        let (_s, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+        w.compact_log_hot().unwrap();
+    }
+    let ck_after = relay_store::checkpoint::read(&dir).unwrap().unwrap();
+    let new_cold: Vec<u64> = ck_after.cold.iter().copied().filter(|n| !ck_before.cold.contains(n)).collect();
+    let retired: Vec<u64> = ck_after.retired.iter().copied().filter(|n| !ck_before.retired.contains(n)).collect();
+    assert!(!new_cold.is_empty() && !retired.is_empty());
+
+    // The crash: the intent recorded, `locs` not yet pointing at the copies,
+    // and one live event of a retiring segment killed after its copy was taken.
+    let crash = tmpdir("intent-kill-crash");
+    copy_dir(&before, &crash);
+    copy_dir(&dir.join("log").join("cold"), &crash.join("log").join("cold"));
+    let (victim, seg) = {
+        let (store, _w) = Store::open(&before, log_opts(0)).unwrap();
+        let v = store.snapshot();
+        let victim = (0..v.count).find(|&s| v.is_live(s)).unwrap();
+        (victim, retired[0])
+    };
+    let id = *Store::open(&before, log_opts(0)).unwrap().0.snapshot().record(victim).unwrap().id();
+    assert!(flag_dead(&crash.join("log").join(format!("{seg:08}.log")), victim), "victim not in the first retired segment");
+    let mut ck = ck_before.clone();
+    ck.next_cold = ck_after.next_cold;
+    ck.cold = ck_after.cold.clone();
+    ck.run_lens = ck_after.run_lens.clone();
+    ck.run_bytes = ck_after.run_bytes.clone();
+    ck.intent_cold = new_cold;
+    ck.intent_retire = retired;
+    relay_store::checkpoint::write(&crash, &ck).unwrap();
+    let (store, _w) = Store::open(&crash, log_opts(0)).unwrap();
+    let v = store.snapshot();
+    assert!(!v.is_live(victim), "the event killed during the compaction is back");
+    assert_eq!(v.lookup_id(&id), None);
+}
+
 /// Deterministic xorshift for reproducible random tests.
 struct Rng(u64);
 impl Rng {

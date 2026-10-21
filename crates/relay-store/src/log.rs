@@ -76,11 +76,19 @@ pub fn frame_intact(segs: &Segs, seg_size: u64, off: u64) -> bool {
     len <= MAX_RECORD && o + FRAME_HEADER + len <= seg_size as usize && crc32c(seg.slice(o + FRAME_HEADER, len)) == seg.read_u32(o + 16)
 }
 
+/// Whether the frame at global offset `off` is flagged dead (false when its
+/// segment is gone).
+pub fn frame_dead(segs: &Segs, seg_size: u64, off: u64) -> bool {
+    segs.file(off / seg_size).is_some_and(|seg| seg.read_u32((off % seg_size) as usize + 4) & FLAG_DEAD != 0)
+}
+
 /// One frame found while replaying.
 pub struct Frame<'a> {
     pub off: u64,
     pub seq: u64,
     pub dead: bool,
+    /// The record's bytes match its checksum (a dead record may be zeroed).
+    pub intact: bool,
     pub record: &'a [u8],
 }
 
@@ -126,16 +134,37 @@ fn scan(seg: &MappedFile, seg_size: u64, base: u64, mut o: usize, trust_len: boo
             return (o, false);
         }
         let record = seg.slice(o + FRAME_HEADER, len);
+        let intact = crc32c(record) == crc;
         let mut dead = flags & FLAG_DEAD != 0;
-        if !dead && crc32c(record) != crc {
+        if !dead && !intact {
             if !trust_len {
                 return (o, false);
             }
             dead = true;
         }
-        f(Frame { off: base + o as u64, seq, dead, record });
+        f(Frame { off: base + o as u64, seq, dead, intact, record });
         o += FRAME_HEADER + len;
     }
+}
+
+/// The seqs of every frame flagged dead in the segment file at `path`. For
+/// segments an interrupted exchange replaces: a kill made after their copy
+/// was taken is recorded only in their flags.
+pub fn flagged_dead(path: &Path, seg_size: u64) -> io::Result<Vec<u64>> {
+    let seg = MappedFile::open(path, seg_size as usize)?;
+    let mut out = Vec::new();
+    let mut o = 0usize;
+    while o + FRAME_HEADER <= seg_size as usize {
+        let len = seg.read_u32(o) as usize;
+        if len == 0 || len > MAX_RECORD || o + FRAME_HEADER + len > seg_size as usize {
+            break;
+        }
+        if seg.read_u32(o + 4) & FLAG_DEAD != 0 {
+            out.push(seg.read_u64(o + 8));
+        }
+        o += FRAME_HEADER + len;
+    }
+    Ok(out)
 }
 
 /// Every frame of a cold segment (used when finishing an interrupted compaction).

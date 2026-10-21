@@ -116,6 +116,10 @@ const MERGE_RATIO: u64 = 4;
 /// few enough that the writer is never away from client batches for long.
 pub const DELETE_BATCH: usize = 4096;
 
+/// How long a killed record the last checkpoint does not cover may keep its
+/// bytes before a flush is started to cover it (see `zero_when_covered`).
+const ZERO_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// A segment tier: segments within a factor of 4 in size share a level, and a
 /// level holding this many is merged into one.
 const COMPACT_FANIN: usize = 4;
@@ -171,6 +175,14 @@ pub struct Writer {
     /// files the backup lacks) until the backup ends.
     backup_hold: bool,
     held_done: Vec<Done>,
+    /// Killed rule-bearing records (replaceable, addressable, deletions,
+    /// vanish requests) that the last checkpoint does not cover: (seq, offset,
+    /// when). After a crash before the next flush, the replayed log rebuilds
+    /// what they decided (the slot a replacement took from an older event, a
+    /// deletion's tombstones, a vanish) from their bytes, so they are zeroed
+    /// only once that flush is done; a flush is started for them after
+    /// `ZERO_WAIT`. Other records decide nothing and go at once.
+    zero_when_covered: Vec<(u64, u64, std::time::Instant)>,
     scratch: Vec<u8>,
 }
 
@@ -386,6 +398,7 @@ impl Writer {
             intent: (Vec::new(), Vec::new()),
             backup_hold: false,
             held_done: Vec::new(),
+            zero_when_covered: Vec::new(),
             scratch: Vec::new(),
         })
     }
@@ -569,7 +582,11 @@ impl Writer {
         for &seq in &b.kills {
             let off = if seq >= base_count { offs[(seq - base_count) as usize] } else { locs::get(&b.base.locs, seq) };
             self.log.mark_dead(off)?;
-            zero.push(off);
+            if seq >= self.covered && keys::rule_bearing(b.record(seq), &self.vanish) {
+                self.zero_when_covered.push((seq, off, std::time::Instant::now()));
+            } else {
+                zero.push(off);
+            }
         }
         crash_point!("writer.marked_dead");
         let mut t = std::time::Instant::now();
@@ -658,6 +675,9 @@ impl Writer {
         // batch failed part-way.
         drop(v);
         if deleted > 0 {
+            // A flush first, so recent events go from the disk now too (see
+            // `zero_when_covered`), not only once the next one comes.
+            self.flush_all()?;
             self.write_checkpoint()?;
             self.reclaim()?;
         }
@@ -773,6 +793,10 @@ impl Writer {
     pub fn maintain(&mut self) -> io::Result<()> {
         while let Ok(d) = self.done.try_recv() {
             self.finish_job(d)?;
+        }
+        // Deleted bytes waiting for a flush do not wait for long.
+        if !self.flushing && self.zero_when_covered.first().is_some_and(|z| z.2.elapsed() >= ZERO_WAIT) {
+            self.start_flush()?;
         }
         self.reclaim()?;
         self.step_log_compaction();
@@ -997,6 +1021,10 @@ impl Writer {
                 self.replay_from = replay_from;
                 drop(self.publish());
                 self.write_checkpoint()?;
+                // Killed records now below `covered` are no longer needed for a replay.
+                let (ready, wait): (Vec<_>, Vec<_>) = self.zero_when_covered.drain(..).partition(|z| z.0 < covered);
+                self.zero_when_covered = wait;
+                self.defer_zero(ready.into_iter().map(|z| z.1).collect());
                 self.maybe_compact();
                 self.maybe_flush()?;
             }
@@ -1212,6 +1240,11 @@ impl Writer {
     /// tail just replayed): a crash between syncs can leave a replaced event live,
     /// or a deletion unapplied. Old seqs killed by tail events are found this way
     /// too, since only the tail is replayed.
+    ///
+    /// Such an old seq may also have had its record zeroed before the crash
+    /// (its kill was synced, but the checkpoint that would have recorded it in
+    /// `dead.bits` never came): its frame's dead flag says so, and its bytes
+    /// must not take part in any decision.
     pub(crate) fn repair(&mut self, tail: &[Vec<u8>]) -> io::Result<usize> {
         let v = self.current();
         let mut kills: Vec<u64> = Vec::new();
@@ -1227,7 +1260,11 @@ impl Writer {
                     v.for_prefix(p, |k| {
                         let s = seq_of(k);
                         if v.is_live(s) {
-                            members.push((created_at_of(k), s));
+                            if v.frame_dead(s) {
+                                kills.push(s);
+                            } else {
+                                members.push((created_at_of(k), s));
+                            }
                         }
                     });
                     if members.len() > 1 {
@@ -1238,11 +1275,30 @@ impl Writer {
                         kills.extend(members.iter().filter(|m| m.1 != best.1).map(|m| m.1));
                     }
                 }
+                T_ID => {
+                    // Two live copies of one event: the older was removed (by an
+                    // operator, whose kills last only from the next checkpoint)
+                    // before the newer was stored, and the crash forgot it.
+                    let p = &key[..33];
+                    if !seen.insert(p.to_vec()) {
+                        continue;
+                    }
+                    let mut copies = Vec::new();
+                    v.for_prefix(p, |k| {
+                        let s = seq_of(k);
+                        if v.is_live(s) {
+                            copies.push(s);
+                        }
+                    });
+                    if let Some(&newest) = copies.iter().max() {
+                        kills.extend(copies.iter().filter(|&&s| s != newest));
+                    }
+                }
                 T_DELETED => {
                     let target: [u8; 32] = key[1..33].try_into().unwrap();
                     let deleter: [u8; 32] = key[33..65].try_into().unwrap();
                     if let Some(t) = v.lookup_id(&target) {
-                        if deletable_by(v.record_unchecked(t), &deleter) {
+                        if v.frame_dead(t) || deletable_by(v.record_unchecked(t), &deleter) {
                             kills.push(t);
                         }
                     }

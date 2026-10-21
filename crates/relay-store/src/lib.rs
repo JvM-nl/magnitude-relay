@@ -242,6 +242,15 @@ impl Store {
             run.1 = run.0.iter().filter_map(|&n| std::fs::metadata(log::cold_path(&dir.join("log"), n)).ok()).map(|m| m.blocks() * 512).sum();
         }
         let cold_keep: Vec<u64> = cold_runs.iter().flat_map(|r| r.0.iter().copied()).collect();
+        // The segments an unfinished exchange replaces go below, and a kill made
+        // after their copies were taken is recorded only in their frames' dead
+        // flags (the copies were written first): carry those kills over.
+        for &n in &ck.intent_retire {
+            let path = if n >= log::COLD_BASE { log::cold_path(&dir.join("log"), n - log::COLD_BASE) } else { log::hot_path(&dir.join("log"), n) };
+            if path.exists() {
+                dead_seqs.extend(log::flagged_dead(&path, opts.segment_size)?);
+            }
+        }
         let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, &retired, &cold_keep, |fr: log::Frame<'_>| {
             if loc_err.is_none() {
                 if let Err(e) = locs.set(fr.seq, fr.off) {
@@ -251,6 +260,13 @@ impl Store {
             next_seq = next_seq.max(fr.seq + 1);
             if fr.dead {
                 dead_seqs.push(fr.seq);
+                // An event of the tail that died still decided things before it
+                // did: the slot it took from an older event, its tombstones, a
+                // vanish. Its keys bring those back for `repair` (its bytes are
+                // kept until a segment covers it, see `zero_when_covered`).
+                if fr.seq >= ck.covered && fr.intact {
+                    keys::index_keys(Record(fr.record), fr.seq, &mut kb, &mut scratch, &vanish);
+                }
             } else if fr.seq >= ck.covered {
                 keys::index_keys(Record(fr.record), fr.seq, &mut kb, &mut scratch, &vanish);
             }
@@ -290,7 +306,7 @@ impl Store {
         // crash between syncs could have lost.
         let tail: Vec<Vec<u8>> = (0..kb.len())
             .map(|i| kb.key(i))
-            .filter(|k| matches!(k[0], keys::T_ADDR | keys::T_DELETED | keys::T_ADDR_DELETED | keys::T_VANISH))
+            .filter(|k| matches!(k[0], keys::T_ID | keys::T_ADDR | keys::T_DELETED | keys::T_ADDR_DELETED | keys::T_VANISH))
             .map(|k| k.to_vec())
             .collect();
         let mem = if kb.is_empty() { Vec::new() } else { vec![Arc::new(MemRun::build(&kb))] };
@@ -329,9 +345,16 @@ impl Store {
             (ck.next_cold, cold_runs, retired),
         )?;
         if finish_intent {
-            w.write_checkpoint()?;
+            w.write_checkpoint().map_err(step("recording a finished log compaction"))?;
+            crash_point!("open.intent_finished");
         }
-        w.repair(&tail)?;
+        let repaired = w.repair(&tail).map_err(step("re-applying the replayed tail's rules"))?;
+        // Kills re-derived just now rest on tail events that may themselves die
+        // before the next checkpoint, taking the evidence with them: record them.
+        if repaired > 0 {
+            w.write_checkpoint().map_err(step("recording the re-applied rules"))?;
+        }
+        crash_point!("open.repaired");
         // Expiry kills are not re-derived from the tail like rule kills are:
         // one that was not checkpointed is redone before anything is served.
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());

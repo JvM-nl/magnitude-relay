@@ -211,6 +211,14 @@ impl Version {
         Record(log::record_at(&self.segs, self.seg_size, off))
     }
 
+    /// Whether `seq`'s log frame is flagged dead. A kill's flag reaches the disk
+    /// before the record may be zeroed, so after a crash this tells a killed
+    /// (perhaps zeroed) record from a live one even when the dead set, loaded
+    /// from the last checkpoint, has not heard of the kill.
+    pub(crate) fn frame_dead(&self, seq: u64) -> bool {
+        log::frame_dead(&self.segs, self.seg_size, locs::get(&self.locs, seq))
+    }
+
     pub fn dead_count(&self) -> u64 {
         self.dead.count()
     }
