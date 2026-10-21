@@ -29,13 +29,6 @@ body {
   background-image: radial-gradient(1100px 520px at 50% -180px, rgba(89, 252, 179, 0.13), transparent 70%);
   background-repeat: no-repeat;
 }
-/* A faint grid behind the masthead, fading out below it. */
-body::before {
-  content: ""; position: fixed; inset: 0 0 auto 0; height: 560px; pointer-events: none; z-index: -1;
-  background-image: linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
-  background-size: 44px 44px; background-position: center top;
-  -webkit-mask-image: radial-gradient(700px 420px at 50% 0, #000 30%, transparent 75%); mask-image: radial-gradient(700px 420px at 50% 0, #000 30%, transparent 75%);
-}
 .wrap {
   max-width: 980px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 56px;
   padding: 56px max(16px, env(safe-area-inset-right)) 48px max(16px, env(safe-area-inset-left));
