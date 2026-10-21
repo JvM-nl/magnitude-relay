@@ -10,5 +10,8 @@ root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 rev=$(git -C "$root" rev-parse "${1:-HEAD}")
 ssh "$host" 'mkdir -p /root/bench/src/ours'
 git -C "$root" archive "$rev" | ssh "$host" 'tar -x -C /root/bench/src/ours'
+# git archive stamps files with the commit's time: after a build of a newer
+# commit, cargo would take an older one for already built. Fresh mtimes.
+ssh "$host" 'find /root/bench/src/ours -type f -exec touch {} +'
 ssh "$host" "echo $rev > /root/bench/src/ours/.git-rev"
 echo "sent $rev to $host:/root/bench/src/ours"
