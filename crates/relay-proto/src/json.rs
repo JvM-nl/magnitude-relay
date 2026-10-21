@@ -349,10 +349,29 @@ const LO: u64 = 0x0101_0101_0101_0101;
 const HI: u64 = 0x8080_8080_8080_8080;
 
 /// Index of the first `"`, `\` or control byte at or after `from`, else `b.len()`.
-/// Eight bytes at a time; exact for the first match, which is all we use.
+/// 32 bytes a step with AVX2, 16 with NEON, then 8 with SWAR (exact for the
+/// first match, which is all we use).
 #[inline]
 fn find_special(b: &[u8], from: usize) -> usize {
     let mut i = from;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if b.len() - i >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was detected; the function stays within `b`.
+            match unsafe { find_special_avx2(b, i) } {
+                Ok(at) => return at,
+                Err(resume) => i = resume,
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64; the function stays within `b`.
+        match unsafe { find_special_neon(b, i) } {
+            Ok(at) => return at,
+            Err(resume) => i = resume,
+        }
+    }
     while i + 8 <= b.len() {
         let v = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
         let q = v ^ (LO * b'"' as u64);
@@ -372,6 +391,49 @@ fn find_special(b: &[u8], from: usize) -> usize {
         i += 1;
     }
     b.len()
+}
+
+/// `Ok(index)` of the first special byte, or `Err(resume)` where fewer than 32
+/// bytes remain unscanned.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_special_avx2(b: &[u8], mut i: usize) -> std::result::Result<usize, usize> {
+    use std::arch::x86_64::*;
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let slash = _mm256_set1_epi8(b'\\' as i8);
+    let ctl = _mm256_set1_epi8(0x1F);
+    while i + 32 <= b.len() {
+        let v = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+        // v <= 0x1F (unsigned) exactly when max(v, 0x1F) == 0x1F.
+        let low = _mm256_cmpeq_epi8(_mm256_max_epu8(v, ctl), ctl);
+        let hit = _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v, quote), _mm256_cmpeq_epi8(v, slash)), low);
+        let m = _mm256_movemask_epi8(hit) as u32;
+        if m != 0 {
+            return Ok(i + m.trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+    Err(i)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn find_special_neon(b: &[u8], mut i: usize) -> std::result::Result<usize, usize> {
+    use std::arch::aarch64::*;
+    let quote = vdupq_n_u8(b'"');
+    let slash = vdupq_n_u8(b'\\');
+    let ctl = vdupq_n_u8(0x20);
+    while i + 16 <= b.len() {
+        let v = vld1q_u8(b.as_ptr().add(i));
+        let hit = vorrq_u8(vorrq_u8(vceqq_u8(v, quote), vceqq_u8(v, slash)), vcltq_u8(v, ctl));
+        // Narrow each 0xFF/0x00 byte to a nibble: a 64-bit mask, 4 bits per byte.
+        let m = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(hit), 4)), 0);
+        if m != 0 {
+            return Ok(i + (m.trailing_zeros() / 4) as usize);
+        }
+        i += 16;
+    }
+    Err(i)
 }
 
 #[inline]
@@ -554,7 +616,7 @@ mod tests {
 
     #[test]
     fn find_special_every_offset() {
-        for len in 0..40 {
+        for len in 0..100 {
             for at in 0..len {
                 for c in [b'"', b'\\', 0x01, 0x1f] {
                     let mut v = vec![b'x'; len];
@@ -564,6 +626,17 @@ mod tests {
             }
             let v = vec![0xC3u8; len];
             assert_eq!(find_special(&v, 0), len);
+            // A starting offset inside the buffer, special byte later on.
+            if len > 40 {
+                let mut v = vec![b'y'; len];
+                v[len - 1] = 0x7F; // DEL is not special
+                v[len - 2] = b'"';
+                assert_eq!(find_special(&v, 3), len - 2);
+                // High bytes (UTF-8) are not control bytes even though they are negative as i8.
+                let mut v = vec![0xE2u8; len];
+                v[len - 1] = 0x1F;
+                assert_eq!(find_special(&v, 1), len - 1);
+            }
         }
     }
 
