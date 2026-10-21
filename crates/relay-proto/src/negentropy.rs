@@ -109,7 +109,10 @@ pub struct VecStorage {
 impl VecStorage {
     /// Takes items in any order; sorts and deduplicates them.
     pub fn new(mut items: Vec<(u64, [u8; ID_SIZE])>) -> VecStorage {
-        items.sort_unstable();
+        // The stable sort finds runs already in order and merges them: a set
+        // read from an index comes as one sorted run per index run, so this is
+        // close to linear where an unstable sort would start from scratch.
+        items.sort();
         items.dedup();
         let mut sums = Vec::with_capacity(items.len() + 1);
         let mut acc = [0u64; 4];

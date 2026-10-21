@@ -195,21 +195,130 @@ pub fn is_hex64(src: &[u8]) -> bool {
     src.len() == 64 && src.iter().all(|&b| DECODE[b as usize] != 0xFF)
 }
 
+/// Hex digit of either case → nibble, 0xFF for anything else.
+static DECODE_ANY: [u8; 256] = {
+    let mut t = DECODE;
+    let mut i = 0;
+    while i < 6 {
+        t[b'A' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    t
+};
+
 /// Decodes any even-length lowercase-or-uppercase hex (NIP-77 messages are not
 /// case-restricted by the spec, so accept both there).
+///
+/// A heavy NIP-77 reconciliation sends hundreds of kilobytes of it per round,
+/// so the bulk is decoded with SIMD (64 digits a step on AVX2, 32 on NEON).
 pub fn decode_any_case(src: &[u8]) -> Option<Vec<u8>> {
     if src.len() % 2 != 0 {
         return None;
     }
-    let nib = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
+    let mut out = vec![0u8; src.len() / 2];
+    // SAFETY: `out` holds exactly half of `src`'s length, as the SIMD decoders require.
+    let (done, ok) = unsafe { simd_decode_any(src, &mut out) };
+    if !ok || !decode_any_scalar(&src[done * 2..], &mut out[done..]) {
+        return None;
+    }
+    Some(out)
+}
+
+/// `out.len() * 2` digits of `src`, either case.
+#[inline]
+fn decode_any_scalar(src: &[u8], out: &mut [u8]) -> bool {
+    let mut bad = 0u8;
+    for (o, pair) in out.iter_mut().zip(src.chunks_exact(2)) {
+        let (hi, lo) = (DECODE_ANY[pair[0] as usize], DECODE_ANY[pair[1] as usize]);
+        bad |= hi | lo;
+        *o = (hi << 4) | (lo & 0x0F);
+    }
+    bad & 0x80 == 0
+}
+
+/// Decodes a prefix of `src` into `out` with SIMD: (output bytes written, all
+/// digits valid). `out.len()` must be `src.len() / 2`.
+#[inline]
+unsafe fn simd_decode_any(src: &[u8], out: &mut [u8]) -> (usize, bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if src.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+            return decode_any_avx2(src, out);
         }
+        (0, true)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        decode_any_neon(src, out)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (src, out);
+        (0, true)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_any_avx2(src: &[u8], out: &mut [u8]) -> (usize, bool) {
+    use std::arch::x86_64::*;
+    let (zero, nine, a, five, ten, case) = (
+        _mm256_set1_epi8(b'0' as i8),
+        _mm256_set1_epi8(9),
+        _mm256_set1_epi8(b'a' as i8),
+        _mm256_set1_epi8(5),
+        _mm256_set1_epi8(10),
+        _mm256_set1_epi8(0x20),
+    );
+    // Each pair of nibbles (high first) becomes hi * 16 + lo in a 16-bit lane.
+    let weights = _mm256_set1_epi16(0x0110);
+    let mut ok = _mm256_set1_epi8(-1);
+    let nibbles = |v: __m256i, ok: &mut __m256i| {
+        let d = _mm256_sub_epi8(v, zero);
+        let is_digit = _mm256_cmpeq_epi8(_mm256_min_epu8(d, nine), d);
+        // Folding case maps digits below 'a', where they fail this test.
+        let l = _mm256_sub_epi8(_mm256_or_si256(v, case), a);
+        let is_letter = _mm256_cmpeq_epi8(_mm256_min_epu8(l, five), l);
+        *ok = _mm256_and_si256(*ok, _mm256_or_si256(is_digit, is_letter));
+        _mm256_blendv_epi8(_mm256_add_epi8(l, ten), d, is_digit)
     };
-    src.chunks_exact(2).map(|p| Some((nib(p[0])? << 4) | nib(p[1])?)).collect()
+    let mut i = 0;
+    while i + 64 <= src.len() {
+        let x = nibbles(_mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i), &mut ok);
+        let y = nibbles(_mm256_loadu_si256(src.as_ptr().add(i + 32) as *const __m256i), &mut ok);
+        let bytes = _mm256_packus_epi16(_mm256_maddubs_epi16(x, weights), _mm256_maddubs_epi16(y, weights));
+        // packus works per 128-bit lane: x's halves are quads 0 and 2, y's 1 and 3.
+        let ordered = _mm256_permute4x64_epi64(bytes, 0b11_01_10_00);
+        _mm256_storeu_si256(out.as_mut_ptr().add(i / 2) as *mut __m256i, ordered);
+        i += 64;
+    }
+    (i / 2, _mm256_movemask_epi8(ok) == -1)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn decode_any_neon(src: &[u8], out: &mut [u8]) -> (usize, bool) {
+    use std::arch::aarch64::*;
+    let (zero, nine, a, five, ten, case) = (vdupq_n_u8(b'0'), vdupq_n_u8(9), vdupq_n_u8(b'a'), vdupq_n_u8(5), vdupq_n_u8(10), vdupq_n_u8(0x20));
+    let mut ok = vdupq_n_u8(0xFF);
+    let nibbles = |v: uint8x16_t, ok: &mut uint8x16_t| {
+        let d = vsubq_u8(v, zero);
+        let is_digit = vcleq_u8(d, nine);
+        let l = vsubq_u8(vorrq_u8(v, case), a);
+        let is_letter = vcleq_u8(l, five);
+        *ok = vandq_u8(*ok, vorrq_u8(is_digit, is_letter));
+        vbslq_u8(is_digit, d, vaddq_u8(l, ten))
+    };
+    let mut i = 0;
+    while i + 32 <= src.len() {
+        // De-interleaved on load: even digits (high nibbles) and odd ones.
+        let pair = vld2q_u8(src.as_ptr().add(i));
+        let hi = nibbles(pair.0, &mut ok);
+        let lo = nibbles(pair.1, &mut ok);
+        vst1q_u8(out.as_mut_ptr().add(i / 2), vorrq_u8(vshlq_n_u8(hi, 4), lo));
+        i += 32;
+    }
+    (i / 2, vminvq_u8(ok) == 0xFF)
 }
 
 #[cfg(test)]
@@ -242,6 +351,33 @@ mod tests {
                     slow.extend_from_slice(&ENCODE[b as usize]);
                 }
                 assert_eq!(fast, slow, "len {len} off {off}");
+            }
+        }
+    }
+
+    #[test]
+    fn any_case_decoding_matches_the_table_at_every_length() {
+        let digits = b"0123456789abcdefABCDEF";
+        let src: Vec<u8> = (0..600u32).map(|i| digits[(i.wrapping_mul(2654435761) >> 9) as usize % digits.len()]).collect();
+        let reference = |s: &[u8]| -> Option<Vec<u8>> {
+            let nib = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+            (s.len() % 2 == 0).then(|| s.chunks_exact(2).map(|p| Some((nib(p[0])? << 4) | nib(p[1])?)).collect::<Option<Vec<u8>>>())?
+        };
+        for len in 0..=src.len() {
+            for off in [0usize, 1, 7] {
+                if off + len > src.len() {
+                    continue;
+                }
+                let s = &src[off..off + len];
+                assert_eq!(decode_any_case(s), reference(s), "len {len} off {off}");
+            }
+        }
+        // One bad character anywhere, in the SIMD part or the tail, fails the whole.
+        for at in 0..300 {
+            for bad in [b'g', b'G', b'/', b':', b'@', b'`', b' ', 0x80, 0xFF] {
+                let mut s = src[..300].to_vec();
+                s[at] = bad;
+                assert_eq!(decode_any_case(&s), None, "bad {bad:#x} at {at}");
             }
         }
     }

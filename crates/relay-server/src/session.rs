@@ -11,7 +11,6 @@ use relay_proto::message::{ClientMsg, MsgError};
 use relay_proto::negentropy::{self, VecStorage};
 use relay_proto::{hex, kind, EventParser, Filter, Record};
 use relay_store::{Outcome, Store, Version};
-use std::collections::HashSet;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 
@@ -224,19 +223,21 @@ impl Session {
         cx.subs.add(self.conn, sub_id, filters.clone(), snap.gen);
 
         let mut hits = Vec::new();
-        let mut seen = HashSet::new();
         for f in &filters {
             let limit = f.limit.map_or(cx.cfg.default_limit, |l| (l as usize).min(cx.cfg.max_limit));
-            for h in snap.query(f, limit, cx.now) {
-                if seen.insert(h.seq) {
-                    hits.push(h);
-                }
-            }
+            hits.extend(snap.query(f, limit, cx.now));
         }
+        // One filter's results are distinct and in order already. An event two
+        // filters match is two equal hits, side by side once sorted.
         if filters.len() > 1 {
             hits.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+            hits.dedup_by_key(|h| h.seq);
         }
-        for h in hits {
+        for (i, h) in hits.iter().enumerate() {
+            // A later event's bytes load while this one is written out.
+            if let Some(next) = hits.get(i + 3) {
+                snap.prefetch_record(next.seq);
+            }
             if let Some(rec) = snap.record(h.seq) {
                 if hides_wrap(&filters, rec) {
                     continue;

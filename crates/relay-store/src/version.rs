@@ -181,6 +181,26 @@ impl Version {
         self.is_live(seq) && log::frame_intact(&self.segs, self.seg_size, locs::get(&self.locs, seq))
     }
 
+    /// First step of reading event `seq` soon: starts loading where its offset
+    /// is kept. A hint only.
+    #[inline]
+    pub fn prefetch_loc(&self, seq: u64) {
+        let at = (seq * 8) as usize;
+        self.locs.prefetch(at, at + 8);
+    }
+
+    /// Second step: starts loading the event's frame and fixed header (what
+    /// filters, ids and expirations are read from). Reads the offset, so it is
+    /// best a few steps after [`prefetch_loc`](Self::prefetch_loc). A hint only.
+    #[inline]
+    pub fn prefetch_record(&self, seq: u64) {
+        let off = locs::get(&self.locs, seq);
+        if let Some(seg) = self.segs.file(off / self.seg_size) {
+            let o = (off % self.seg_size) as usize;
+            seg.prefetch(o, o + log::FRAME_HEADER + relay_proto::record::HEADER_LEN + 8);
+        }
+    }
+
     #[inline]
     pub(crate) fn record_unchecked(&self, seq: u64) -> Record<'_> {
         let off = locs::get(&self.locs, seq);
@@ -362,8 +382,8 @@ impl Version {
         Plan::Scan { prefixes: best.2, exact: best.3 }
     }
 
-    /// Up to `limit` matching events, `created_at` descending, ties lowest id
-    /// first (NIP-01). Expired events (`expiration <= now`) are never returned.
+    /// Up to `limit` matching events, each once, `created_at` descending, ties
+    /// lowest id first (NIP-01). Expired events (`expiration <= now`) are never returned.
     pub fn query(&self, f: &Filter, limit: usize, now: u64) -> Vec<Hit> {
         if limit == 0 {
             return Vec::new();
@@ -383,14 +403,8 @@ impl Version {
             Plan::Scan { prefixes, exact } => {
                 let since = f.since.unwrap_or(0);
                 let until = f.until.unwrap_or(u64::MAX);
-                let mut m = Merge::new(self, &prefixes, since, until);
-                let mut last = u64::MAX;
                 let mut boundary: Option<u64> = None;
-                while let Some((ca, seq)) = m.next() {
-                    if seq == last {
-                        continue;
-                    }
-                    last = seq;
+                for (ca, seq) in Ahead::new(self, Merge::new(self, &prefixes, since, until)) {
                     if boundary.is_some_and(|b| ca < b) {
                         break;
                     }
@@ -411,6 +425,8 @@ impl Version {
             }
         }
         hits.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+        // Each event once: an id a filter lists twice is looked up twice.
+        hits.dedup_by_key(|h| h.seq);
         hits.truncate(limit);
         hits
     }
@@ -706,6 +722,77 @@ impl<'a> Merge<'a> {
             self.heap.push((n, ci));
         }
         Some(((s >> 64) as u64, s as u64))
+    }
+}
+
+/// Merge output read a few entries ahead, for callers that read each entry's
+/// record in turn. A record is two dependent cache misses away (its offset in
+/// `locs`, then its bytes in the log), so one at a time the CPU mostly waits;
+/// here an entry's offset is prefetched as it is pulled from the merge and its
+/// record half a window later, so several are on their way at once. Repeats of
+/// a seq in a row (an event under two of the merged prefixes) are dropped.
+struct Ahead<'a> {
+    v: &'a Version,
+    merge: Merge<'a>,
+    ring: [(u64, u64); AHEAD],
+    head: usize,
+    len: usize,
+    last: u64,
+    done: bool,
+}
+
+/// Entries in flight: offsets for the newer half, records for the older.
+const AHEAD: usize = 8;
+
+impl<'a> Ahead<'a> {
+    fn new(v: &'a Version, merge: Merge<'a>) -> Ahead<'a> {
+        Ahead { v, merge, ring: [(0, 0); AHEAD], head: 0, len: 0, last: u64::MAX, done: false }
+    }
+
+    #[inline]
+    fn at(&self, i: usize) -> (u64, u64) {
+        self.ring[(self.head + i) % AHEAD]
+    }
+}
+
+impl Iterator for Ahead<'_> {
+    type Item = (u64, u64);
+
+    /// `(created_at, seq)`, in the merge's order. An entry at position `p` of
+    /// the window has had its record prefetched exactly when
+    /// `p < len - AHEAD / 2`.
+    #[inline]
+    fn next(&mut self) -> Option<(u64, u64)> {
+        while !self.done && self.len < AHEAD {
+            match self.merge.next() {
+                Some((ca, seq)) => {
+                    if seq == self.last {
+                        continue;
+                    }
+                    self.last = seq;
+                    self.v.prefetch_loc(seq);
+                    self.ring[(self.head + self.len) % AHEAD] = (ca, seq);
+                    self.len += 1;
+                    if self.len > AHEAD / 2 {
+                        self.v.prefetch_record(self.at(self.len - 1 - AHEAD / 2).1);
+                    }
+                }
+                None => {
+                    self.done = true;
+                    // The newer half will not reach the record step on its own.
+                    for i in self.len.saturating_sub(AHEAD / 2)..self.len {
+                        self.v.prefetch_record(self.at(i).1);
+                    }
+                }
+            }
+        }
+        if self.len == 0 {
+            return None;
+        }
+        let e = self.at(0);
+        self.head = (self.head + 1) % AHEAD;
+        self.len -= 1;
+        Some(e)
     }
 }
 

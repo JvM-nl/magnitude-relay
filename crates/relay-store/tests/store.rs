@@ -1258,3 +1258,19 @@ fn abandoned_or_misdirected_backups_leave_nothing() {
     drop(w.begin_backup().unwrap());
     w.end_backup().unwrap();
 }
+
+#[test]
+fn a_query_returns_each_event_once() {
+    let dir = tmpdir("query-once");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    write(&mut w, &[ev(1, 1, 100, 1, "[]", "a"), ev(2, 1, 200, 1, r#"[["t","x"],["t","y"]]"#, "b")]);
+    let v = store.snapshot();
+    let (a, b) = (hex32(0xEE, 1), hex32(0xEE, 2));
+    // An id listed twice, and an event under two of a filter's tag values.
+    let ids = v.query(&filter(&format!(r#"{{"ids":["{a}","{b}","{a}"]}}"#)), 10, 0);
+    assert_eq!(ids.iter().map(|h| h.seq).collect::<Vec<_>>(), vec![1, 0]);
+    let tags = v.query(&filter(r##"{"#t":["x","y"]}"##), 10, 0);
+    assert_eq!(tags.len(), 1);
+    drop((store, w));
+    let _ = std::fs::remove_dir_all(&dir);
+}

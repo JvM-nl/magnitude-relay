@@ -71,6 +71,19 @@ impl MappedFile {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(off), len) }
     }
 
+    /// Starts loading the cache lines of `[off, end)` (clamped to the mapping).
+    /// A hint: it never faults, and changes nothing a reader can see.
+    #[inline]
+    pub fn prefetch(&self, off: usize, end: usize) {
+        let mut at = off & !63;
+        let end = end.min(self.len);
+        while at < end {
+            // SAFETY: within the mapping; a prefetch only hints the CPU.
+            unsafe { prefetch_line(self.ptr.as_ptr().add(at)) };
+            at += 64;
+        }
+    }
+
     #[inline]
     pub fn read_u64(&self, off: usize) -> u64 {
         u64::from_le_bytes(self.slice(off, 8).try_into().unwrap())
@@ -182,6 +195,16 @@ impl MappedFile {
 }
 
 /// Free bytes on the filesystem holding `path`, for unprivileged writers.
+#[inline(always)]
+unsafe fn prefetch_line(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    #[cfg(target_arch = "aarch64")]
+    std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
 pub fn free_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;

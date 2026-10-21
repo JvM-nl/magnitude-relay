@@ -848,3 +848,36 @@ async fn a_backup_runs_beside_live_writes_and_restores() {
     relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn overlapping_filters_send_each_event_once_newest_first() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-union-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start(dir.clone(), port);
+    let mut c = client_connect(relay.addr, &format!("127.0.0.1:{port}"), "/").await.unwrap();
+    let me = Signer::new(41);
+    let mut ids = Vec::new();
+    for (i, kind) in [(0u64, 30078), (1, 1059), (2, 30078)] {
+        let tags = if kind == 1059 { json!([["p", me.pk()]]) } else { json!([["d", format!("n{i}")]]) };
+        let e = me.event(now() - 100 + i, kind, tags, "x");
+        send(&mut c, json!(["EVENT", e])).await;
+        assert!(ok_of(&mut c).await.0);
+        ids.push(e["id"].as_str().unwrap().to_string());
+    }
+    // Every event matches two or three of these; the first id is listed twice.
+    let all = json!({"authors": [me.pk()]});
+    let by_kind = json!({"kinds": [30078, 1059], "authors": [me.pk()]});
+    let by_id = json!({"ids": [ids[0], ids[2], ids[0]]});
+    send(&mut c, json!(["REQ", "u", all, by_kind, by_id])).await;
+    let (evs, _) = collect(&mut c, "u").await;
+    let got: Vec<&str> = evs.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(got, vec![ids[2].as_str(), ids[1].as_str(), ids[0].as_str()]);
+    // One filter that lists an id twice.
+    send(&mut c, json!(["REQ", "one", {"ids": [ids[1], ids[1]]}])).await;
+    let (evs, _) = collect(&mut c, "one").await;
+    assert_eq!(evs.len(), 1);
+    drop(c);
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
