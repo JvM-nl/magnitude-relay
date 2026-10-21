@@ -15,6 +15,8 @@ libc.workspace = true
 # The reference negentropy client, to prove our responder interoperates.
 negentropy = { version = "0.5", default-features = false, features = ["std"] }
 serde_json.workspace = true
+# The reference base64 our gift-wrap codec is checked against.
+base64.workspace = true
 secp256k1 = { workspace = true }
 # Reference big-integer arithmetic for the curve code's differential tests.
 num-bigint.workspace = true

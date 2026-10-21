@@ -36,6 +36,7 @@ ring = "0.17"
 # Dev-only: reference implementations our own code is cross-checked against.
 serde_json = "1"
 num-bigint = "0.4"
+base64 = "0.22"
 
 [profile.release]
 lto = "fat"
