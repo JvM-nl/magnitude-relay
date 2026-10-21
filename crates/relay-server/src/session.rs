@@ -9,8 +9,7 @@ use relay_proto::event::EventInfo;
 use relay_proto::json::{escape_str, Scanner};
 use relay_proto::message::{ClientMsg, MsgError};
 use relay_proto::negentropy::{self, VecStorage};
-use crate::verify::{Checked, Job};
-use relay_proto::secp::Verifier;
+use crate::verify::{Checked, Checker, Job, Verdict};
 use relay_proto::{hex, kind, EventParser, Filter, Record};
 use relay_store::{Outcome, Store, Version};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -124,7 +123,7 @@ const MAX_QUEUED_ALONE: usize = 16;
 /// or hands the job to the verifier threads. One per reactor.
 #[derive(Default)]
 pub struct SigQueue {
-    pub verifier: Verifier,
+    pub checker: Checker,
     pub job: Job,
 }
 
@@ -203,7 +202,11 @@ impl Session {
             metrics::inc(&cx.m.events_duplicate);
             return ok(out, &id, true, "duplicate: already have this event");
         }
-        if cx.parser.confirm_id(Scanner::new_at(text, at), cx.rec, info).is_err() {
+        // An id is hashed here only when the event had escapes: if their
+        // canonical form does not match, the id is retried on the text as
+        // received, which only this reactor still has. Every other id is
+        // hashed with the signature check, eight at a time.
+        if info.any_escaped && cx.parser.confirm_id(Scanner::new_at(text, at), cx.rec, info).is_err() {
             metrics::inc(&cx.m.events_refused);
             return ok(out, &id, false, "invalid: bad event id");
         }
@@ -213,7 +216,7 @@ impl Session {
             relay_proto::record::mark_first_hand(cx.rec);
         }
         // The signature last, together with any other EVENTs from this read.
-        cx.sigs.job.push(cx.rec, info.kind);
+        cx.sigs.job.push(cx.rec, info.kind, !info.any_escaped);
     }
 
     /// Whether this connection's signatures may be checked in batches.
@@ -240,7 +243,7 @@ impl Session {
         // The job comes out of the queue while its events finish (finishing
         // needs the whole context), and goes back empty for the next read.
         let mut job = std::mem::take(&mut cx.sigs.job);
-        job.verify(&mut cx.sigs.verifier, !self.no_batch);
+        cx.sigs.checker.check(&mut [&mut job], !self.no_batch);
         self.finish_job(&job, cx, out);
         job.clear();
         cx.sigs.job = job;
@@ -261,16 +264,23 @@ impl Session {
                 self.no_batch = true;
             }
         }
-        for ((rec, &kind), &valid) in job.records().zip(&job.kinds).zip(&job.ok) {
-            self.finish_event(rec, kind, valid, cx, out);
+        for ((rec, &kind), &verdict) in job.records().zip(&job.kinds).zip(&job.verdicts) {
+            self.finish_event(rec, kind, verdict, cx, out);
         }
     }
 
-    fn finish_event(&mut self, rec: &[u8], kind: u64, valid: bool, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
+    fn finish_event(&mut self, rec: &[u8], kind: u64, verdict: Verdict, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
         let id = *Record(rec).id();
-        if !valid {
-            metrics::inc(&cx.m.events_refused);
-            return ok(out, &id, false, "invalid: bad signature");
+        match verdict {
+            Verdict::Valid => {}
+            Verdict::BadId => {
+                metrics::inc(&cx.m.events_refused);
+                return ok(out, &id, false, "invalid: bad event id");
+            }
+            Verdict::BadSig => {
+                metrics::inc(&cx.m.events_refused);
+                return ok(out, &id, false, "invalid: bad signature");
+            }
         }
         if kind::is_ephemeral(kind) {
             metrics::inc(&cx.m.events_ephemeral);

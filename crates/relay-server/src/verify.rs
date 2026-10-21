@@ -12,8 +12,9 @@
 //! Reactors never stall their other connections behind a long batch.
 
 use relay_proto::secp::{self, SigRef, Verifier};
-use relay_proto::Record;
+use relay_proto::{sha256, Record};
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex};
 use tokio::sync::oneshot;
 
@@ -31,7 +32,10 @@ pub struct Job {
     pub recs: Vec<u8>,
     pub ends: Vec<usize>,
     pub kinds: Vec<u64>,
-    pub ok: Vec<bool>,
+    /// Whether the id is still to be checked (the reactor checks those it
+    /// cannot leave to a verifier).
+    pub check_id: Vec<bool>,
+    pub verdicts: Vec<Verdict>,
     pub checked: Checked,
     /// The first job of a batch that passed: the one that counts the batch.
     pub head: bool,
@@ -46,59 +50,40 @@ impl Job {
         self.ends.is_empty()
     }
 
-    pub fn push(&mut self, rec: &[u8], kind: u64) {
+    pub fn push(&mut self, rec: &[u8], kind: u64, check_id: bool) {
         self.recs.extend_from_slice(rec);
         self.ends.push(self.recs.len());
         self.kinds.push(kind);
+        self.check_id.push(check_id);
     }
 
     pub fn clear(&mut self) {
         self.recs.clear();
         self.ends.clear();
         self.kinds.clear();
-        self.ok.clear();
+        self.check_id.clear();
+        self.verdicts.clear();
         self.checked = Checked::OneByOne;
         self.head = false;
     }
 
+    pub fn record(&self, i: usize) -> &[u8] {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] };
+        &self.recs[start..self.ends[i]]
+    }
+
     /// Each record, in order.
     pub fn records(&self) -> impl Iterator<Item = &[u8]> {
-        let mut start = 0;
-        self.ends.iter().map(move |&end| {
-            let r = &self.recs[start..end];
-            start = end;
-            r
-        })
+        (0..self.len()).map(|i| self.record(i))
     }
+}
 
-    fn refs(&self) -> impl Iterator<Item = SigRef<'_>> {
-        self.records().map(|r| {
-            let r = Record(r);
-            SigRef { pubkey: r.pubkey(), msg: r.id(), sig: r.sig() }
-        })
-    }
-
-    /// Checks this job's signatures alone: as a batch when `batch`, else one at
-    /// a time.
-    pub fn verify(&mut self, v: &mut Verifier, batch: bool) {
-        let mut ok = std::mem::take(&mut self.ok);
-        ok.clear();
-        let refs: Vec<SigRef<'_>> = self.refs().collect();
-        let checked = if batch && refs.len() >= secp::MIN_BATCH {
-            if v.verify_batch(&refs, &mut ok) {
-                Checked::Batch
-            } else {
-                Checked::BatchFailed
-            }
-        } else {
-            ok.extend(refs.iter().map(|r| v.verify_one(r)));
-            Checked::OneByOne
-        };
-        drop(refs);
-        self.ok = ok;
-        self.checked = checked;
-        self.head = checked == Checked::Batch;
-    }
+/// What a check found for one event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    Valid,
+    BadId,
+    BadSig,
 }
 
 /// How a job's signatures were checked.
@@ -111,6 +96,93 @@ pub enum Checked {
     /// In a batch that failed because of this job's own signatures: they were
     /// then checked alone, and the connection checks the rest the same way.
     BatchFailed,
+}
+
+/// Checks jobs: one per thread that does (each reactor, each verifier).
+#[derive(Default)]
+pub struct Checker {
+    sigs: Verifier,
+    pre: Vec<u8>,
+    spans: Vec<Range<usize>>,
+    digests: Vec<[u8; 32]>,
+    ok: Vec<bool>,
+    /// (job, event) of each preimage, then of each signature.
+    at: Vec<(usize, usize)>,
+}
+
+impl Checker {
+    /// Gives every event of `jobs` a verdict: ids left to us hashed eight at
+    /// a time (`sha256::digest_many`), then the signatures of every event
+    /// whose id holds, as one batch when `batch` (else one at a time). An
+    /// event with a bad id stays out of the batch, so it cannot fail it.
+    pub fn check(&mut self, jobs: &mut [&mut Job], batch: bool) {
+        self.pre.clear();
+        self.spans.clear();
+        self.at.clear();
+        for (j, job) in jobs.iter_mut().enumerate() {
+            job.verdicts.clear();
+            job.verdicts.resize(job.len(), Verdict::Valid);
+            for i in 0..job.len() {
+                if job.check_id[i] {
+                    let start = self.pre.len();
+                    Record(job.record(i)).write_id_preimage(&mut self.pre);
+                    self.spans.push(start..self.pre.len());
+                    self.at.push((j, i));
+                }
+            }
+        }
+        if !self.at.is_empty() {
+            let pres: Vec<&[u8]> = self.spans.iter().map(|r| &self.pre[r.clone()]).collect();
+            self.digests.clear();
+            self.digests.resize(pres.len(), [0; 32]);
+            sha256::digest_many(&pres, &mut self.digests);
+            for (k, &(j, i)) in self.at.iter().enumerate() {
+                if self.digests[k] != *Record(jobs[j].record(i)).id() {
+                    jobs[j].verdicts[i] = Verdict::BadId;
+                }
+            }
+        }
+
+        self.at.clear();
+        let mut refs: Vec<SigRef<'_>> = Vec::new();
+        for (j, job) in jobs.iter().enumerate() {
+            for i in 0..job.len() {
+                if job.verdicts[i] == Verdict::Valid {
+                    let r = Record(job.record(i));
+                    refs.push(SigRef { pubkey: r.pubkey(), msg: r.id(), sig: r.sig() });
+                    self.at.push((j, i));
+                }
+            }
+        }
+        let tried = batch && refs.len() >= secp::MIN_BATCH;
+        let passed = if tried {
+            self.sigs.verify_batch(&refs, &mut self.ok)
+        } else {
+            self.ok.clear();
+            self.ok.extend(refs.iter().map(|r| self.sigs.verify_one(r)));
+            false
+        };
+        drop(refs);
+        let mut in_batch = vec![false; jobs.len()];
+        for (k, &(j, i)) in self.at.iter().enumerate() {
+            in_batch[j] = true;
+            if !self.ok[k] {
+                jobs[j].verdicts[i] = Verdict::BadSig;
+            }
+        }
+        let mut counted = false;
+        for (j, job) in jobs.iter_mut().enumerate() {
+            job.checked = if tried && passed && in_batch[j] {
+                Checked::Batch
+            } else if tried && job.verdicts.contains(&Verdict::BadSig) {
+                Checked::BatchFailed
+            } else {
+                Checked::OneByOne
+            };
+            job.head = job.checked == Checked::Batch && !counted;
+            counted |= job.head;
+        }
+    }
 }
 
 struct Queue {
@@ -178,9 +250,8 @@ impl Drop for Pool {
 }
 
 fn work(inner: &Inner) {
-    let mut v = Verifier::default();
+    let mut checker = Checker::default();
     let mut taken: Vec<(Job, oneshot::Sender<Job>)> = Vec::new();
-    let mut ok = Vec::new();
     loop {
         {
             let mut q = inner.q.lock().unwrap();
@@ -205,41 +276,13 @@ fn work(inner: &Inner) {
                 inner.ready.notify_one();
             }
         }
-        check(&mut v, &mut taken, &mut ok);
+        let mut jobs: Vec<&mut Job> = taken.iter_mut().map(|(j, _)| j).collect();
+        checker.check(&mut jobs, true);
         for (job, tx) in taken.drain(..) {
             // A connection that went away no longer wants its verdicts.
             let _ = tx.send(job);
         }
         inner.q.lock().unwrap().busy -= 1;
-    }
-}
-
-/// Checks every signature in `jobs` as one batch and hands each job its verdicts.
-fn check(v: &mut Verifier, jobs: &mut [(Job, oneshot::Sender<Job>)], ok: &mut Vec<bool>) {
-    if let [(job, _)] = jobs {
-        return job.verify(v, true);
-    }
-    let refs: Vec<SigRef<'_>> = jobs.iter().flat_map(|(j, _)| j.refs()).collect();
-    let passed = refs.len() >= secp::MIN_BATCH && v.verify_batch(&refs, ok);
-    if refs.len() < secp::MIN_BATCH {
-        ok.clear();
-        ok.extend(refs.iter().map(|r| v.verify_one(r)));
-    }
-    drop(refs);
-    let mut at = 0;
-    for (i, (job, _)) in jobs.iter_mut().enumerate() {
-        job.head = passed && i == 0;
-        let n = job.len();
-        job.ok.clear();
-        job.ok.extend_from_slice(&ok[at..at + n]);
-        at += n;
-        job.checked = if passed {
-            Checked::Batch
-        } else if job.ok.contains(&false) {
-            Checked::BatchFailed
-        } else {
-            Checked::OneByOne
-        };
     }
 }
 
@@ -284,23 +327,36 @@ mod tests {
         let sig = *Record(&bad).sig();
         let at = bad.windows(64).position(|w| w == sig).unwrap() + 10;
         bad[at] ^= 1;
+        // And one whose content no longer hashes to its id.
+        let mut forged = good[12].clone();
+        let at = forged.windows(8).position(|w| w == b"event 12").unwrap();
+        forged[at + 4] = b'T';
         let mut rxs = Vec::new();
         let mut want = Vec::new();
         for (i, chunk) in good.chunks(5).enumerate() {
             let mut job = Job::default();
             let mut w = Vec::new();
             for (k, r) in chunk.iter().enumerate() {
-                // Job 3 carries a bad signature in its second place.
-                let r = if i == 3 && k == 1 { &bad } else { r };
-                job.push(r, 1);
-                w.push(!(i == 3 && k == 1));
+                // Job 3 carries a bad signature in its second place, job 5 a
+                // bad id in its first.
+                let r = match (i, k) {
+                    (3, 1) => &bad,
+                    (5, 0) => &forged,
+                    _ => r,
+                };
+                job.push(r, 1, true);
+                w.push(match (i, k) {
+                    (3, 1) => Verdict::BadSig,
+                    (5, 0) => Verdict::BadId,
+                    _ => Verdict::Valid,
+                });
             }
             rxs.push(pool.submit(job));
             want.push(w);
         }
         for (i, rx) in rxs.into_iter().enumerate() {
             let job = rt.block_on(rx).unwrap();
-            assert_eq!(job.ok, want[i], "job {i}");
+            assert_eq!(job.verdicts, want[i], "job {i}");
             if i == 3 {
                 assert_eq!(job.checked, Checked::BatchFailed);
             } else {
