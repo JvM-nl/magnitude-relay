@@ -659,6 +659,9 @@ impl Version {
     /// capped at `limits[i]` events: a scan where every key matches stops at
     /// its limit, one that checks records reads every key in range; each range
     /// is a seek. `u64::MAX` past `max_ranges` ranges, without estimating them.
+    /// Only a scan that checks records is estimated: the others' bound is
+    /// known (every REQ pays this, and estimating took latest_1 from 124 to
+    /// 140 µs).
     pub fn req_cost(&self, filters: &[Filter], limits: &[usize], max_ranges: usize) -> u64 {
         let mut ranges = 0;
         let mut cost = 0u64;
@@ -671,8 +674,8 @@ impl Version {
                     if ranges > max_ranges {
                         return u64::MAX;
                     }
-                    let keys = self.estimate_all(&prefixes, f.since.unwrap_or(0), f.until.unwrap_or(u64::MAX));
-                    cost += prefixes.len() as u64 + if exact { keys.min(limit as u64) } else { keys };
+                    cost += prefixes.len() as u64
+                        + if exact { limit as u64 } else { self.estimate_all(&prefixes, f.since.unwrap_or(0), f.until.unwrap_or(u64::MAX)) };
                 }
             }
         }
