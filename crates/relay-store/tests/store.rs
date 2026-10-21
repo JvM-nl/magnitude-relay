@@ -275,8 +275,27 @@ fn deleted_content_is_zeroed_on_disk() {
     assert!(held.record(0).is_none());
     assert!(on_disk(secret));
     drop(held);
-    // ...and gone once the next batch finds no reader holding it.
+    // ...and gone once no reader holds it and its dead flag is durable: the
+    // flag is written once the deletion is (with the next batch), and synced
+    // with the batch after that.
     write(&mut w, &[ev(3, 1, 102, 14, "[]", "later")]);
+    write(&mut w, &[ev(4, 1, 103, 14, "[]", "later still")]);
+    assert!(!on_disk(secret));
+}
+
+/// The same on a store that goes quiet: an idle store syncs the flag itself.
+#[test]
+fn deleted_content_leaves_an_idle_store_too() {
+    let dir = tmpdir("zero-idle");
+    let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+    let secret = "SECRET-CONTENT-YYYY";
+    write(&mut w, &[ev(1, 1, 100, 14, "[]", secret)]);
+    write(&mut w, &[ev(2, 1, 101, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "")]);
+    let seg = dir.join("log").join("00000000.log");
+    let on_disk = |s: &str| std::fs::read(&seg).unwrap().windows(s.len()).any(|w| w == s.as_bytes());
+    w.maintain().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    w.maintain().unwrap();
     assert!(!on_disk(secret));
 }
 

@@ -125,6 +125,10 @@ const SCRUB: u64 = 1 << 63;
 /// `zero_when_covered`).
 const ZERO_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How long a store must be idle before it syncs, itself, the dead flags that
+/// zeroing waits for (see `Writer::maintain`).
+const IDLE_SYNC: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A segment tier: segments within a factor of 4 in size share a level, and a
 /// level holding this many is merged into one.
 const COMPACT_FANIN: usize = 4;
@@ -198,6 +202,18 @@ pub struct Writer {
     ///
     /// Other records are flagged dead and zeroed whole at once.
     zero_when_covered: Vec<(u64, u64, std::time::Instant)>,
+    /// Dead flags not yet written: (seq, offset, the killing batch's epoch,
+    /// scrub). A batch's frames and the flags of what it kills are written in
+    /// the same unsynced stretch, and a power cut may keep any of those pages
+    /// and lose others: a flag that outlived its killer would kill an
+    /// acknowledged event at the next replay, or (on an older frame) make the
+    /// next log compaction drop a live one. So a flag is written only once its
+    /// batch is durable; until then the kill lives in memory (and, if the
+    /// process dies, is re-derived from the log by `repair`).
+    flags_due: Vec<(u64, u64, u64, bool)>,
+    /// When the last batch was published: a store idle for `IDLE_SYNC` syncs
+    /// what zeroing waits for itself, as no batch's sync will.
+    last_publish: std::time::Instant,
     scratch: Vec<u8>,
 }
 
@@ -417,6 +433,8 @@ impl Writer {
             backup_hold: false,
             held_done: Vec::new(),
             zero_when_covered: Vec::new(),
+            flags_due: Vec::new(),
+            last_publish: std::time::Instant::now(),
             scratch: Vec::new(),
         })
     }
@@ -609,18 +627,22 @@ impl Writer {
         let mut later = Vec::new();
         for &seq in &b.kills {
             let off = if seq >= base_count { offs[(seq - base_count) as usize] } else { locs::get(&b.base.locs, seq) };
-            // A kill whose flag cannot be written (a failing disk) happens all
-            // the same: a restart re-derives a rule's kill from the log, and the
-            // next checkpoint records any kill. Its bytes stay until then.
-            let flagged = !(b.operator && seq < self.covered) && self.log.mark_dead(off).is_ok();
-            if seq >= self.covered && keys::rule_bearing(b.record(seq), &self.vanish) {
-                if flagged {
-                    zero.push(off | SCRUB);
-                }
+            let scrub = seq >= self.covered && keys::rule_bearing(b.record(seq), &self.vanish);
+            if scrub {
                 later.push((seq, off, std::time::Instant::now()));
-            } else if flagged {
-                zero.push(off);
-            } else {
+            }
+            if b.operator && seq < self.covered {
+                if !scrub {
+                    later.push((seq, off, std::time::Instant::now()));
+                }
+            } else if !b.new.is_empty() {
+                self.flags_due.push((seq, off, self.epoch, scrub));
+            } else if self.log.mark_dead(off).is_ok() {
+                zero.push(if scrub { off | SCRUB } else { off });
+            } else if !scrub {
+                // A kill whose flag cannot be written (a failing disk) happens
+                // all the same: a restart re-derives a rule's kill from the log,
+                // and the next checkpoint records any kill. Its bytes stay until then.
                 later.push((seq, off, std::time::Instant::now()));
             }
         }
@@ -644,6 +666,7 @@ impl Writer {
         }
         drop(self.publish());
         crash_point!("writer.published");
+        self.last_publish = std::time::Instant::now();
         self.zero_when_covered.extend(later);
         self.defer_zero(zero);
         // The batch is published and owes only its sync: housekeeping that
@@ -835,10 +858,37 @@ impl Writer {
         }
     }
 
+    /// Writes the dead flags of kills whose batch is now durable (see
+    /// `flags_due`). They form an epoch of their own: what they let zero
+    /// waits until they are synced too.
+    fn write_due_flags(&mut self) {
+        let synced = self.synced.load(Ordering::Acquire);
+        let n = self.flags_due.iter().take_while(|f| f.2 <= synced).count();
+        if n == 0 {
+            return;
+        }
+        self.epoch += 1;
+        let mut zero = Vec::with_capacity(n);
+        for (seq, off, _, scrub) in self.flags_due.drain(..n).collect::<Vec<_>>() {
+            if self.log.mark_dead(off).is_ok() {
+                zero.push(if scrub { off | SCRUB } else { off });
+            } else if !scrub {
+                self.zero_when_covered.push((seq, off, std::time::Instant::now()));
+            }
+        }
+        crash_point!("writer.flagged");
+        self.defer_zero(zero);
+    }
+
     /// Takes in finished background work. Called before every batch and on idle ticks.
     pub fn maintain(&mut self) -> io::Result<()> {
+        self.write_due_flags();
         while let Ok(d) = self.done.try_recv() {
             self.finish_job(d)?;
+        }
+        // Deleted bytes waiting only for a sync that no batch is coming to do.
+        if self.last_publish.elapsed() >= IDLE_SYNC && self.pending_zero.front().is_some_and(|z| z.3 > self.synced.load(Ordering::Acquire) && z.1.strong_count() == 0) {
+            self.barrier()?;
         }
         // Deleted bytes waiting for a checkpoint do not wait for long.
         if let Some(&(seq, _, at)) = self.zero_when_covered.first() {
@@ -1043,11 +1093,12 @@ impl Writer {
         }
         let epoch = self.epoch;
         match self.pending_zero.back_mut() {
-            Some(b) => {
+            // Joining a batch of a later epoch would hold the earlier ones back.
+            Some(b) if b.3 >= epoch || b.2.is_empty() => {
                 b.2.extend(offs);
                 b.3 = b.3.max(epoch);
             }
-            None => {
+            _ => {
                 let cur = self.current();
                 self.pending_zero.push_back((cur.gen, Arc::downgrade(&cur), offs, epoch));
             }
@@ -1220,6 +1271,12 @@ impl Writer {
     pub fn write_checkpoint(&mut self) -> io::Result<()> {
         // The dead set may hold kills by batches whose sync is still in flight.
         self.barrier()?;
+        // Their dead flags can go to disk now, and are synced with the rest
+        // (a log frame zeroed later must be flagged, or a replay stops there).
+        if !self.flags_due.is_empty() {
+            self.write_due_flags();
+            self.barrier()?;
+        }
         self.locs.sync()?;
         let dead_tmp = self.dir.join("dead.bits.tmp");
         let bits = self.dead.to_bytes(self.next_seq);

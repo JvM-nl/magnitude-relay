@@ -254,3 +254,39 @@ fn a_failed_log_compaction_leaves_nothing_in_the_next_ones_segments() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Found by the adversarial suite's power-cut torture: a batch wrote the dead
+/// flags of what it killed in the same unsynced stretch as its own frames.
+/// A power cut can keep one page and lose another: here the flag on an
+/// acknowledged profile survived while its replacement was lost, and the
+/// replay of the log tail then killed the acknowledged profile. Flags now go
+/// to disk only once their batch is durable.
+#[test]
+fn a_dead_flag_never_reaches_the_disk_before_its_killer() {
+    let dir = tmpdir("flag-order");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    // The first profile fills the first page; its replacement starts later.
+    write(&mut w, &[ev_kind(1, 1, 0, 4000)]).unwrap();
+    let at = w.log.head();
+    let replacement = ev_kind(2, 1, 0, 10);
+    let (outs, staged) = w.stage(&[&replacement]).unwrap();
+    assert_eq!(outs, vec![Outcome::Stored(1)]);
+    // Published, not yet synced: the power goes now.
+    let ticket = w.publish_staged(staged).unwrap();
+    drop(ticket);
+    w.close();
+    drop(store);
+    // The replacement's page is lost; the first page stays as written.
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new().write(true).open(dir.join("log").join("00000000.log")).unwrap();
+        f.write_all_at(&vec![0u8; 20 + replacement.len()], at).unwrap();
+    }
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    let v = store.snapshot();
+    assert_eq!(v.lookup_id(&id_of(2)), None, "the lost replacement is back");
+    let first = v.lookup_id(&id_of(1)).expect("the acknowledged profile is gone");
+    assert_eq!(v.record(first).map(|r| *r.id()), Some(id_of(1)));
+    drop(v);
+    let _ = std::fs::remove_dir_all(dir);
+}
