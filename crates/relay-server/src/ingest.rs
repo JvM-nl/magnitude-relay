@@ -30,6 +30,8 @@ pub struct WriteReq {
     pub reactor: usize,
     pub conn: ConnId,
     pub rec: Vec<u8>,
+    /// When the EVENT was read (for the RELAY_DEBUG_WRITER timings).
+    pub at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,16 @@ pub struct LiveBatch {
     pub gen: u64,
     /// Newly stored records, in seq order.
     pub events: Vec<Arc<[u8]>>,
+    /// When the batch's first EVENT was read, and when the batch was handed to
+    /// the reactors (for the RELAY_DEBUG_WRITER timings).
+    pub received: Instant,
+    pub sent: Instant,
+}
+
+/// RELAY_DEBUG_WRITER=1: per-second timings of the writer and of live delivery.
+pub fn debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RELAY_DEBUG_WRITER").is_some())
 }
 
 /// The OKs for a batch that is now durable and published as version `gen`.
@@ -123,8 +135,8 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
     let mut last_sweep = Instant::now();
     let mut reqs: Vec<WriteReq> = Vec::new();
     // RELAY_DEBUG_WRITER=1 prints a per-second breakdown of the writer's cycle.
-    let debug = std::env::var_os("RELAY_DEBUG_WRITER").is_some();
-    let (mut d_batches, mut d_events, mut d_stage, mut d_finish, mut d_idle) = (0u64, 0u64, 0f64, 0f64, 0f64);
+    let debug = debug();
+    let (mut d_batches, mut d_events, mut d_stage, mut d_finish, mut d_idle, mut d_queue) = (0u64, 0u64, 0f64, 0f64, 0f64, 0f64);
     let mut d_last = Instant::now();
     loop {
         let wait_started = Instant::now();
@@ -149,6 +161,10 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
         };
         reqs.clear();
         let mut bytes = first.rec.len();
+        let received = first.at;
+        if debug {
+            d_queue += received.elapsed().as_secs_f64();
+        }
         reqs.push(first);
         while reqs.len() < MAX_BATCH_EVENTS && bytes < MAX_BATCH_BYTES {
             match rx.try_recv() {
@@ -183,7 +199,7 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
                             .map(|(r, _)| Arc::<[u8]>::from(r.rec.as_slice()))
                             .collect();
                         if !events.is_empty() {
-                            let live = Arc::new(LiveBatch { gen, events });
+                            let live = Arc::new(LiveBatch { gen, events, received, sent: Instant::now() });
                             for s in &sinks {
                                 s(ReactorMsg::Live(live.clone()));
                             }
@@ -221,8 +237,9 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
                     .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / d_batches.max(1) as f64)
                     .collect();
                 eprintln!(
-                    "writer: {d_batches} batches, {d_events} events ({:.0}/batch), stage {:.2} ms/batch, finish {:.2} ms/batch (sync {:.2}, build {:.2}, merge {:.2}, publish {:.2}), idle {:.0}%",
+                    "writer: {d_batches} batches, {d_events} events ({:.0}/batch), queue {:.0} us, stage {:.2} ms/batch, finish {:.2} ms/batch (sync {:.2}, build {:.2}, merge {:.2}, publish {:.2}), idle {:.0}%",
                     d_events as f64 / d_batches.max(1) as f64,
+                    d_queue * 1e6 / d_batches.max(1) as f64,
                     d_stage * 1e3 / d_batches.max(1) as f64,
                     d_finish * 1e3 / d_batches.max(1) as f64,
                     ph[0],
@@ -231,7 +248,7 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
                     ph[3],
                     d_idle * 100.0 / d_last.elapsed().as_secs_f64()
                 );
-                (d_batches, d_events, d_stage, d_finish, d_idle) = (0, 0, 0.0, 0.0, 0.0);
+                (d_batches, d_events, d_stage, d_finish, d_idle, d_queue) = (0, 0, 0.0, 0.0, 0.0, 0.0);
                 d_last = Instant::now();
             }
         }

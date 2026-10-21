@@ -145,7 +145,7 @@ impl Session {
             // Even with nobody listening: Vector's relay check treats a refusal as fatal.
             return ok(out, &id, true, "");
         }
-        match cx.writer.try_send(WriteReq { reactor: cx.reactor, conn: self.conn, rec: cx.rec.clone() }) {
+        match cx.writer.try_send(WriteReq { reactor: cx.reactor, conn: self.conn, rec: cx.rec.clone(), at: std::time::Instant::now() }) {
             Ok(()) => self.pending += 1,
             Err(TrySendError::Full(_)) => ok(out, &id, false, "rate-limited: the relay is busy, try again shortly"),
             Err(TrySendError::Disconnected(_)) => ok(out, &id, false, "error: the relay is shutting down"),

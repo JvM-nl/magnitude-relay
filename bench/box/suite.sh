@@ -18,7 +18,7 @@ valid_name "$name" || die "usage: suite.sh <ours|strfry|fastr|ditto> [dataset]"
 data=${2:-$BENCH_ROOT/data/d1m.jsonl}
 assert_in_bench "$data"
 [ -f "$data" ] || die "missing dataset $data"
-out=$BENCH_ROOT/results/suite.jsonl
+out=${SUITE_OUT:-$BENCH_ROOT/results/suite.jsonl}
 mkdir -p "$BENCH_ROOT/results"
 url=ws://127.0.0.1:$(port_of "$name")
 
@@ -40,6 +40,10 @@ pid=$(cat "$(pidfile_of "$name")")
 lg load --file "$data" --conns 8
 du -sh "$(data_dir_of "$name")" | sed "s/^/[$name] disk after load: /"
 grep -E 'VmRSS|VmHWM' /proc/"$pid"/status | sed "s/^/[$name] /"
+# The same numbers as a result line, for compare.py.
+printf '{"label":"%s","command":"footprint","workload":"after_ingest","time":%s,"disk_bytes":%s,"rss_kb":%s,"hwm_kb":%s,"ok":true}\n' \
+    "$name" "$(date +%s)" "$(du -sb "$(data_dir_of "$name")" | cut -f1)" \
+    "$(awk '/VmRSS/{print $2}' /proc/"$pid"/status)" "$(awk '/VmHWM/{print $2}' /proc/"$pid"/status)" >> "$out"
 # Resends: the duplicate fast path.
 lg load --file "$data" --conns 8 --duplicates --count 100k
 

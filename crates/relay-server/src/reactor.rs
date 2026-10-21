@@ -231,9 +231,33 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
     let mut targets = Vec::new();
     let mut json = Vec::new();
     let limit = shared.cfg.limits.outbound_buffer_bytes;
+    // RELAY_DEBUG_WRITER: how long live batches take to reach this reactor.
+    let debug = crate::ingest::debug();
+    let (mut d_n, mut d_handoff, mut d_since_read, mut d_max) = (0u64, 0f64, 0f64, 0f64);
+    let mut d_last = std::time::Instant::now();
     while let Some(msg) = rx.recv().await {
         let mut guard = st.borrow_mut();
         let r = &mut *guard;
+        if debug {
+            if let ReactorMsg::Live(b) = &msg {
+                let h = b.sent.elapsed().as_secs_f64();
+                d_n += 1;
+                d_handoff += h;
+                d_max = d_max.max(h);
+                d_since_read += b.received.elapsed().as_secs_f64();
+            }
+            if d_last.elapsed().as_secs() >= 1 && d_n > 0 {
+                eprintln!(
+                    "reactor {}: {d_n} live batches, handoff {:.0} us avg ({:.0} max), EVENT read to fan-out {:.0} us avg",
+                    r.idx,
+                    d_handoff * 1e6 / d_n as f64,
+                    d_max * 1e6,
+                    d_since_read * 1e6 / d_n as f64
+                );
+                (d_n, d_handoff, d_since_read, d_max) = (0, 0.0, 0.0, 0.0);
+                d_last = std::time::Instant::now();
+            }
+        }
         let (events, gen): (&[Arc<[u8]>], u64) = match &msg {
             ReactorMsg::Live(b) => {
                 // Kept until published: a REQ answered from an older snapshot in
