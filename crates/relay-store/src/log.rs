@@ -374,6 +374,36 @@ impl LogWriter {
         write_zeros(&seg, body, end)
     }
 
+    /// Zeroes a dead record's content but keeps the rest of it (its checksum
+    /// rewritten to match): for a record whose index keys a restart may still
+    /// have to rebuild from the log (see `Writer::zero_when_covered`), while
+    /// what it said leaves the disk at once. One write, checksum and record
+    /// together.
+    pub fn scrub_content(&mut self, off: u64) -> io::Result<()> {
+        let si = off / self.seg_size;
+        let Some(seg) = self.file(si).cloned() else { return Ok(()) };
+        let o = (off % self.seg_size) as usize;
+        let len = seg.read_u32(o) as usize;
+        let mut rec = seg.slice(o + FRAME_HEADER, len).to_vec();
+        if crc32c(&rec) != seg.read_u32(o + 16) {
+            // Already zeroed (or damaged): nothing left to keep.
+            return Ok(());
+        }
+        let content = relay_proto::Record(&rec).content();
+        let start = content.as_ptr() as usize - rec.as_ptr() as usize;
+        let end = start + content.len();
+        if start == end {
+            return Ok(());
+        }
+        rec[start..end].fill(0);
+        let mut buf = Vec::with_capacity(4 + len);
+        buf.extend_from_slice(&crc32c(&rec).to_le_bytes());
+        buf.extend_from_slice(&rec);
+        self.touched.insert(si);
+        crash_point!("log.scrubbing");
+        seg.write_at((o + 16) as u64, &buf)
+    }
+
     /// Writes queued frames and hands over the segments written since the last
     /// call, for a sync on another thread.
     pub fn take_touched(&mut self) -> io::Result<Vec<Arc<MappedFile>>> {

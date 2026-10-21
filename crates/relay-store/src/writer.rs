@@ -116,6 +116,10 @@ const MERGE_RATIO: u64 = 4;
 /// few enough that the writer is never away from client batches for long.
 pub const DELETE_BATCH: usize = 4096;
 
+/// Marks an offset queued for zeroing as "content only" (offsets stay below
+/// 2^56, see `log::COLD_BASE`).
+const SCRUB: u64 = 1 << 63;
+
 /// How long a killed record the last checkpoint does not cover may keep its
 /// bytes before a flush is started to cover it (see `zero_when_covered`).
 const ZERO_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -179,9 +183,10 @@ pub struct Writer {
     /// vanish requests) that the last checkpoint does not cover: (seq, offset,
     /// when). After a crash before the next flush, the replayed log rebuilds
     /// what they decided (the slot a replacement took from an older event, a
-    /// deletion's tombstones, a vanish) from their bytes, so they are zeroed
-    /// only once that flush is done; a flush is started for them after
-    /// `ZERO_WAIT`. Other records decide nothing and go at once.
+    /// deletion's tombstones, a vanish) from their bytes. So their content is
+    /// scrubbed as soon as no reader can see them (see `SCRUB`), and the rest
+    /// zeroed only once that flush is done; a flush is started for them after
+    /// `ZERO_WAIT`. Other records decide nothing and are zeroed whole at once.
     zero_when_covered: Vec<(u64, u64, std::time::Instant)>,
     scratch: Vec<u8>,
 }
@@ -583,6 +588,7 @@ impl Writer {
             let off = if seq >= base_count { offs[(seq - base_count) as usize] } else { locs::get(&b.base.locs, seq) };
             self.log.mark_dead(off)?;
             if seq >= self.covered && keys::rule_bearing(b.record(seq), &self.vanish) {
+                zero.push(off | SCRUB);
                 self.zero_when_covered.push((seq, off, std::time::Instant::now()));
             } else {
                 zero.push(off);
@@ -675,9 +681,6 @@ impl Writer {
         // batch failed part-way.
         drop(v);
         if deleted > 0 {
-            // A flush first, so recent events go from the disk now too (see
-            // `zero_when_covered`), not only once the next one comes.
-            self.flush_all()?;
             self.write_checkpoint()?;
             self.reclaim()?;
         }
@@ -1230,7 +1233,11 @@ impl Writer {
             let (_, _, offs, _) = self.pending_zero.pop_front().unwrap();
             for off in offs {
                 crash_point!("reclaim.zeroing");
-                self.log.zero_record(off)?;
+                if off & SCRUB != 0 {
+                    self.log.scrub_content(off & !SCRUB)?;
+                } else {
+                    self.log.zero_record(off)?;
+                }
             }
         }
         Ok(())

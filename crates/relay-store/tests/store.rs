@@ -344,6 +344,10 @@ fn a_replaced_event_stays_dead_when_its_replacement_is_removed_before_a_crash() 
     let Outcome::Stored(b) = write(&mut w, &[ev(2, 1, 101, 0, "[]", "second profile")])[0] else { panic!() };
     assert_eq!(w.kill_live(&[b]).unwrap(), 1);
     write(&mut w, &[ev(3, 2, 102, 14, "[]", "later")]);
+    // Its content left the disk at once (no reader holds it); the rest of it
+    // stays until a flush covers it, for the replay below.
+    let log = std::fs::read(dir.join("log").join("00000000.log")).unwrap();
+    assert!(!log.windows(14).any(|w| w == b"second profile"), "removed content still on disk");
     let crashed = tmpdir("dead-replacer-copy");
     copy_dir(&dir, &crashed);
     drop((store, w));
