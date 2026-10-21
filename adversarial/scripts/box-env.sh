@@ -4,7 +4,7 @@
 # Everything lives under /root/bench/adv: sources, builds, the isolated
 # toolchain (nightly, for libFuzzer), crate downloads, campaign data, logs.
 # Nothing here writes, signals or deletes anything outside it (assert_in_adv
-# guards every such path). Relays bind 127.0.0.1 only, on ports 7850-7899.
+# guards every such path). Relays bind 127.0.0.1 only, on a free port.
 # Every heavy process runs capped: CPUs 0-5 (6 and 7 are never used), nice
 # 10, 4 cargo jobs, and a memory ceiling where it could balloon.
 

@@ -37,7 +37,9 @@ pub fn config(data: &[u8]) -> u64 {
             if let Some(l) = e.line {
                 assert!(l >= 1 && l <= lines + 1, "error on line {l} of a {lines}-line file");
             }
-            fp(&[3, fp_str(&e.msg[..e.msg.len().min(24)])])
+            // The message's start, as the kind of error (whole characters).
+            let head: String = e.msg.chars().take(24).collect();
+            fp(&[3, fp_str(&head)])
         }
     }
 }
