@@ -1302,3 +1302,34 @@ fn a_closed_store_leaves_its_directory_alone() {
     assert_eq!(store.snapshot().count(&filter(r#"{"kinds":[14]}"#), 0), 2000);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn counts_take_each_event_once_whatever_its_keys() {
+    let dir = tmpdir("count-once");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    // One event under two of a filter's tag values; one with two authors' worth
+    // of nothing (authors are one per event); one expired, one not yet.
+    let recs = vec![
+        ev(1, 1, 100, 1, r#"[["t","a"],["t","b"]]"#, "x"),
+        ev(2, 1, 101, 1, r#"[["t","a"]]"#, "x"),
+        ev(3, 2, 102, 1, r#"[["t","b"],["expiration","50"]]"#, "x"),
+        ev(4, 2, 103, 7, r#"[["t","c"],["expiration","5000"]]"#, "x"),
+    ];
+    write(&mut w, &recs);
+    let v = store.snapshot();
+    let at = 1000;
+    let count = |json: &str| v.count(&filter(json), at);
+    assert_eq!(count(r##"{"#t":["a","b"]}"##), 2, "the first event under both values, once; the third expired");
+    assert_eq!(count(r##"{"#t":["a"]}"##), 2);
+    assert_eq!(count(r##"{"kinds":[1,7]}"##), 3);
+    assert_eq!(count(&format!(r#"{{"authors":["{}","{}"]}}"#, pk(1), pk(2))), 3);
+    assert_eq!(count(&format!(r#"{{"authors":["{}"],"kinds":[1,7]}}"#, pk(2))), 1);
+    assert_eq!(count("{}"), 3);
+    assert_eq!(count(r#"{"since":101,"until":102}"#), 1);
+    // The same answers as the general walk, which orders and deduplicates.
+    for json in [r##"{"#t":["a","b"]}"##, r#"{"kinds":[1,7]}"#, "{}", r#"{"since":101}"#] {
+        assert_eq!(count(json), v.matching_seqs(&[filter(json)], None, at).count() as u64, "{json}");
+    }
+    drop((store, w));
+    let _ = std::fs::remove_dir_all(&dir);
+}

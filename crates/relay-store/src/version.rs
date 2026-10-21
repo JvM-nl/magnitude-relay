@@ -448,6 +448,12 @@ impl Version {
     /// will take, found up front in the expiry index. For counting and removal,
     /// where reading millions of records would be the whole cost.
     pub fn matching_seqs(&self, filters: &[Filter], older_than: Option<u64>, now: u64) -> Matching<'_> {
+        self.walk(filters, older_than, now, Some(self.expired_live(now)))
+    }
+
+    /// Live events whose expiration has passed (not yet swept), from the expiry
+    /// index: what a keys-only walk must leave out.
+    fn expired_live(&self, now: u64) -> std::collections::HashSet<u64> {
         let mut expired = std::collections::HashSet::new();
         let hi = prefix(T_EXPIRY, &[&now.saturating_add(1).to_be_bytes()]);
         self.for_range(&[T_EXPIRY], &hi, |k| {
@@ -456,7 +462,7 @@ impl Version {
                 expired.insert(seq);
             }
         });
-        self.walk(filters, older_than, now, Some(expired))
+        expired
     }
 
     fn walk(&self, filters: &[Filter], older_than: Option<u64>, now: u64, keys_only: Option<std::collections::HashSet<u64>>) -> Matching<'_> {
@@ -545,7 +551,38 @@ impl Version {
     /// a key: a million-wrap mailbox in ~50 ms); see [`count_cost`](Self::count_cost)
     /// to decide where to run a big one.
     pub fn count_all(&self, filters: &[Filter], now: u64) -> u64 {
+        if let [f] = filters {
+            if let Some(n) = self.count_by_keys(f, now) {
+                return n;
+            }
+        }
         self.matching_seqs(filters, None, now).count() as u64
+    }
+
+    /// One filter the index answers whole, whose keys name each event at most
+    /// once (one author, kind or author and kind per event; or a single prefix):
+    /// counted run by run, range by range. The walk would merge every run's
+    /// keys into order and drop repeats, which a count needs neither of.
+    fn count_by_keys(&self, f: &Filter, now: u64) -> Option<u64> {
+        let Plan::Scan { prefixes, exact: true } = self.plan(f) else { return None };
+        let distinct = prefixes.len() == 1 || prefixes.iter().all(|p| matches!(p.first(), Some(&(T_AUTHOR | T_AUTHOR_KIND | T_KIND | T_CREATED))));
+        if !distinct {
+            return None;
+        }
+        let expired = self.expired_live(now);
+        let (since, until) = (f.since.unwrap_or(0), f.until.unwrap_or(u64::MAX));
+        let mut n = 0u64;
+        for p in &prefixes {
+            let (lo, hi) = bounds(p, since, until);
+            for r in self.runs.iter() {
+                r.scan(&lo, &hi, Some(p), &mut |k| {
+                    let seq = seq_of(k);
+                    n += u64::from(self.is_live(seq) && !expired.contains(&seq));
+                    true
+                });
+            }
+        }
+        Some(n)
     }
 
     /// Roughly how many index keys counting `filters` walks, from the block
