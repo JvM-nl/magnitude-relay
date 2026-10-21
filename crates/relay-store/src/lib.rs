@@ -284,7 +284,7 @@ impl Store {
                 dead_seqs.extend(log::flagged_dead(&path, opts.segment_size)?);
             }
         }
-        let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, &retired, &cold_keep, |fr: log::Frame<'_>| {
+        let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, ck.covered, &retired, &cold_keep, |fr: log::Frame<'_>| {
             if loc_err.is_none() {
                 if let Err(e) = locs.set(fr.seq, fr.off) {
                     loc_err = Some(e);

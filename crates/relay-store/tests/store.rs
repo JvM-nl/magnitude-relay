@@ -1831,3 +1831,52 @@ fn a_damaged_dead_set_is_refused() {
     assert!(Store::open(&dir, opts()).is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Found by the adversarial suite's power-cut torture: a batch spanning two
+/// log segments, cut by a power loss that kept its frames in the second
+/// segment and lost those in the first. The store refused to open ("corrupt
+/// frame inside sealed segment") when the lost page held a torn frame, and
+/// when it read as zeros replayed the second segment's frames: seqs whose
+/// frames were gone came back as live events that could not be read. The log
+/// now ends at the first torn or out-of-sequence frame, in any segment.
+#[test]
+fn a_batch_torn_across_two_segments_is_dropped_whole() {
+    let dir = tmpdir("torn-across");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    let seg0 = dir.join("log").join("00000000.log");
+    let used = |p: &std::path::Path| std::fs::read(p).map_or(0, |b| b.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1));
+    // Fill the first segment to within a few frames of its end.
+    let mut n = 0;
+    while used(&seg0) < 60 * 1024 {
+        write(&mut w, &[ev(n, 1, 100 + n, 1, "[]", &"a".repeat(900))]);
+        n += 1;
+    }
+    let before = w.next_seq();
+    let used0 = used(&seg0);
+    let batch: Vec<Vec<u8>> = (1000..1020).map(|i| ev(i, 2, 300 + i, 1, "[]", &"b".repeat(900))).collect();
+    write(&mut w, &batch);
+    drop((store, w));
+    let seg1 = dir.join("log").join("00000001.log");
+    assert!(used(&seg1) > 0, "the batch reaches the second segment");
+    // The power cut: the batch's frames in the first segment are lost, those
+    // in the second kept.
+    let from = used0 as u64;
+    let len = std::fs::metadata(&seg0).unwrap().len();
+    patch(&seg0, from, &vec![0u8; (len - from) as usize]);
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    let next = w.next_seq();
+    assert!((before..before + 20).contains(&next), "next seq {next} after a batch from {before} was torn");
+    let v = store.snapshot();
+    for s in 0..next {
+        assert!(v.record(s).is_some(), "seq {s} is live but cannot be read");
+    }
+    drop(v);
+    // Writes go on from there, and a restart finds exactly them.
+    write(&mut w, &[ev(5000, 3, 900, 1, "[]", "after")]);
+    drop((store, w));
+    let (store, w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(w.next_seq(), next + 1);
+    assert!(ids(&store, r#"{"kinds":[1]}"#, 1000).contains(&id_of(5000)));
+    drop((store, w));
+    let _ = std::fs::remove_dir_all(dir);
+}

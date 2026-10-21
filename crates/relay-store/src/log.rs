@@ -129,7 +129,10 @@ pub struct LogWriter {
 /// Returns where the good frames end and whether they ended cleanly. With
 /// `trust_len` (a segment written whole and synced before use), a crc mismatch
 /// is a record zeroed after its copy was taken: reported dead, not an end.
-fn scan(seg: &MappedFile, seg_size: u64, base: u64, mut o: usize, trust_len: bool, f: &mut impl FnMut(Frame<'_>)) -> (usize, bool) {
+///
+/// With `expect`, frames must carry consecutive seqs from it on: one that
+/// does not ends the scan as not clean.
+fn scan(seg: &MappedFile, seg_size: u64, base: u64, mut o: usize, trust_len: bool, mut expect: Option<&mut u64>, f: &mut impl FnMut(Frame<'_>)) -> (usize, bool) {
     loop {
         if o + FRAME_HEADER > seg_size as usize {
             return (o, true);
@@ -152,6 +155,12 @@ fn scan(seg: &MappedFile, seg_size: u64, base: u64, mut o: usize, trust_len: boo
                 return (o, false);
             }
             dead = true;
+        }
+        if let Some(e) = expect.as_deref_mut() {
+            if seq != *e {
+                return (o, false);
+            }
+            *e += 1;
         }
         f(Frame { off: base + o as u64, seq, dead, intact, record });
         o += FRAME_HEADER + len;
@@ -180,7 +189,7 @@ pub fn flagged_dead(path: &Path, seg_size: u64) -> io::Result<Vec<u64>> {
 
 /// Every frame of a cold segment (used when finishing an interrupted compaction).
 pub fn scan_cold(seg: &MappedFile, seg_size: u64, n: u64, mut f: impl FnMut(Frame<'_>)) {
-    scan(seg, seg_size, (COLD_BASE + n) * seg_size, 0, true, &mut f);
+    scan(seg, seg_size, (COLD_BASE + n) * seg_size, 0, true, None, &mut f);
 }
 
 /// Every frame of a sealed hot segment, in order (log compaction's input).
@@ -188,7 +197,7 @@ pub fn scan_cold(seg: &MappedFile, seg_size: u64, n: u64, mut f: impl FnMut(Fram
 /// zeroed under the scan (reported dead). False if the frames did not end
 /// cleanly: the segment is damaged and must not be retired.
 pub fn scan_hot(seg: &MappedFile, seg_size: u64, n: u64, mut f: impl FnMut(Frame<'_>)) -> bool {
-    scan(seg, seg_size, n * seg_size, 0, true, &mut f).1
+    scan(seg, seg_size, n * seg_size, 0, true, None, &mut f).1
 }
 
 impl LogWriter {
@@ -198,7 +207,8 @@ impl LogWriter {
     /// `retired` hot segments may be missing (and are removed if present);
     /// `cold` lists the cold segments in use (unlisted ones are leftovers of a
     /// compaction that never finished, and are removed).
-    pub fn open(dir: &Path, seg_size: u64, from: u64, retired: &[u64], cold: &[u64], mut f: impl FnMut(Frame<'_>)) -> io::Result<LogWriter> {
+    /// Replays the log from `from`, whose first frame is seq `first_seq`.
+    pub fn open(dir: &Path, seg_size: u64, from: u64, first_seq: u64, retired: &[u64], cold: &[u64], mut f: impl FnMut(Frame<'_>)) -> io::Result<LogWriter> {
         std::fs::create_dir_all(dir.join("cold"))?;
         let mut names: Vec<u64> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
@@ -242,23 +252,38 @@ impl LogWriter {
         while last > from_seg && hot[last].as_ref().is_none_or(|s| s.read_u32(0) == 0) {
             last -= 1;
         }
+        // The log ends at the first frame that is torn or out of sequence,
+        // whatever segment it is in. A power cut can keep a later page and lose
+        // an earlier one, both unsynced: a batch spanning two segments may be
+        // torn in the first and whole in the second. Nothing from the first
+        // lost frame on was acknowledged (a batch is acknowledged only once it
+        // and every batch before it are synced), so it all goes; replaying the
+        // rest would give seqs whose frames are gone.
         let mut head = 0u64;
+        let mut expect = first_seq;
+        let mut ended = false;
         for (si, slot) in hot.iter().enumerate().take(last + 1).skip(from_seg) {
             let Some(seg) = slot.clone() else { continue };
-            seg.advise(Advice::Sequential);
             let base = si as u64 * seg_size;
+            if ended {
+                seg.zero_from(0)?;
+                continue;
+            }
+            seg.advise(Advice::Sequential);
             let start = if si == from_seg { (from % seg_size) as usize } else { 0 };
-            let (end, clean) = scan(&seg, seg_size, base, start, false, &mut f);
-            if si == last {
+            let (end, clean) = scan(&seg, seg_size, base, start, false, Some(&mut expect), &mut f);
+            seg.advise(Advice::Random);
+            if si == last || !clean {
                 head = base + end as u64;
                 // Whatever follows the last good frame was never acknowledged.
                 if !clean || end < seg_size as usize {
                     seg.zero_from(end as u64)?;
                 }
-            } else if !clean {
-                return Err(io::Error::other(format!("corrupt frame inside sealed segment {si:08}.log at byte {end}")));
+                if si != last {
+                    eprintln!("store: the log ends at byte {end} of {si:08}.log (a torn or out-of-sequence frame); what follows was never acknowledged and is dropped");
+                }
+                ended = true;
             }
-            seg.advise(Advice::Random);
         }
         Ok(LogWriter {
             dir: dir.to_path_buf(),
