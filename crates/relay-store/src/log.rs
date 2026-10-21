@@ -294,11 +294,7 @@ impl LogWriter {
             return Ok(());
         }
         let si = self.buf_start / self.seg_size;
-        let seg = self.file(si).expect("head segment");
-        seg.write_at(self.buf_start % self.seg_size, &self.buf)?;
-        // Their way to the disk starts now, on this thread, so the sync that
-        // follows (on the syncer's) is left with little more than the flush.
-        seg.start_writeback(self.buf_start % self.seg_size, self.buf.len() as u64);
+        self.file(si).expect("head segment").write_at(self.buf_start % self.seg_size, &self.buf)?;
         self.touched.insert(si);
         self.buf.clear();
         self.buf_start = self.head;
