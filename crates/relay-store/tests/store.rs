@@ -1868,6 +1868,50 @@ fn a_zeroed_frame_is_missing_not_a_panic() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Found by the adversarial suite's damage tests: a bit flipped inside a
+/// record on disk was served as it was (only replay and log compaction checked
+/// frame checksums). A record is now checked the first time it is read, and a
+/// damaged one is missing from answers.
+#[test]
+fn a_record_damaged_on_disk_is_missing_not_served() {
+    let dir = damaged_store("damaged-record");
+    let off = u64::from_le_bytes(read_at(&dir.join("locs"), 8 * 8, 8).try_into().unwrap());
+    let log = dir.join("log").join("00000000.log");
+    let frame = read_at(&log, off, 512);
+    let at = frame.windows(7).position(|w| w == b"event 8").unwrap();
+    patch(&log, off + at as u64 + 6, b"9");
+    let before = relay_store::log::DAMAGED_READS.load(std::sync::atomic::Ordering::Relaxed);
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    let v = store.snapshot();
+    assert!(v.record(8).is_none(), "a damaged record was read");
+    assert_eq!(v.record(9).map(|r| *r.id()), Some(id_of(9)), "its neighbour is fine");
+    let got = ids(&store, r#"{"kinds":[1]}"#, 100);
+    assert!(!got.contains(&id_of(8)), "a damaged record was served");
+    assert_eq!(got.len(), 18, "the 20 events but the deleted one and the damaged one");
+    assert!(relay_store::log::DAMAGED_READS.load(std::sync::atomic::Ordering::Relaxed) > before);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Found by the adversarial suite's damage tests: a damaged index block
+/// stopped the relay on the first query that read it, and on the same query
+/// after every restart. Opening now checks every block and refuses a damaged
+/// index, saying how to rebuild it; the export that rebuilds it still opens.
+#[test]
+fn a_damaged_index_block_is_refused_at_open_and_export_still_reads() {
+    let dir = damaged_store("damaged-index");
+    let seg = std::fs::read_dir(dir.join("idx")).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "seg")).expect("a flushed index segment");
+    let b = read_at(&seg, 40, 1);
+    patch(&seg, 40, &[b[0] ^ 0x10]);
+    let err = Store::open(&dir, opts()).err().expect("a damaged index is refused");
+    let msg = err.to_string();
+    assert!(msg.contains("damaged") && msg.contains("export"), "{msg}");
+    let (store, _w) = Store::open(&dir, Options { verify_index: false, ..opts() }).unwrap();
+    let v = store.snapshot();
+    let live = (0..21).filter(|&s| v.record(s).is_some()).count();
+    assert_eq!(live, 20, "every live event reads by seq without the index");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Found by the adversarial suite's damage tests: a flipped bit in `dead.bits`
 /// brought a deleted event back (or hid a live one), silently. `dead.bits`
 /// now carries a checksum, and a damaged one is refused.

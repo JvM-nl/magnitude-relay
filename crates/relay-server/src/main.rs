@@ -212,7 +212,10 @@ fn run() -> Result<(), String> {
             let since = value(&mut args, "--since")?;
             let until = value(&mut args, "--until")?;
             let cfg = load()?;
-            let (store, _w) = Store::open(&cfg.store.data, store_options(&cfg)).map_err(|e| e.to_string())?;
+            // Events are read by seq, never through the index: this is how a
+            // damaged index is rebuilt, so it does not refuse one.
+            let opts = relay_store::Options { verify_index: false, ..store_options(&cfg) };
+            let (store, _w) = Store::open(&cfg.store.data, opts).map_err(|e| e.to_string())?;
             let v = store.snapshot();
             let stdout = std::io::stdout();
             let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());

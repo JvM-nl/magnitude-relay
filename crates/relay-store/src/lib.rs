@@ -33,6 +33,7 @@ pub mod log;
 pub mod memrun;
 pub mod mmap;
 pub mod segment;
+pub mod verified;
 pub mod version;
 pub mod writer;
 
@@ -74,11 +75,15 @@ pub struct Options {
     pub log_compact_segments: usize,
     /// Log bytes clustered together in one sort (0: sized from available memory).
     pub log_chunk_bytes: u64,
+    /// Check every index block's checksum when opening, and refuse a damaged
+    /// index (see `Store::open`). Off only for reading events without the
+    /// index, which is how a damaged one is rebuilt (export, then import).
+    pub verify_index: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { segment_size: 1 << 30, sync: true, flush_bytes: 64 << 20, vanish_urls: Vec::new(), log_compact_segments: 2, log_chunk_bytes: 0 }
+        Options { segment_size: 1 << 30, sync: true, flush_bytes: 64 << 20, vanish_urls: Vec::new(), log_compact_segments: 2, log_chunk_bytes: 0, verify_index: true }
     }
 }
 
@@ -118,6 +123,8 @@ pub(crate) struct Shared {
     /// Every seq below this is on disk. Published events above it are visible
     /// (and relayed live) but their sync is still in flight.
     pub(crate) durable: Arc<AtomicU64>,
+    /// Records whose checksum has been checked (see `verified`).
+    pub(crate) verified: Arc<verified::Verified>,
     /// Held for as long as the store is open: one process per directory.
     _lock: std::fs::File,
 }
@@ -200,6 +207,7 @@ impl Store {
         std::fs::create_dir_all(dir)?;
         let lock = lock_dir(dir)?;
         check_meta(dir, &opts)?;
+        let verify_index = opts.verify_index;
         let idx = dir.join("idx");
         std::fs::create_dir_all(&idx)?;
         // Which step of opening failed, for an error an operator can act on.
@@ -211,6 +219,21 @@ impl Store {
         let mut segments = Vec::with_capacity(ck.segments.len());
         for &id in &ck.segments {
             segments.push(Arc::new(Segment::open(id, &bg::seg_path(&idx, id))?));
+        }
+        // Every block's checksum, now: a damaged block met by a query later
+        // could only stop the relay (and the same query would stop it again
+        // after a restart). Segments are checked side by side.
+        if opts.verify_index {
+            let damaged = std::thread::scope(|s| {
+                let handles: Vec<_> = segments.iter().map(|seg| s.spawn(move || seg.verify_blocks().err().map(|b| (seg.path().to_path_buf(), b)))).collect();
+                handles.into_iter().find_map(|h| h.join().expect("index check"))
+            });
+            if let Some((path, block)) = damaged {
+                return Err(io::Error::other(format!(
+                    "index segment {} block {block} is damaged on disk, and a damaged index cannot answer correctly. Every event is still in the log: rebuild with `export` (it reads events without the index) and `import` into an empty data directory, or restore a backup",
+                    path.display()
+                )));
+            }
         }
         // Leftovers of a flush or compaction that never reached a checkpoint.
         for e in std::fs::read_dir(&idx).map_err(step("listing the index"))?.flatten() {
@@ -354,6 +377,7 @@ impl Store {
         drop(kb);
 
         let mem_bloom = writer::mem_bloom(&opts, &mem);
+        let verified = Arc::new(verified::Verified::default());
         let mut runs: Vec<Run> = segments.iter().map(|s| Run::Disk(s.clone())).collect();
         runs.extend(mem.iter().map(|m| Run::Mem(m.clone())));
         let v = Arc::new(Version {
@@ -366,8 +390,9 @@ impl Store {
             runs: Arc::new(runs),
             mem_start: segments.len(),
             mem_bloom: mem_bloom.clone(),
+            verified: verified.clone(),
         });
-        let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0), durable: Arc::new(AtomicU64::new(next_seq)), _lock: lock });
+        let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0), durable: Arc::new(AtomicU64::new(next_seq)), verified, _lock: lock });
         let finish_intent = !ck.intent_cold.is_empty();
         let mut w = Writer::new(
             shared.clone(),
@@ -398,8 +423,12 @@ impl Store {
         crash_point!("open.repaired");
         // Expiry kills are not re-derived from the tail like rule kills are:
         // one that was not checkpointed is redone before anything is served.
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        w.sweep_expired(now).map_err(step("removing expired events"))?;
+        // (Not when opened without trusting the index: the sweep reads it, and
+        // such an open is for an export, whose import sweeps them anyway.)
+        if verify_index {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            w.sweep_expired(now).map_err(step("removing expired events"))?;
+        }
         Ok((Store { shared }, w))
     }
 

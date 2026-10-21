@@ -1339,6 +1339,7 @@ impl Writer {
             runs: Arc::new(runs),
             mem_start: self.segments.len(),
             mem_bloom: self.mem_bloom.clone(),
+            verified: self.shared.verified.clone(),
         });
         let old = std::mem::replace(&mut *self.shared.current.write().unwrap(), v);
         self.shared.gen.store(gen, Ordering::Release);

@@ -44,14 +44,15 @@ pub fn json(shared: &Shared) -> String {
     }
     let _ = write!(
         o,
-        ",\"store\":{{\"events\":{},\"live\":{},\"dead\":{},\"index_keys\":{},\"index_memory_bytes\":{},\"index_segment_bytes\":{},\"segments\":{}}}",
+        ",\"store\":{{\"events\":{},\"live\":{},\"dead\":{},\"index_keys\":{},\"index_memory_bytes\":{},\"index_segment_bytes\":{},\"segments\":{},\"damaged_reads\":{}}}",
         st.events,
         st.events - st.dead,
         st.dead,
         st.index_keys,
         st.index_mem_bytes,
         st.segment_bytes,
-        st.segments
+        st.segments,
+        relay_store::log::DAMAGED_READS.load(Ordering::Relaxed)
     );
     // One object per [[sync]] entry: which relay, which way, which events, then its counters.
     o.push_str(",\"sync\":[");
@@ -84,6 +85,7 @@ pub fn prometheus(shared: &Shared) -> String {
     gauge("store_index_memory_bytes", st.index_mem_bytes);
     gauge("store_index_segment_bytes", st.segment_bytes);
     gauge("store_segments", st.segments as u64);
+    gauge("store_damaged_reads", relay_store::log::DAMAGED_READS.load(Ordering::Relaxed));
     for (k, v) in t.fields() {
         let _ = writeln!(o, "# TYPE relay_{k} counter\nrelay_{k} {v}");
     }

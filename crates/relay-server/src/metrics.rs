@@ -76,6 +76,8 @@ counters! {
     counts,
     /// COUNTs large enough to be handed to the counting workers.
     counts_offloaded,
+    /// REQs costly enough to be answered by the query workers.
+    reqs_offloaded,
     /// NEG-OPEN messages.
     neg_opens,
     /// Sum of REQ time to EOSE, microseconds (with reqs: the mean).

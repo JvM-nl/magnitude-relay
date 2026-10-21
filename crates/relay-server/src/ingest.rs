@@ -125,6 +125,20 @@ pub enum ReactorMsg {
     Ephemeral(Arc<[u8]>),
     /// A COUNT answered by a counting worker, for one connection.
     Count { conn: ConnId, sub: String, n: u64 },
+    /// A REQ's stored events, found and encoded by a worker (see `ReqJob`).
+    Req(Arc<ReqAnswer>),
+}
+
+/// What a worker found for a REQ: its `["EVENT",...]` messages end to end.
+pub struct ReqAnswer {
+    pub conn: ConnId,
+    pub sub: String,
+    /// The hold this answer is for (a CLOSE or a new REQ with the same id ends it).
+    pub token: u64,
+    pub msgs: Vec<u8>,
+    pub ends: Vec<usize>,
+    /// The answer outgrew the connection's outbound limit: CLOSED, not EOSE.
+    pub too_big: bool,
 }
 
 /// A COUNT too big to run on a reactor: the snapshot it is counted on, and
@@ -136,6 +150,28 @@ pub struct CountJob {
     pub reactor: usize,
     pub conn: ConnId,
     pub sub: String,
+}
+
+/// A REQ too costly for a reactor (see `Session::on_req`): answered on a
+/// worker from the snapshot it was made on, while its subscription is held.
+pub struct ReqJob {
+    pub snap: Arc<relay_store::Version>,
+    pub filters: Vec<relay_proto::Filter>,
+    pub limits: Vec<usize>,
+    pub now: u64,
+    pub reactor: usize,
+    pub conn: ConnId,
+    pub sub: String,
+    pub token: u64,
+    /// To a trusted peer (gift wraps listed, first-hand marks).
+    pub peer: bool,
+    pub max_outbound: usize,
+}
+
+/// Work for the query workers.
+pub enum Job {
+    Count(CountJob),
+    Req(ReqJob),
 }
 
 pub type Sink = Box<dyn Fn(ReactorMsg) + Send>;

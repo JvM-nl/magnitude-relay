@@ -434,6 +434,20 @@ impl Segment {
         (off, len, count, before, self.map.slice(e + 26, klen))
     }
 
+    /// Checks every block's checksum (`Err` names the first damaged one), so
+    /// that none is checked again on use.
+    pub fn verify_blocks(&self) -> Result<(), usize> {
+        for i in 0..self.nblocks {
+            let (off, len, ..) = self.meta(i);
+            let (body, crc) = self.map.slice(off, len).split_at(len - 4);
+            if crc32c(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
+                return Err(i);
+            }
+            self.verified[i / 64].fetch_or(1 << (i % 64), Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Block `i`'s layout, its checksum verified on first use.
     fn block(&self, i: usize) -> BlockRef<'_> {
         let (off, len, count, before, _) = self.meta(i);
@@ -442,7 +456,14 @@ impl Segment {
         let word = &self.verified[i / 64];
         let bit = 1u64 << (i % 64);
         if word.load(Ordering::Relaxed) & bit == 0 {
-            assert_eq!(crc32c(body), u32::from_le_bytes(crc.try_into().unwrap()), "index segment {} block {i} is corrupt", self.path.display());
+            // Opening checked every block; this one was damaged since, on disk
+            // under the page cache. Nothing it says can be trusted.
+            assert_eq!(
+                crc32c(body),
+                u32::from_le_bytes(crc.try_into().unwrap()),
+                "index segment {} block {i} was damaged after the store opened: restarting refuses it and says how to rebuild",
+                self.path.display()
+            );
             word.fetch_or(bit, Ordering::Relaxed);
         }
         let n = u16::from_le_bytes([body[body.len() - 2], body[body.len() - 1]]) as usize;

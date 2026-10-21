@@ -98,8 +98,10 @@ pub struct Ctx<'a> {
     pub m: &'a Block,
     /// Live batches this reactor relayed that are not yet published.
     pub pending: &'a std::collections::VecDeque<Arc<crate::ingest::LiveBatch>>,
-    /// Hands a large COUNT to the counting workers; false when they are full.
-    pub offload: &'a dyn Fn(crate::ingest::CountJob) -> bool,
+    /// Hands a large COUNT or REQ to the query workers; false when they are full.
+    pub offload: &'a dyn Fn(crate::ingest::Job) -> bool,
+    /// This reactor's subscriptions whose stored events a worker is finding.
+    pub held: &'a mut HeldReqs,
     pub conn: ConnId,
 }
 
@@ -107,6 +109,153 @@ pub struct Ctx<'a> {
 /// go to the counting workers, so one big count never stalls a reactor's other
 /// connections. Smaller ones are answered on the spot.
 const INLINE_COUNT_KEYS: u64 = 50_000;
+/// REQs expected to read more index entries than this (a few ms with their
+/// records), or to seek more ranges than `INLINE_REQ_RANGES`, are answered by
+/// the query workers: four clients sending 50-filter REQs had held every
+/// other connection on their reactors for 400 ms at a time.
+const INLINE_REQ_COST: u64 = 20_000;
+const INLINE_REQ_RANGES: usize = 256;
+/// Live events a held subscription keeps before its connection counts as
+/// unable to keep up.
+const HELD_MAX: usize = 4096;
+
+/// Subscriptions whose stored events a worker is still finding: their live
+/// events wait here, to go out after EOSE (stored, then EOSE, then live, as
+/// for a REQ answered on the spot). One per reactor.
+#[derive(Default)]
+pub struct HeldReqs {
+    by_conn: crate::subs::FxMap<ConnId, Vec<HeldReq>>,
+    next_token: u64,
+}
+
+pub struct HeldReq {
+    sub: Box<str>,
+    token: u64,
+    pub recs: Vec<Arc<[u8]>>,
+}
+
+impl HeldReqs {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.by_conn.is_empty()
+    }
+
+    fn hold(&mut self, conn: ConnId, sub: &str, recs: Vec<Arc<[u8]>>) -> u64 {
+        self.release(conn, sub);
+        self.next_token += 1;
+        self.by_conn.entry(conn).or_default().push(HeldReq { sub: sub.into(), token: self.next_token, recs });
+        self.next_token
+    }
+
+    /// Ends a hold (a CLOSE, a new REQ with the same id).
+    pub fn release(&mut self, conn: ConnId, sub: &str) {
+        if let Some(v) = self.by_conn.get_mut(&conn) {
+            v.retain(|h| &*h.sub != sub);
+            if v.is_empty() {
+                self.by_conn.remove(&conn);
+            }
+        }
+    }
+
+    pub fn release_conn(&mut self, conn: ConnId) {
+        self.by_conn.remove(&conn);
+    }
+
+    /// The hold `token` names, ended; `None` if it ended already.
+    pub fn take(&mut self, conn: ConnId, sub: &str, token: u64) -> Option<HeldReq> {
+        let v = self.by_conn.get_mut(&conn)?;
+        let i = v.iter().position(|h| h.token == token && &*h.sub == sub)?;
+        let h = v.swap_remove(i);
+        if v.is_empty() {
+            self.by_conn.remove(&conn);
+        }
+        Some(h)
+    }
+
+    /// Keeps a live event for a held subscription. `None` when it is not
+    /// held; `Some(false)` when the hold is full.
+    #[inline]
+    pub fn keep(&mut self, conn: ConnId, sub: &str, rec: &Arc<[u8]>) -> Option<bool> {
+        let h = self.by_conn.get_mut(&conn)?.iter_mut().find(|h| &*h.sub == sub)?;
+        if h.recs.len() >= HELD_MAX {
+            return Some(false);
+        }
+        h.recs.push(rec.clone());
+        Some(true)
+    }
+}
+
+/// Messages collected instead of sent: what a worker builds for a reactor.
+#[derive(Default)]
+pub struct Collect {
+    pub buf: Vec<u8>,
+    pub ends: Vec<usize>,
+}
+
+impl Outbox for Collect {
+    fn text(&mut self, f: &mut dyn FnMut(&mut Vec<u8>)) {
+        f(&mut self.buf);
+        self.ends.push(self.buf.len());
+    }
+
+    fn queued(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+/// How writing a REQ's stored events went.
+pub struct Answered {
+    pub sent: u64,
+    /// Stopped at the outbound limit.
+    pub too_big: bool,
+}
+
+/// Writes the stored events answering `filters` (each at its limit) from
+/// `snap`, newest first, each once; stops when `out` holds more than
+/// `max_outbound` bytes. Not EOSE. The same on a reactor and on a worker.
+#[allow(clippy::too_many_arguments)]
+pub fn answer(snap: &Version, filters: &[Filter], limits: &[usize], sub_id: &str, peer: bool, now: u64, max_outbound: usize, out: &mut dyn Outbox) -> Answered {
+    let mut hits = Vec::new();
+    for (f, &limit) in filters.iter().zip(limits) {
+        hits.extend(snap.query(f, limit, now));
+    }
+    // One filter's results are distinct and in order already. An event two
+    // filters match is two equal hits, side by side once sorted.
+    if filters.len() > 1 {
+        hits.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+        hits.dedup_by_key(|h| h.seq);
+    }
+    // A gift wrap only broad filters matched is left out; with no broad
+    // filter (Vector's are never broad) every hit came from one that is not.
+    let any_broad = !peer && filters.iter().any(broad);
+    let mut sent = 0;
+    for (i, h) in hits.iter().enumerate() {
+        // An answer bigger than the connection may have waiting is all built
+        // in memory before a byte of it goes out (50 filters of 5000 events
+        // each can be hundreds of megabytes, held as long as the client does
+        // not read). Stop there and say so, rather than truncate silently.
+        if out.queued() > max_outbound {
+            return Answered { sent, too_big: true };
+        }
+        // A later event's bytes load while this one is written out.
+        if let Some(next) = hits.get(i + 3) {
+            snap.prefetch_record(next.seq);
+        }
+        if let Some(rec) = snap.record(h.seq) {
+            if any_broad && hides_wrap(filters, rec) {
+                continue;
+            }
+            event_msg(out, sub_id, rec, peer);
+            sent += 1;
+        }
+    }
+    Answered { sent, too_big: false }
+}
+
+/// `["CLOSED", sub, ...]` for an answer that outgrew the outbound limit.
+pub fn closed_too_big(out: &mut dyn Outbox, sub_id: &str, max_outbound: usize) {
+    closed(out, sub_id, &format!("error: the answer is larger than {} MB; ask for fewer events at a time", max_outbound >> 20));
+}
 
 /// Open negentropy sessions per connection (Vector runs one per relay at a time).
 const MAX_NEG_SESSIONS: usize = 8;
@@ -174,6 +323,7 @@ impl Session {
             Ok(ClientMsg::Count { sub_id, filters }) => self.on_count(sub_id, filters, cx, out),
             Ok(ClientMsg::Close { sub_id }) => {
                 cx.subs.remove(self.conn, sub_id);
+                cx.held.release(self.conn, sub_id);
             }
             Ok(ClientMsg::Auth { .. }) => {
                 let id = *Record(cx.rec).id();
@@ -336,60 +486,63 @@ impl Session {
         if !replacing && cx.subs.count(self.conn) >= cx.cfg.max_subscriptions {
             return closed(out, sub_id, &format!("error: at most {} open subscriptions", cx.cfg.max_subscriptions));
         }
+        cx.held.release(self.conn, sub_id);
         cx.store.refresh(cx.snap);
         let snap = cx.snap.clone();
+        let limits: Vec<usize> = filters.iter().map(|f| f.limit.map_or(cx.cfg.default_limit, |l| (l as usize).min(cx.cfg.max_limit))).collect();
         // Live from the snapshot the stored results come from: nothing is missed
         // and nothing is sent twice.
         cx.subs.add_with(self.conn, sub_id, filters.clone(), snap.gen, self.trusted);
-
-        let mut hits = Vec::new();
-        for f in &filters {
-            let limit = f.limit.map_or(cx.cfg.default_limit, |l| (l as usize).min(cx.cfg.max_limit));
-            hits.extend(snap.query(f, limit, cx.now));
-        }
-        // One filter's results are distinct and in order already. An event two
-        // filters match is two equal hits, side by side once sorted.
-        if filters.len() > 1 {
-            hits.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
-            hits.dedup_by_key(|h| h.seq);
-        }
-        // A gift wrap only broad filters matched is left out; with no broad
-        // filter (Vector's are never broad) every hit came from one that is not.
-        let any_broad = !self.trusted && filters.iter().any(broad);
-        for (i, h) in hits.iter().enumerate() {
-            // An answer bigger than the connection may have waiting is all built
-            // in memory before a byte of it goes out (50 filters of 5000 events
-            // each can be hundreds of megabytes, held as long as the client does
-            // not read). Stop there and say so, rather than truncate silently.
-            if out.queued() > cx.cfg.max_outbound {
-                cx.subs.remove(self.conn, sub_id);
-                let mb = cx.cfg.max_outbound >> 20;
-                return closed(out, sub_id, &format!("error: the answer is larger than {mb} MB; ask for fewer events at a time"));
-            }
-            // A later event's bytes load while this one is written out.
-            if let Some(next) = hits.get(i + 3) {
-                snap.prefetch_record(next.seq);
-            }
-            if let Some(rec) = snap.record(h.seq) {
-                if any_broad && hides_wrap(&filters, rec) {
-                    continue;
-                }
-                event_msg(out, sub_id, rec, self.trusted);
-                metrics::inc(&cx.m.events_out);
-            }
-        }
-        eose(out, sub_id);
         // Batches relayed live before this subscription existed but published
-        // after the snapshot above: in neither the results nor the live stream
-        // so far, so they go out now (exactly once).
+        // after the snapshot: in neither the results nor the live stream so
+        // far, so they go out after EOSE (exactly once).
+        let any_broad = !self.trusted && filters.iter().any(broad);
+        let mut early: Vec<Arc<[u8]>> = Vec::new();
         for batch in cx.pending.iter().filter(|b| b.gen > snap.gen) {
             for rec in &batch.events {
-                let rec = Record(rec);
-                if filters.iter().any(|f| f.matches(rec)) && !(any_broad && hides_wrap(&filters, rec)) {
-                    event_msg(out, sub_id, rec, self.trusted);
-                    metrics::inc(&cx.m.events_live);
+                let r = Record(rec);
+                if filters.iter().any(|f| f.matches(r)) && !(any_broad && hides_wrap(&filters, r)) {
+                    early.push(rec.clone());
                 }
             }
+        }
+
+        if snap.req_cost(&filters, &limits, INLINE_REQ_RANGES) > INLINE_REQ_COST {
+            // A worker finds and encodes the stored events; live ones wait in
+            // the hold until they have gone out.
+            let token = cx.held.hold(self.conn, sub_id, early);
+            let job = crate::ingest::ReqJob {
+                snap,
+                filters,
+                limits,
+                now: cx.now,
+                reactor: cx.reactor,
+                conn: self.conn,
+                sub: sub_id.to_string(),
+                token,
+                peer: self.trusted,
+                max_outbound: cx.cfg.max_outbound,
+            };
+            if (cx.offload)(crate::ingest::Job::Req(job)) {
+                metrics::inc(&cx.m.reqs_offloaded);
+            } else {
+                cx.held.release(self.conn, sub_id);
+                cx.subs.remove(self.conn, sub_id);
+                closed(out, sub_id, "rate-limited: too many large requests in progress, try again shortly");
+            }
+            return;
+        }
+
+        let a = answer(&snap, &filters, &limits, sub_id, self.trusted, cx.now, cx.cfg.max_outbound, out);
+        metrics::add(&cx.m.events_out, a.sent);
+        if a.too_big {
+            cx.subs.remove(self.conn, sub_id);
+            return closed_too_big(out, sub_id, cx.cfg.max_outbound);
+        }
+        eose(out, sub_id);
+        for rec in &early {
+            event_msg(out, sub_id, Record(rec), self.trusted);
+            metrics::inc(&cx.m.events_live);
         }
         metrics::add(&cx.m.req_micros, started.elapsed().as_micros() as u64);
     }
@@ -452,7 +605,7 @@ impl Session {
         // Exact, always: Vector sizes its syncs with it.
         if cx.snap.count_cost(&filters) > INLINE_COUNT_KEYS {
             let job = crate::ingest::CountJob { snap: cx.snap.clone(), filters, now: cx.now, reactor: cx.reactor, conn: cx.conn, sub: sub_id.to_string() };
-            if (cx.offload)(job) {
+            if (cx.offload)(crate::ingest::Job::Count(job)) {
                 metrics::inc(&cx.m.counts_offloaded);
             } else {
                 closed(out, sub_id, "rate-limited: too many large counts in progress, try again shortly");

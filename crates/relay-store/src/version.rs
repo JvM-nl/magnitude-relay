@@ -142,6 +142,8 @@ pub struct Version {
     pub(crate) mem_start: usize,
     /// A filter over every memory run's prefixes (see `bloom::SharedBloom`).
     pub(crate) mem_bloom: Arc<crate::bloom::SharedBloom>,
+    /// Records whose checksum has been checked, shared by every version.
+    pub(crate) verified: Arc<crate::verified::Verified>,
 }
 
 /// One query result, enough to order it and fetch it.
@@ -215,7 +217,18 @@ impl Version {
     /// event's bytes (or panicking on a zeroed frame).
     #[inline]
     fn checked(&self, seq: u64) -> Option<Record<'_>> {
-        log::record_of(&self.segs, self.seg_size, locs::get(&self.locs, seq), seq).map(Record)
+        let off = locs::get(&self.locs, seq);
+        let rec = log::record_of(&self.segs, self.seg_size, off, seq)?;
+        // Its checksum, the first time this process reads it: a record
+        // damaged on disk is missing, never served as other bytes.
+        if !self.verified.contains(seq) {
+            if !log::record_crc_ok(&self.segs, self.seg_size, off, rec) {
+                log::report_damaged(seq);
+                return None;
+            }
+            self.verified.insert(seq);
+        }
+        Some(Record(rec))
     }
 
     /// The record at `seq` for the write path's rules and `repair`, which
@@ -640,6 +653,30 @@ impl Version {
                 Plan::Scan { prefixes, .. } => self.estimate_all(&prefixes, f.since.unwrap_or(0), f.until.unwrap_or(u64::MAX)),
             })
             .sum()
+    }
+
+    /// About how many index entries answering `filters` reads, each filter
+    /// capped at `limits[i]` events: a scan where every key matches stops at
+    /// its limit, one that checks records reads every key in range; each range
+    /// is a seek. `u64::MAX` past `max_ranges` ranges, without estimating them.
+    pub fn req_cost(&self, filters: &[Filter], limits: &[usize], max_ranges: usize) -> u64 {
+        let mut ranges = 0;
+        let mut cost = 0u64;
+        for (f, &limit) in filters.iter().zip(limits) {
+            match self.plan(f) {
+                Plan::Nothing => {}
+                Plan::Ids => cost += f.ids.as_ref().map_or(0, |i| i.len() as u64),
+                Plan::Scan { prefixes, exact } => {
+                    ranges += prefixes.len();
+                    if ranges > max_ranges {
+                        return u64::MAX;
+                    }
+                    let keys = self.estimate_all(&prefixes, f.since.unwrap_or(0), f.until.unwrap_or(u64::MAX));
+                    cost += prefixes.len() as u64 + if exact { keys.min(limit as u64) } else { keys };
+                }
+            }
+        }
+        cost
     }
 }
 

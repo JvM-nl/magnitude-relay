@@ -9,7 +9,7 @@
 use crate::config::Config;
 use crate::ingest::{ReactorMsg, WriteReq};
 use crate::metrics::{self, Metrics};
-use crate::session::{self, Ctx, Outbox, Session, SessionCfg, SigQueue};
+use crate::session::{self, Ctx, HeldReqs, Outbox, Session, SessionCfg, SigQueue};
 use crate::sock::{Incoming, Sock, Stream, TlsConfig};
 use crate::subs::{ConnId, FxMap, SubIndex};
 use crate::verify::Job;
@@ -48,7 +48,7 @@ pub struct Shared {
     pub writer: SyncSender<WriteReq>,
     pub reactors: OnceLock<Vec<mpsc::UnboundedSender<ReactorMsg>>>,
     /// The counting workers' queue (see `count_workers`).
-    pub counts: OnceLock<SyncSender<crate::ingest::CountJob>>,
+    pub counts: OnceLock<SyncSender<crate::ingest::Job>>,
     pub nip11: String,
     pub next_conn: AtomicU64,
     ips: Mutex<FxMap<IpAddr, IpState>>,
@@ -222,6 +222,8 @@ struct Reactor {
     scratch: Vec<u8>,
     /// Live batches relayed but not yet published, oldest first.
     pending: std::collections::VecDeque<Arc<crate::ingest::LiveBatch>>,
+    /// Subscriptions waiting for a worker's answer to their REQ.
+    held: HeldReqs,
 }
 
 /// Frames each reply as a WebSocket text message: built in place, or, for a
@@ -373,6 +375,7 @@ pub fn run(
             sigs: SigQueue::default(),
             scratch: vec![0; READ_CHUNK],
             pending: std::collections::VecDeque::new(),
+            held: HeldReqs::default(),
         }));
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
         tokio::task::spawn_local(keep_fresh(st.clone(), shared.clone()));
@@ -395,11 +398,11 @@ async fn keep_fresh(st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
     }
 }
 
-/// COUNTs too big for a reactor, run on their own threads against the
+/// COUNTs and REQs too big for a reactor, run on their own threads against the
 /// snapshot the request saw; each answer goes back to the connection's reactor.
-/// The queue is bounded: when it is full, a big COUNT is refused, not queued.
+/// The queue is bounded: when it is full, a big request is refused, not queued.
 pub fn count_workers(shared: &Arc<Shared>, workers: usize) {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<crate::ingest::CountJob>(COUNT_QUEUE);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<crate::ingest::Job>(COUNT_QUEUE);
     assert!(shared.counts.set(tx).is_ok(), "counting workers start once");
     let rx = Arc::new(Mutex::new(rx));
     for i in 0..workers {
@@ -411,10 +414,21 @@ pub fn count_workers(shared: &Arc<Shared>, workers: usize) {
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                let n = job.snap.count_all(&job.filters, job.now);
-                drop(job.snap);
-                if let Some(r) = shared.reactors.get().and_then(|r| r.get(job.reactor)) {
-                    let _ = r.send(ReactorMsg::Count { conn: job.conn, sub: job.sub, n });
+                let (reactor, msg) = match job {
+                    crate::ingest::Job::Count(job) => {
+                        let n = job.snap.count_all(&job.filters, job.now);
+                        (job.reactor, ReactorMsg::Count { conn: job.conn, sub: job.sub, n })
+                    }
+                    crate::ingest::Job::Req(job) => {
+                        let mut c = session::Collect::default();
+                        let a = session::answer(&job.snap, &job.filters, &job.limits, &job.sub, job.peer, job.now, job.max_outbound, &mut c);
+                        metrics::add(&shared.metrics.of(job.reactor).events_out, a.sent);
+                        let ans = crate::ingest::ReqAnswer { conn: job.conn, sub: job.sub, token: job.token, msgs: c.buf, ends: c.ends, too_big: a.too_big };
+                        (job.reactor, ReactorMsg::Req(Arc::new(ans)))
+                    }
+                };
+                if let Some(r) = shared.reactors.get().and_then(|r| r.get(reactor)) {
+                    let _ = r.send(msg);
                 }
             })
             .expect("counting worker");
@@ -489,6 +503,37 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                 }
                 (&[], 0)
             }
+            ReactorMsg::Req(a) => {
+                // Unless the subscription was closed or replaced meanwhile: its
+                // stored events, EOSE, then what came live while it was held.
+                if let (Some(h), Some(o)) = (r.held.take(a.conn, &a.sub, a.token), r.conns.get(&a.conn)) {
+                    let max = shared.scfg.max_outbound;
+                    o.write(|w| {
+                        let mut start = 0;
+                        for &end in &a.ends {
+                            w.text(&mut |b| b.extend_from_slice(&a.msgs[start..end]));
+                            start = end;
+                        }
+                        if a.too_big {
+                            session::closed_too_big(w, &a.sub, max);
+                        } else {
+                            session::eose(w, &a.sub);
+                            for rec in &h.recs {
+                                session::event_msg(w, &a.sub, Record(rec), o.peer);
+                            }
+                        }
+                    });
+                    if a.too_big {
+                        r.subs.remove(a.conn, &a.sub);
+                    } else {
+                        let m = shared.metrics.of(r.idx);
+                        metrics::add(&m.events_out, h.recs.len() as u64);
+                        metrics::add(&m.events_live, h.recs.len() as u64);
+                    }
+                    o.notify.notify_one();
+                }
+                (&[], 0)
+            }
         };
         for rec in events {
             targets.clear();
@@ -503,6 +548,18 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
             let body: Option<Rc<[u8]>> = (json.len() >= SHARE_MIN && targets.len() > 1).then(|| Rc::from(&json[..]));
             for (conn, sub) in &targets {
                 let Some(o) = r.conns.get(conn) else { continue };
+                // Held while a worker answers its REQ: after EOSE.
+                if !r.held.is_empty() {
+                    match r.held.keep(*conn, sub, rec) {
+                        Some(true) => continue,
+                        Some(false) => {
+                            o.overflow.set(true);
+                            o.notify.notify_one();
+                            continue;
+                        }
+                        None => {}
+                    }
+                }
                 if o.queued() > limit {
                     o.overflow.set(true);
                 } else {
@@ -599,6 +656,7 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
     {
         let mut r = st.borrow_mut();
         r.subs.remove_conn(conn);
+        r.held.release_conn(conn);
         r.conns.remove(&conn);
     }
     shared.release(ip);
@@ -689,7 +747,7 @@ struct Pass {
 fn with_cx(st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr, conn: ConnId, out: &ConnOut, f: impl FnOnce(&mut Ctx<'_>, &mut WsOut<'_>)) {
     let broadcast = |m: ReactorMsg| shared.broadcast(m);
     let allow_event = || shared.take_event(ip);
-    let offload = |job: crate::ingest::CountJob| shared.counts.get().is_some_and(|q| q.try_send(job).is_ok());
+    let offload = |job: crate::ingest::Job| shared.counts.get().is_some_and(|q| q.try_send(job).is_ok());
     let mut guard = st.borrow_mut();
     let r = &mut *guard;
     shared.store.refresh(&mut r.snap);
@@ -709,6 +767,7 @@ fn with_cx(st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr, conn: ConnId, out
         m: shared.metrics.of(r.idx),
         pending: &r.pending,
         offload: &offload,
+        held: &mut r.held,
         conn,
     };
     out.write(|w| f(&mut cx, w));

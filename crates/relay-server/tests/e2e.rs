@@ -1292,3 +1292,69 @@ async fn an_answer_past_the_outbound_limit_ends_in_closed() {
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Found by the adversarial suite: a REQ needing hundreds of index seeks ran
+/// on its reactor, holding every other connection there. Over a cost it is
+/// answered by a query worker: the same events, then EOSE, then live ones.
+#[tokio::test]
+async fn costly_reqs_are_answered_off_the_reactors_in_order() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-costly-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let relay = Relay::start(dir, free_port());
+    let host = relay.addr.to_string();
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    let signers: Vec<Signer> = (1..=3).map(Signer::new).collect();
+    let to = Signer::new(9).pk();
+    let t = now();
+    for (k, s) in signers.iter().enumerate() {
+        for i in 0..10u64 {
+            send(&mut c, json!(["EVENT", s.event(t - 100 - i * 3 - k as u64, 1059, json!([["p", to]]), &format!("wrap {k} {i}"))])).await;
+            assert!(ok_of(&mut c).await.0);
+        }
+    }
+    // 300 authors (297 with no events) x one kind: 300 index ranges.
+    let mut authors: Vec<String> = signers.iter().map(Signer::pk).collect();
+    authors.extend((0..297u32).map(|n| {
+        let mut b = [0x5A; 32];
+        b[..4].copy_from_slice(&n.to_le_bytes());
+        hex::encode_string(&b)
+    }));
+    let ids = |evs: &[Value]| evs.iter().map(|e| e["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    send(&mut c, json!(["REQ", "costly", {"authors": authors, "kinds": [1059]}])).await;
+    let (costly, end) = collect(&mut c, "costly").await;
+    assert_eq!(end[0], "EOSE");
+    send(&mut c, json!(["REQ", "cheap", {"authors": authors[..3], "kinds": [1059]}])).await;
+    let (cheap, _) = collect(&mut c, "cheap").await;
+    assert_eq!(ids(&costly), ids(&cheap), "the worker's answer is the reactor's, newest first");
+    assert_eq!(costly.len(), 30);
+    // Live after EOSE, once (each subscription gets its copy).
+    let live = signers[0].event(t, 1059, json!([["p", to]]), "live wrap");
+    send(&mut c, json!(["EVENT", live])).await;
+    let mut got = Vec::new();
+    while got.len() < 3 {
+        let m = recv(&mut c).await;
+        match m[0].as_str() {
+            Some("OK") => got.push("ok".to_string()),
+            Some("EVENT") => {
+                assert_eq!(m[2]["id"], live["id"]);
+                got.push(m[1].as_str().unwrap().to_string());
+            }
+            _ => panic!("unexpected {m}"),
+        }
+    }
+    got.sort();
+    assert_eq!(got, ["cheap", "costly", "ok"]);
+    assert_eq!(stats(&relay).await["reqs_offloaded"].as_u64(), Some(1));
+    // A CLOSE while held, then the same id again: one answer, the second's.
+    send(&mut c, json!(["REQ", "again", {"authors": authors, "kinds": [1059]}])).await;
+    send(&mut c, json!(["CLOSE", "again"])).await;
+    send(&mut c, json!(["REQ", "again", {"authors": authors, "kinds": [1059], "limit": 5}])).await;
+    let (evs, end) = collect(&mut c, "again").await;
+    assert_eq!((evs.len(), end[0].as_str()), (5, Some("EOSE")));
+    send(&mut c, json!(["REQ", "probe", {"ids": [live["id"]]}])).await;
+    let (evs, _) = collect(&mut c, "probe").await;
+    assert_eq!(evs.len(), 1, "nothing left over from the closed one before this");
+    drop(c);
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -76,6 +76,24 @@ pub fn record_of(segs: &Segs, seg_size: u64, off: u64, seq: u64) -> Option<&[u8]
     Some(seg.slice(o + FRAME_HEADER, len))
 }
 
+/// Whether `rec`, read by [`record_of`] at `off`, matches its frame's checksum.
+#[inline]
+pub fn record_crc_ok(segs: &Segs, seg_size: u64, off: u64, rec: &[u8]) -> bool {
+    segs.file(off / seg_size).is_some_and(|seg| crc32c(rec) == seg.read_u32((off % seg_size) as usize + 16))
+}
+
+/// Records found damaged on read (they are skipped), since the process started.
+pub static DAMAGED_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts a record that failed its checksum on read, and says so for the first few.
+#[cold]
+pub fn report_damaged(seq: u64) {
+    let n = DAMAGED_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 16 {
+        eprintln!("store: record {seq} fails its checksum: it is damaged on disk and is skipped (a backup or a re-import restores it)");
+    }
+}
+
 /// Whether the frame at `off` still matches the checksum it was written with.
 pub fn frame_intact(segs: &Segs, seg_size: u64, off: u64) -> bool {
     let Some(seg) = segs.file(off / seg_size) else { return false };
