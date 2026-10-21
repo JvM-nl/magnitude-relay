@@ -320,8 +320,14 @@ impl<'a> Scanner<'a> {
             }
             s.p - d
         };
+        let int_start = self.p;
         if digits(self) == 0 {
             return self.err("bad number");
+        }
+        // JSON forbids leading zeros (`01`, `-00`): what the scanner skips must
+        // still be JSON, or a document we accept is one other parsers refuse.
+        if self.b[int_start] == b'0' && self.p - int_start > 1 {
+            return self.err("leading zero");
         }
         if self.b.get(self.p) == Some(&b'.') {
             self.p += 1;
@@ -716,6 +722,20 @@ mod tests {
         s.end().unwrap();
         let deep = "[".repeat(100) + &"]".repeat(100);
         assert!(Scanner::new(&deep).skip().is_err());
+    }
+
+    #[test]
+    fn skipped_numbers_are_json_numbers() {
+        // Found by the adversarial suite's differential against serde_json: a
+        // skipped value with a leading zero was accepted.
+        for bad in ["00", "01", "-01", "-00", "007.5", "[0,01]", "{\"x\":00}"] {
+            let mut s = Scanner::new(bad);
+            assert!(s.skip().and_then(|()| s.end()).is_err(), "{bad} accepted");
+        }
+        for good in ["0", "-0", "0.5", "-0.0e5", "10", "[0,1,0e1]", "{\"x\":0}"] {
+            let mut s = Scanner::new(good);
+            assert!(s.skip().and_then(|()| s.end()).is_ok(), "{good} refused");
+        }
     }
 
     #[test]
