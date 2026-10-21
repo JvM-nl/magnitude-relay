@@ -9,8 +9,10 @@
 //! A live REQ alone misses things: relays cap what a REQ returns from storage
 //! (strfry at 500), so after a gap only the newest events come back, and gift
 //! wraps are backdated up to two days, so a wrap that arrived during the gap can
-//! be older than all of those. On every (re)connect the whole window is therefore
-//! also copied page by page, on connections of its own, beside the live feed.
+//! be older than all of those. strfry's live feed also skips some events outright
+//! (measured: about 80 in an hour, mostly backdated). So on every (re)connect,
+//! and every ten minutes after, the window is copied page by page on
+//! connections of its own, beside the live feed.
 
 use relay_bench::net::{connect, recv_text, resolve, RecvError};
 use relay_bench::wire::{parse_relay_msg, RelayMsg};
@@ -21,6 +23,8 @@ use std::time::{Duration, Instant};
 const PAGE: usize = 500;
 /// Gift wraps are backdated up to this much (NIP-59).
 const BACKDATE: u64 = 2 * 86400;
+/// How often the window is copied again while connected.
+const REFILL_EVERY: Duration = Duration::from_secs(600);
 
 /// The raw event object inside `["EVENT","sub",{...}]`.
 fn event_json(msg: &str) -> Option<&str> {
@@ -123,13 +127,17 @@ fn main() {
         let mut tally: BTreeMap<String, u64> = BTreeMap::new();
         let mut last = Instant::now();
         loop {
-            let window_start = since.saturating_sub(BACKDATE);
             let fill = async {
-                match backfill(&from, &to, window_start).await {
-                    Ok(t) => println!("{} backfill since {window_start} done: {:?}", now(), t),
-                    Err(e) => println!("{} backfill since {window_start} failed: {e}", now()),
+                let mut window_start = since.saturating_sub(BACKDATE);
+                loop {
+                    let started = now();
+                    match backfill(&from, &to, window_start).await {
+                        Ok(t) => println!("{} backfill since {window_start} done: {:?}", now(), t),
+                        Err(e) => println!("{} backfill since {window_start} failed: {e}", now()),
+                    }
+                    tokio::time::sleep(REFILL_EVERY).await;
+                    window_start = started.saturating_sub(BACKDATE);
                 }
-                std::future::pending::<()>().await
             };
             let run = async {
                 let mut src = connect(&resolve(&from).await?, None).await.map_err(|e| e.to_string())?;
@@ -167,7 +175,7 @@ fn main() {
             };
             let result = tokio::select! {
                 r = run => r,
-                _ = fill => unreachable!(),
+                () = fill => unreachable!(),
             };
             if let Err(e) = result {
                 println!("{} reconnecting after: {e}", now());

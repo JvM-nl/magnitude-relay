@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""compare.py FILE.jsonl...  Side-by-side table of suite.sh results.
+"""compare.py [--best] FILE.jsonl...  Side-by-side table of suite.sh results.
 
 Every relay-bench result line (and suite.sh's footprint lines) is grouped by
 workload and relay; a relay that ran a workload more than once (several rounds)
-gets the median of each number. Prints one Markdown table: throughput and
+gets the median of each number, or with --best its best one (on a shared box
+other load only ever slows a run down, so the best run is the least disturbed). Prints one Markdown table: throughput and
 latency per workload, the best value in bold. A result that returned wrong
 answers is shown as "wrong" and never wins; one the relay does not support as
 "n/a".
@@ -30,7 +31,7 @@ def get(d, path):
 
 def metrics(command, workload):
     if command == "footprint":
-        return [("disk", ("disk_bytes",), False, "GB"), ("RSS", ("rss_kb",), False, "MBk")]
+        return [("disk", ("disk_bytes",), False, "GB"), ("RSS", ("rss_kb",), False, "MBk"), ("RSS private", ("rss_anon_kb",), False, "MBk")]
     if command == "idle":
         return [("conn/s", ("ops_per_s",), True, ""), ("bytes/conn", ("detail", "rss_per_conn_bytes"), False, "")]
     if command == "fanout":
@@ -55,9 +56,12 @@ def fmt(v, unit):
 
 
 def main():
+    args = sys.argv[1:]
+    best_of = "--best" in args
+    args = [a for a in args if a != "--best"]
     runs = defaultdict(list)  # (command, workload, label) -> [record]
     keys = []
-    for path in sys.argv[1:]:
+    for path in args:
         for line in open(path):
             line = line.strip()
             if not line:
@@ -88,7 +92,7 @@ def main():
                 if not vals:
                     cells[l] = (None, "-")
                     continue
-                v = statistics.median(vals)
+                v = (max(vals) if higher else min(vals)) if best_of else statistics.median(vals)
                 cells[l] = (v, fmt(v, unit))
             scored = [c[0] for c in cells.values() if c[0] is not None]
             best = (max(scored) if higher else min(scored)) if len(scored) > 1 else None
