@@ -16,13 +16,13 @@ relay-bench: load generator and validating tester for Nostr relays
   relay-bench load   --url ws://HOST:PORT --file FILE [--conns C] [--window W] [--batch-ack] [--duplicates] [--count N] [--skip N]
   relay-bench query  --url ws://HOST:PORT --file FILE [--workload W] [--conns C] [--queries Q] [--limit L] [--distinct D] [--strict-ties] [--warmup N]
   relay-bench neg    --url ws://HOST:PORT --file FILE [--recipient-mode heavy|light] [--have PCT] [--sessions S] [--conns C]
-  relay-bench fanout --url ws://HOST:PORT [--subscribers N] [--publishers P] [--rate R] [--duration D] [--community K] [--dm-share PCT]
+  relay-bench fanout --url ws://HOST:PORT [--subscribers N] [--publishers P] [--rate R] [--duration D] [--community K] [--dm-share PCT] [--drain SECS]
   relay-bench idle   --url ws://HOST:PORT [--conns N] [--hold SECS] [--pid PID] [--src-ips K]
 
 Common to every command but gen:
   --label NAME     relay name in reports (default: relay)
   --json FILE      append one JSON object per run to FILE
-  --seed S         seeds every random choice (default 1; must match what `gen` used for nothing: the file is the source of truth)
+  --seed S         seeds the choice of queries, mailboxes and keys (default 1); the dataset file is the source of truth
   --timeout SECS   give up on a reply after this long (default 30)
   --threads T      client runtime threads (default min(cpus, 4)); the relay shares the box
   --src-ips K      spread connections over K loopback source addresses (127.0.0.2...) past ~28k ports
@@ -39,7 +39,10 @@ query: workloads: classic latest_1 latest_100 latest_500 author kind author_kind
        --limit overrides the page size of every workload that has one except latest_N.
        --strict-ties makes NIP-01's same-second order (lowest id first) a requirement.
 neg:   NIP-77 sessions on {kinds:[1059],#p:[r]}; the client holds PCT% (default 90) of the relay's set plus 5 extras.
-fanout: half DM subscribers, half Concord (200 plane authors); publishers send at --rate for --duration.
+fanout: half DM subscribers, half Concord (200 plane authors, --community members share them); publishers send
+       at --rate (total) for --duration seconds; deliveries still missing --drain seconds (default 5) later count as lost.
+load:  --window W events in flight per connection (default 64); --batch-ack waits for all W OKs before sending the next W;
+       --duplicates re-sends events the relay holds; --count/--skip select part of the file.
 idle:  N quiet connections each with a live REQ, held --hold seconds (default 30). `ulimit -n` may need raising.
 ";
 

@@ -1,0 +1,20 @@
+# ditto-relay, benchmark instance. Everything not listed keeps its default.
+
+url = "ws://127.0.0.1:7802"
+bind = "127.0.0.1:7802"
+
+# Default is "127.0.0.1:13133", which is outside the 7801-7809 benchmark port range
+# and would open an extra listener. "" turns the Prometheus listener off.
+metrics_bind = ""
+
+data_dir = "/root/bench/ditto-data"
+
+# Limits raised to at least ours (defaults: 20 / 1000). max_message_size (4000000),
+# max_filters (100), max_filter_values (20000), default_limit (100) stay at their
+# defaults, which already meet or exceed ours.
+max_subscriptions = 200
+max_limit = 5000
+
+# No kind needs AUTH to read. This is already the default (empty), set explicitly
+# so the intent is on the page: kinds 4 and 1059 are readable without NIP-42.
+auth_kinds = []

@@ -1,0 +1,20 @@
+# Our relay (magnitude-relay), benchmark instance. Everything not listed keeps its default
+# (see `magnitude-relay init`). Built from git 1d6cd16 (see README).
+
+[relay]
+# loopback only, port in the 7801-7809 benchmark range
+bind = "127.0.0.1:7804"
+# threads = 0 (default): one per available hardware thread, which under the
+# AllowedCPUs cgroup cap is the capped CPU count.
+
+[policy]
+# accept every kind (default is "vector": Vector's kinds only)
+kinds = "all"
+
+[limits]
+# no per-IP limits: every benchmark client connects from 127.0.0.1
+max_connections_per_ip = 0
+events_per_minute_per_ip = 0
+
+[store]
+data = "/root/bench/ours-data"
