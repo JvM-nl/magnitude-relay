@@ -3,13 +3,18 @@
 //! Each write batch becomes one small run; runs of similar size merge, so there
 //! are O(log n) of them. Keys live back to back in one buffer with a u32 offset
 //! table: a lookup is a binary search over a flat array, no pointer chasing.
+//! Each run has a bloom filter over its keys' prefixes, like a segment: a lookup
+//! of an id or a prefix the run lacks (most of them: there are up to two dozen
+//! runs) costs one cache line instead of a binary search.
 
+use crate::bloom::{self, Bloom};
 use crate::keys::{self, KeyBuf};
 
 pub struct MemRun {
     data: Vec<u8>,
     /// `offs[i]..offs[i + 1]` is key `i`; one extra entry at the end.
     offs: Vec<u32>,
+    bloom: Bloom,
 }
 
 impl MemRun {
@@ -25,7 +30,29 @@ impl MemRun {
             data.extend_from_slice(kb.key(i as usize));
         }
         offs.push(data.len() as u32);
-        MemRun { data, offs }
+        MemRun::sealed(data, offs)
+    }
+
+    /// The run of these sorted keys, with its bloom filter.
+    fn sealed(data: Vec<u8>, offs: Vec<u32>) -> MemRun {
+        // Sorted keys keep equal prefixes adjacent, so each is hashed once.
+        let mut hashes = Vec::new();
+        let mut last: Option<&[u8]> = None;
+        for w in offs.windows(2) {
+            let p = keys::bloom_prefix(&data[w[0] as usize..w[1] as usize]);
+            if last != Some(p) {
+                hashes.push(bloom::hash64(p));
+                last = Some(p);
+            }
+        }
+        let bloom = Bloom::new(&hashes);
+        MemRun { data, offs, bloom }
+    }
+
+    /// False means no key with bloom prefix `p` is in this run.
+    #[inline]
+    pub fn may_contain(&self, p: &[u8]) -> bool {
+        self.bloom.may_contain(p)
     }
 
     #[inline]
@@ -40,7 +67,7 @@ impl MemRun {
 
     /// Memory held, for flush and merge decisions.
     pub fn bytes(&self) -> usize {
-        self.data.len() + self.offs.len() * 4
+        self.data.len() + self.offs.len() * 4 + self.bloom.bytes()
     }
 
     #[inline]
@@ -101,7 +128,7 @@ impl MemRun {
             push(b.key(k), &mut data, &mut offs);
         }
         offs.push(data.len() as u32);
-        MemRun { data, offs }
+        MemRun::sealed(data, offs)
     }
 }
 
@@ -129,5 +156,26 @@ mod tests {
         let m = MemRun::merge(&r, &s, |_| false);
         let all: Vec<&[u8]> = (0..m.len()).map(|i| m.key(i)).collect();
         assert_eq!(all, vec![&b"a"[..], b"b", b"c", b"d"]);
+        // Every key's prefix is in the merged run's filter.
+        assert!(all.iter().all(|k| m.may_contain(keys::bloom_prefix(k))));
+    }
+
+    #[test]
+    fn the_filter_knows_every_prefix_and_few_others() {
+        // Id keys: the whole key is the prefix. Author keys: all but created_at and seq.
+        let mut kb = KeyBuf::default();
+        let id = |i: u32| [&[keys::T_ID][..], &[i as u8; 28], &i.to_be_bytes(), &[0, 0, 0, 0, 0, 0, 0, 7]].concat();
+        let by = |a: u32, t: u64| [&[keys::T_AUTHOR][..], &[a as u8; 28], &a.to_be_bytes(), &t.to_be_bytes(), &[0; 8]].concat();
+        for i in 0..5_000u32 {
+            kb.push(&id(i));
+            kb.push(&by(i % 50, u64::from(i)));
+        }
+        let r = MemRun::build(&kb);
+        for i in 0..5_000u32 {
+            assert!(r.may_contain(keys::bloom_prefix(&id(i))));
+            assert!(r.may_contain(keys::bloom_prefix(&by(i % 50, 0))));
+        }
+        let fp = (5_000..55_000u32).filter(|&i| r.may_contain(keys::bloom_prefix(&id(i)))).count();
+        assert!(fp < 1_500, "{fp} of 50000 absent ids reported present");
     }
 }

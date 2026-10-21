@@ -20,6 +20,7 @@
 //! opening is O(1) and the only memory pinned is what the page cache keeps hot.
 //! A probe for an absent prefix costs one cache line of bloom.
 
+use crate::bloom;
 use crate::crc32c::crc32c;
 use crate::keys;
 use crate::mmap::{Advice, MappedFile};
@@ -37,40 +38,6 @@ const RESTART: usize = 16;
 /// Room for the longest index key (a tag value is capped at 259 bytes).
 const SCAN_KEY_MAX: usize = 1024;
 const FOOTER_LEN: usize = 80;
-const BLOOM_BITS_PER_PREFIX: usize = 10;
-const BLOOM_K: u32 = 7;
-
-/// 64-bit hash for bloom probes: multiply-xorshift over 8-byte words. Fast,
-/// well mixed, and stable across platforms (it is persisted in segment files).
-pub fn hash64(b: &[u8]) -> u64 {
-    const M: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut h = (b.len() as u64).wrapping_mul(M) ^ 0x2545_F491_4F6C_DD1D;
-    let mut chunks = b.chunks_exact(8);
-    for c in &mut chunks {
-        let w = u64::from_le_bytes(c.try_into().unwrap());
-        h = (h ^ w.wrapping_mul(M)).rotate_left(29).wrapping_mul(M);
-    }
-    let mut tail = [0u8; 8];
-    tail[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
-    h = (h ^ u64::from_le_bytes(tail).wrapping_mul(M)).rotate_left(29).wrapping_mul(M);
-    h ^= h >> 32;
-    h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
-    h ^ (h >> 32)
-}
-
-#[inline]
-fn bloom_probe(h: u64, nblocks: u64, mut f: impl FnMut(usize, u32) -> bool) -> bool {
-    let block = (((h >> 32) * nblocks) >> 32) as usize;
-    let h1 = h as u32;
-    let h2 = ((h >> 32) as u32).rotate_left(16) | 1;
-    for i in 0..BLOOM_K {
-        if !f(block, h1.wrapping_add(i.wrapping_mul(h2)) & 511) {
-            return false;
-        }
-    }
-    true
-}
-
 struct BlockMeta {
     first: Vec<u8>,
     off: u64,
@@ -140,7 +107,7 @@ impl SegmentWriter {
         // Sorted keys keep equal prefixes adjacent, so each is hashed once.
         let p = keys::bloom_prefix(key);
         if p != self.last_prefix.as_slice() {
-            self.prefix_hashes.push(hash64(p));
+            self.prefix_hashes.push(bloom::hash64(p));
             self.last_prefix.clear();
             self.last_prefix.extend_from_slice(p);
         }
@@ -196,10 +163,10 @@ impl SegmentWriter {
             index.push(0);
         }
 
-        let nblocks = (self.prefix_hashes.len() * BLOOM_BITS_PER_PREFIX).div_ceil(512).max(1) as u64;
+        let nblocks = bloom::blocks_for(self.prefix_hashes.len());
         let mut bloom = vec![0u64; nblocks as usize * 8];
         for &h in &self.prefix_hashes {
-            bloom_probe(h, nblocks, |blk, bit| {
+            bloom::probe(h, nblocks, |blk, bit| {
                 bloom[blk * 8 + (bit / 64) as usize] |= 1 << (bit % 64);
                 true
             });
@@ -212,7 +179,7 @@ impl SegmentWriter {
         let mut footer = Vec::with_capacity(FOOTER_LEN);
         footer.extend_from_slice(MAGIC);
         footer.extend_from_slice(&1u32.to_le_bytes()); // version
-        footer.extend_from_slice(&BLOOM_K.to_le_bytes());
+        footer.extend_from_slice(&bloom::K.to_le_bytes());
         footer.extend_from_slice(&(self.blocks.len() as u64).to_le_bytes());
         footer.extend_from_slice(&self.keys.to_le_bytes());
         footer.extend_from_slice(&index_off.to_le_bytes());
@@ -429,8 +396,8 @@ impl Segment {
     #[inline]
     pub fn may_contain(&self, p: &[u8]) -> bool {
         let base = self.bloom_off;
-        let h = hash64(p);
-        bloom_probe(h, self.bloom_blocks, |blk, bit| {
+        let h = bloom::hash64(p);
+        bloom::probe(h, self.bloom_blocks, |blk, bit| {
             let w = self.map.read_u64(base + blk * 64 + (bit / 64) as usize * 8);
             w & (1 << (bit % 64)) != 0
         })

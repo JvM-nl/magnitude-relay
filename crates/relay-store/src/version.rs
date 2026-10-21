@@ -45,7 +45,8 @@ impl Run {
     fn may_contain(&self, p: Option<&[u8]>) -> bool {
         match (self, p) {
             (Run::Disk(s), Some(p)) => s.may_contain(p),
-            _ => true,
+            (Run::Mem(m), Some(p)) => m.may_contain(p),
+            (_, None) => true,
         }
     }
 
@@ -56,9 +57,10 @@ impl Run {
         }
         match self {
             Run::Mem(m) => {
+                // Ranges are mostly a few keys: walk to the end rather than
+                // search for it.
                 let mut i = m.lower_bound(lo);
-                let end = m.lower_bound(hi);
-                while i < end {
+                while i < m.len() && keys::key_lt(m.key(i), hi) {
                     if !f(m.key(i)) {
                         return;
                     }
@@ -84,6 +86,9 @@ impl Run {
     fn contains(&self, key: &[u8]) -> bool {
         match self {
             Run::Mem(m) => {
+                if !m.may_contain(keys::bloom_prefix(key)) {
+                    return false;
+                }
                 let i = m.lower_bound(key);
                 i < m.len() && m.key(i) == key
             }
