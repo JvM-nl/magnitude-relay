@@ -222,15 +222,13 @@ impl Store {
         }
         // Every block's checksum, now: a damaged block met by a query later
         // could only stop the relay (and the same query would stop it again
-        // after a restart). Each segment's blocks are split across threads, so
-        // a cold index is read with the drive's parallelism (one thread read
-        // a 1.46 GB index in 6.8 s).
+        // after a restart). Each segment's blocks are split across threads,
+        // each reading its share in large pieces (see `Segment::verify_blocks`).
         if opts.verify_index {
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8);
             let damaged = std::thread::scope(|s| {
                 let mut handles = Vec::new();
                 for seg in &segments {
-                    seg.will_need();
                     let n = seg.blocks();
                     let per = n.div_ceil(threads).max(1);
                     for lo in (0..n).step_by(per) {

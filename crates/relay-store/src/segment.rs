@@ -438,21 +438,40 @@ impl Segment {
         self.nblocks
     }
 
-    /// Asks the kernel to start reading the whole file in.
-    pub fn will_need(&self) {
-        self.map.advise(crate::mmap::Advice::WillNeed);
-    }
-
     /// Checks the checksums of blocks `range` (`Err` names the first damaged
-    /// one), so that none is checked again on use.
+    /// one, or the first that could not be read), so that none is checked
+    /// again on use. Read through the file in large pieces: a cold 1.46 GB
+    /// index took 7.5 s through the mapping, at about 200 MB/s.
     pub fn verify_blocks(&self, range: std::ops::Range<usize>) -> Result<(), usize> {
-        for i in range {
-            let (off, len, ..) = self.meta(i);
-            let (body, crc) = self.map.slice(off, len).split_at(len - 4);
-            if crc32c(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
+        const PIECE: usize = 8 << 20;
+        let mut buf = Vec::new();
+        let mut i = range.start;
+        while i < range.end {
+            // Whole blocks, back to back in the file, up to a piece's worth.
+            let (start, ..) = self.meta(i);
+            let mut j = i;
+            let mut end = start;
+            while j < range.end {
+                let (off, len, ..) = self.meta(j);
+                if off != end || (end + len - start > PIECE && j > i) {
+                    break;
+                }
+                end = off + len;
+                j += 1;
+            }
+            buf.resize(end - start, 0);
+            if self.map.read_exact_at(&mut buf, start as u64).is_err() {
                 return Err(i);
             }
-            self.verified[i / 64].fetch_or(1 << (i % 64), Ordering::Relaxed);
+            for b in i..j {
+                let (off, len, ..) = self.meta(b);
+                let (body, crc) = buf[off - start..off - start + len].split_at(len - 4);
+                if crc32c(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
+                    return Err(b);
+                }
+                self.verified[b / 64].fetch_or(1 << (b % 64), Ordering::Relaxed);
+            }
+            i = j;
         }
         Ok(())
     }

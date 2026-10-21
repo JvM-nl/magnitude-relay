@@ -100,6 +100,13 @@ impl MappedFile {
         u32::from_le_bytes(self.slice(off, 4).try_into().unwrap())
     }
 
+    /// Reads `buf.len()` bytes at `off` through the file, not the mapping: large
+    /// reads go at the drive's speed, where touching a cold mapping faults a
+    /// page (and a little readahead) at a time.
+    pub fn read_exact_at(&self, buf: &mut [u8], off: u64) -> io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(&self.file, buf, off)
+    }
+
     pub fn write_at(&self, off: u64, data: &[u8]) -> io::Result<()> {
         debug_assert!(off as usize + data.len() <= self.len);
         #[cfg(any(test, feature = "fault-injection"))]
