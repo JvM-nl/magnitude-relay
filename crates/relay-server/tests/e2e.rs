@@ -1,6 +1,6 @@
 //! End to end: the real binary, real sockets, Vector-shaped traffic.
 
-use relay_net::conn::{client_connect, ClientConn, Message};
+use relay_net::conn::{client_connect, client_handshake, ClientConn, Message};
 use relay_proto::hex;
 use secp256k1::{schnorr, Keypair};
 use serde_json::{json, Value};
@@ -9,6 +9,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 struct Relay {
     child: Child,
@@ -95,11 +96,11 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
 
-async fn send(c: &mut ClientConn, v: Value) {
+async fn send<S: AsyncRead + AsyncWrite + Unpin>(c: &mut ClientConn<S>, v: Value) {
     c.send_text(&v.to_string()).await.unwrap();
 }
 
-async fn recv(c: &mut ClientConn) -> Value {
+async fn recv<S: AsyncRead + AsyncWrite + Unpin>(c: &mut ClientConn<S>) -> Value {
     loop {
         match tokio::time::timeout(Duration::from_secs(5), c.recv()).await.expect("timed out waiting for a message").unwrap() {
             Message::Text(t) => return serde_json::from_str(&t).unwrap(),
@@ -109,7 +110,7 @@ async fn recv(c: &mut ClientConn) -> Value {
 }
 
 /// Reads until EOSE (or CLOSED) for `sub`, returning the events.
-async fn collect(c: &mut ClientConn, sub: &str) -> (Vec<Value>, Value) {
+async fn collect<S: AsyncRead + AsyncWrite + Unpin>(c: &mut ClientConn<S>, sub: &str) -> (Vec<Value>, Value) {
     let mut evs = Vec::new();
     loop {
         let m = recv(c).await;
@@ -121,7 +122,7 @@ async fn collect(c: &mut ClientConn, sub: &str) -> (Vec<Value>, Value) {
     }
 }
 
-async fn ok_of(c: &mut ClientConn) -> (bool, String) {
+async fn ok_of<S: AsyncRead + AsyncWrite + Unpin>(c: &mut ClientConn<S>) -> (bool, String) {
     loop {
         let m = recv(c).await;
         if m[0] == "OK" {
@@ -888,4 +889,84 @@ async fn overlapping_filters_send_each_event_once_newest_first() {
     drop(c);
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_web_server_can_reach_the_relay_over_a_unix_socket() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let dir = std::env::temp_dir().join(format!("relay-e2e-unix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("r.sock");
+    let port = free_port();
+    let cfg = dir.join("relay.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[relay]\nbind = \"127.0.0.1:{port}\"\nunix_socket = \"{}\"\nunix_socket_mode = \"600\"\nreal_ip_header = \"x-real-ip\"\nthreads = 2\n[limits]\nevents_per_minute_per_ip = 0\n[store]\ndata = \"{}\"\n",
+            sock.display(),
+            dir.join("data").display()
+        ),
+    )
+    .unwrap();
+    let start = || {
+        let child = Command::new(env!("CARGO_BIN_EXE_magnitude-relay")).arg("--config").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+        let t = Instant::now();
+        while std::os::unix::net::UnixStream::connect(&sock).is_err() || std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(t.elapsed() < Duration::from_secs(10), "relay did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child
+    };
+    let unix = || async { client_handshake(tokio::net::UnixStream::connect(&sock).await.unwrap(), "relay.example", "/").await.unwrap() };
+    let mut child = start();
+    let meta = std::fs::symlink_metadata(&sock).unwrap();
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+    // Publish over the socket, read over TCP; a big live event to a socket
+    // subscriber goes the shared (spliced) way.
+    let me = Signer::new(51);
+    let mut sub = unix().await;
+    send(&mut sub, json!(["REQ", "live", {"kinds": [30078], "authors": [me.pk()], "limit": 0}])).await;
+    let (_, eose) = collect(&mut sub, "live").await;
+    assert_eq!(eose[0], "EOSE");
+    let mut u = unix().await;
+    let small = me.event(now(), 30078, json!([["d", "a"]]), "over the socket");
+    send(&mut u, json!(["EVENT", small])).await;
+    assert!(ok_of(&mut u).await.0);
+    let mut t = client_connect(("127.0.0.1", port), &format!("127.0.0.1:{port}"), "/").await.unwrap();
+    send(&mut t, json!(["REQ", "q", {"ids": [small["id"]]}])).await;
+    assert_eq!(collect(&mut t, "q").await.0.len(), 1);
+    let big = me.event(now(), 30078, json!([["d", "b"]]), &"x".repeat(6000));
+    send(&mut t, json!(["EVENT", big])).await;
+    assert!(ok_of(&mut t).await.0);
+    let mut live = Vec::new();
+    while live.len() < 2 {
+        let m = recv(&mut sub).await;
+        if m[0] == "EVENT" && m[1] == "live" {
+            live.push(m[2]["id"].clone());
+        }
+    }
+    assert_eq!(live, vec![small["id"].clone(), big["id"].clone()]);
+    drop((sub, u, t));
+
+    // A relay already listening keeps its socket.
+    let second = Command::new(env!("CARGO_BIN_EXE_magnitude-relay")).arg("--config").arg(&cfg).arg("serve").output().unwrap();
+    assert!(!second.status.success());
+
+    // Killed, the relay leaves its socket behind; the next start replaces it.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(sock.exists());
+    let mut child = start();
+    let mut u = unix().await;
+    send(&mut u, json!(["REQ", "after", {"ids": [big["id"]]}])).await;
+    assert_eq!(collect(&mut u, "after").await.0.len(), 1);
+    drop(u);
+    // Stopped cleanly, it removes it.
+    unsafe { libc_kill(child.id() as i32, 15) };
+    child.wait().unwrap();
+    assert!(!sock.exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

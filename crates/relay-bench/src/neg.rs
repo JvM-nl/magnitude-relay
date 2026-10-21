@@ -117,7 +117,7 @@ struct SessionDone {
 }
 
 async fn session(
-    c: &mut relay_net::conn::ClientConn<tokio::net::TcpStream>,
+    c: &mut crate::net::Conn,
     sub: &str,
     mb: &Mailbox,
     s: u64,

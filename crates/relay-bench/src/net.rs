@@ -6,22 +6,78 @@ use relay_net::conn::{client_handshake, ClientConn, Message};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpSocket, TcpStream, UnixStream};
+
+/// A connection to the relay: TCP, or the Unix socket a web server in front of
+/// it would use (`unix:/path` URLs).
+pub enum Stream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+pub type Conn = ClientConn<Stream>;
+
+impl AsyncRead for Stream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Stream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Stream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Stream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Stream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Stream::Unix(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Stream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Stream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// A relay endpoint: where to connect and what to put in the handshake.
 #[derive(Clone, Debug)]
 pub struct Target {
+    /// Unused when `unix` is set.
     pub addr: SocketAddr,
+    /// A Unix socket to connect to instead.
+    pub unix: Option<PathBuf>,
     /// `Host` header value.
     pub host: String,
     pub path: String,
     pub url: String,
 }
 
-/// `ws://host[:port][/path]`. TLS is out of scope: every relay under test is on
-/// loopback, and a TLS handshake per connection would measure the TLS library.
+/// `ws://host[:port][/path]`, or `unix:/path/to/socket`. TLS is out of scope:
+/// every relay under test is local, and a TLS handshake per connection would
+/// measure the TLS library.
 pub async fn resolve(url: &str) -> Result<Target, String> {
+    if let Some(path) = url.strip_prefix("unix:") {
+        if path.is_empty() {
+            return Err(format!("no socket path in '{url}'"));
+        }
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        return Ok(Target { addr, unix: Some(path.into()), host: "localhost".into(), path: "/".into(), url: url.to_owned() });
+    }
     let rest = match url.strip_prefix("ws://") {
         Some(r) => r,
         None if url.starts_with("wss://") => return Err("wss:// is not supported: point the bench at the relay's plain ws:// port".into()),
@@ -44,7 +100,7 @@ pub async fn resolve(url: &str) -> Result<Target, String> {
         .map_err(|e| format!("cannot resolve '{name}': {e}"))?
         .next()
         .ok_or_else(|| format!("'{name}' resolved to nothing"))?;
-    Ok(Target { addr, host: authority.to_owned(), path: path.to_owned(), url: url.to_owned() })
+    Ok(Target { addr, unix: None, host: authority.to_owned(), path: path.to_owned(), url: url.to_owned() })
 }
 
 /// The loopback source address for connection number `i` when spreading over `k`
@@ -61,8 +117,11 @@ pub fn source_ip(i: usize, k: usize) -> Option<IpAddr> {
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub async fn connect(t: &Target, src: Option<IpAddr>) -> io::Result<ClientConn<TcpStream>> {
+pub async fn connect(t: &Target, src: Option<IpAddr>) -> io::Result<Conn> {
     let attempt = async {
+        if let Some(path) = &t.unix {
+            return client_handshake(Stream::Unix(UnixStream::connect(path).await?), &t.host, &t.path).await;
+        }
         let sock = if t.addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
         if let (Some(ip), true) = (src, t.addr.is_ipv4() && t.addr.ip().is_loopback()) {
             sock.bind(SocketAddr::new(ip, 0))?;
@@ -70,7 +129,7 @@ pub async fn connect(t: &Target, src: Option<IpAddr>) -> io::Result<ClientConn<T
         let stream = sock.connect(t.addr).await?;
         // Small request/response frames: Nagle plus delayed ACK would add 40 ms each.
         stream.set_nodelay(true)?;
-        client_handshake(stream, &t.host, &t.path).await
+        client_handshake(Stream::Tcp(stream), &t.host, &t.path).await
     };
     match tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
         Ok(r) => r,
@@ -98,7 +157,7 @@ impl fmt::Display for RecvError {
 
 /// The next text message, waiting at most `wait` in total. Binary frames and pongs
 /// are skipped (pings are answered inside `recv`).
-pub async fn recv_text(c: &mut ClientConn<TcpStream>, wait: Duration) -> Result<String, RecvError> {
+pub async fn recv_text(c: &mut Conn, wait: Duration) -> Result<String, RecvError> {
     let deadline = Instant::now() + wait;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());

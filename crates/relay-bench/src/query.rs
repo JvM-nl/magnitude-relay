@@ -19,12 +19,10 @@ use crate::report::{clip, RunResult};
 use crate::rng::Rng;
 use crate::workload::{build, Pool, PoolOpts, Step};
 use crate::wire::{parse_relay_msg, RelayMsg};
-use relay_net::conn::ClientConn;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 
 pub struct QueryOpts {
     pub url: String,
@@ -116,7 +114,7 @@ fn is_event_msg(s: &str) -> bool {
     s.strip_prefix('[').is_some_and(|r| r.trim_start().starts_with("\"EVENT\""))
 }
 
-async fn do_step(c: &mut ClientConn<TcpStream>, sub: &str, step: &Step, sh: &Shared) -> Result<StepDone, StepErr> {
+async fn do_step(c: &mut crate::net::Conn, sub: &str, step: &Step, sh: &Shared) -> Result<StepDone, StepErr> {
     let is_req = matches!(step, Step::Req { .. });
     let msg = format!("[\"{}\",\"{sub}\",{}]", if is_req { "REQ" } else { "COUNT" }, step.json());
     let net = |e: &dyn std::fmt::Display| StepErr::Net(e.to_string());
@@ -192,7 +190,7 @@ async fn do_step(c: &mut ClientConn<TcpStream>, sub: &str, step: &Step, sh: &Sha
 async fn worker(id: usize, sh: Arc<Shared>) -> (Histogram, Stats) {
     let mut hist = Histogram::new();
     let mut st = Stats::default();
-    let mut conn: Option<ClientConn<TcpStream>> = None;
+    let mut conn: Option<crate::net::Conn> = None;
     let mut fails = 0u32;
     let mut seq = 0u64;
     'ops: while !sh.stop.load(Relaxed) {

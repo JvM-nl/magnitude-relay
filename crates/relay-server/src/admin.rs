@@ -301,7 +301,7 @@ fn bind_private(tmp: &Path, inner: &Path, path: &Path) -> io::Result<UnixListene
 }
 
 /// A socket path must fit `sun_path`: 104 bytes with the NUL on macOS, 108 on Linux.
-fn check_len(path: &Path) -> io::Result<()> {
+pub(crate) fn check_len(path: &Path) -> io::Result<()> {
     const MAX: usize = 103;
     if path.as_os_str().len() > MAX {
         return Err(io::Error::other(format!(

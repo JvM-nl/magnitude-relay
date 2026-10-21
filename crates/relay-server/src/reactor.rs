@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::ingest::{ReactorMsg, WriteReq};
 use crate::metrics::{self, Metrics};
 use crate::session::{self, Ctx, Outbox, Session, SessionCfg};
-use crate::sock::{Incoming, Sock, TlsConfig};
+use crate::sock::{Incoming, Sock, Stream, TlsConfig};
 use crate::subs::{ConnId, FxMap, SubIndex};
 use relay_net::conn::{server_handshake_with, Handshake, OwnedRequest};
 use relay_net::http::{write_response, ExtensionPolicy};
@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpSocket;
 use tokio::sync::{mpsc, Notify};
 
 /// A client silent this long gets a ping; silent twice as long, it is dropped.
@@ -264,6 +264,49 @@ pub fn listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     Ok(l)
 }
 
+/// Binds the Unix socket at `path` with permission bits `mode`. A socket file
+/// already there is replaced when nothing answers on it (left by a relay that
+/// did not stop cleanly); one that something answers on, or a file that is not
+/// a socket, is refused.
+pub fn unix_listener(path: &std::path::Path, mode: u32) -> io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    crate::admin::check_len(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.file_type().is_socket() => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a file that is not a socket is in the way")),
+        Ok(_) => match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::AddrInUse, "another program is listening on it")),
+            Err(_) => std::fs::remove_file(path)?,
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let l = std::os::unix::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(l)
+}
+
+/// [`accept_loop`] for the Unix socket. Its connections have no address: the
+/// web server in front names the client in `real_ip_header`, and without that
+/// they count as 127.0.0.1, like any local connection.
+pub fn accept_loop_unix(l: std::os::unix::net::UnixListener, conns: Vec<mpsc::UnboundedSender<Incoming>>) {
+    let local = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut next = 0usize;
+    loop {
+        match l.accept() {
+            Ok((s, _)) => {
+                if s.set_nonblocking(true).is_ok() {
+                    let _ = conns[next % conns.len()].send((Stream::Unix(s), local, None));
+                    next = next.wrapping_add(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("accept failed: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 /// Accepts connections and deals them to reactors round-robin. SO_REUSEPORT
 /// hashing leaves reactors idle when connections are few (eight benchmark
 /// clients can land 3-3-1-1 or worse), and signature checks are per core, so an
@@ -276,7 +319,7 @@ pub fn accept_loop(l: std::net::TcpListener, conns: Vec<mpsc::UnboundedSender<In
             Ok((s, peer)) => {
                 let _ = s.set_nodelay(true);
                 if s.set_nonblocking(true).is_ok() {
-                    let _ = conns[next % conns.len()].send((s, peer, tls.clone()));
+                    let _ = conns[next % conns.len()].send((Stream::Tcp(s), peer, tls.clone()));
                     next = next.wrapping_add(1);
                 }
             }
@@ -312,12 +355,7 @@ pub fn run(
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
         tokio::task::spawn_local(keep_fresh(st.clone(), shared.clone()));
         while let Some((s, peer, tls)) = conns.recv().await {
-            match TcpStream::from_std(s) {
-                Ok(s) => {
-                    tokio::task::spawn_local(connection(s, peer, tls, st.clone(), shared.clone()));
-                }
-                Err(e) => eprintln!("cannot adopt connection: {e}"),
-            }
+            tokio::task::spawn_local(connection(s, peer, tls, st.clone(), shared.clone()));
         }
     });
 }
@@ -472,7 +510,7 @@ fn client_ip(req: &OwnedRequest, peer: SocketAddr, header: &str) -> IpAddr {
     std::str::from_utf8(last).ok().and_then(|s| s.trim().parse::<IpAddr>().ok()).map_or(fallback, |ip| ip.to_canonical())
 }
 
-async fn connection(s: TcpStream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
+async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
     // Clients of the HTTPS listener connect to the relay directly, so a header
     // naming "the real address" is theirs to forge: only the socket's peer counts.
     let real_ip_header = if tls.is_some() { "" } else { shared.cfg.relay.real_ip_header.as_str() };
@@ -506,7 +544,7 @@ async fn connection(s: TcpStream, peer: SocketAddr, tls: Option<TlsConfig>, st: 
     if z.is_some() {
         metrics::inc(&shared.metrics.of(idx).connections_deflate);
     }
-    let out = Rc::new(ConnOut::new(z, matches!(s, Sock::Plain(_))));
+    let out = Rc::new(ConnOut::new(z, s.is_clear()));
     st.borrow_mut().conns.insert(conn, out.clone());
 
     let _ = serve(&mut s, &mut buf, conn, ip, deflate, &out, &st, &shared).await;
@@ -522,8 +560,15 @@ async fn connection(s: TcpStream, peer: SocketAddr, tls: Option<TlsConfig>, st: 
 
 /// Writes `buf` with each shared body inserted at its offset, in vectored writes.
 async fn write_spliced(s: &mut Sock, buf: &[u8], spliced: &[(usize, Rc<[u8]>)]) -> io::Result<()> {
-    // Only plain connections share bodies (`ConnOut::share`).
-    let Sock::Plain(s) = s else { return Err(io::Error::other("spliced output on an encrypted connection")) };
+    // Only unencrypted connections share bodies (`ConnOut::share`).
+    match s {
+        Sock::Plain(s) => write_vectored_all(s, buf, spliced).await,
+        Sock::Unix(s) => write_vectored_all(s, buf, spliced).await,
+        Sock::Tls(_) => Err(io::Error::other("spliced output on an encrypted connection")),
+    }
+}
+
+async fn write_vectored_all<W: AsyncWrite + Unpin>(s: &mut W, buf: &[u8], spliced: &[(usize, Rc<[u8]>)]) -> io::Result<()> {
     let mut parts: Vec<io::IoSlice<'_>> = Vec::with_capacity(spliced.len() * 2 + 1);
     let mut at = 0;
     for (off, body) in spliced {

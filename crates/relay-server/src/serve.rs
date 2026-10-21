@@ -22,6 +22,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let events = w.next_seq();
     let threads = if cfg.relay.threads == 0 { std::thread::available_parallelism().map_or(4, |n| n.get()) } else { cfg.relay.threads };
     let bind = cfg.relay.bind;
+    let (unix_path, unix_mode) = (std::path::PathBuf::from(&cfg.relay.unix_socket), cfg.relay.unix_socket_mode);
     let data = cfg.store.data.clone();
     // HTTPS, when asked for: certificates first, so a saved one serves from the first connection.
     let tls = if cfg.tls.enabled { Some(start_tls(&cfg)?) } else { None };
@@ -98,6 +99,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
             .transpose()?;
         (l, tl)
     };
+    let ul = Some(unix_path.as_path())
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| {
+            reactor::unix_listener(p, unix_mode).map_err(|e| {
+                if let Some(a) = &admin {
+                    a.stop();
+                }
+                format!("cannot listen on {}: {e}", p.display())
+            })
+        })
+        .transpose()?;
     let mut conn_txs = Vec::with_capacity(threads);
     for (i, rx) in rxs.into_iter().enumerate() {
         let (ctx, crx) = tmpsc::unbounded_channel();
@@ -108,6 +120,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
     if let (Some(tl), Some(tls)) = (tl, &tls) {
         let (conns, config) = (conn_txs.clone(), tls.config.clone());
         std::thread::Builder::new().name("acceptor-tls".into()).spawn(move || reactor::accept_loop(tl, conns, Some(config))).map_err(|e| e.to_string())?;
+    }
+    if let Some(ul) = ul {
+        let conns = conn_txs.clone();
+        std::thread::Builder::new().name("acceptor-unix".into()).spawn(move || reactor::accept_loop_unix(ul, conns)).map_err(|e| e.to_string())?;
+        eprintln!("also listening on {}", unix_path.display());
     }
     std::thread::Builder::new().name("acceptor".into()).spawn(move || reactor::accept_loop(l, conn_txs, None)).map_err(|e| e.to_string())?;
     // Other relays to keep in step with, on a thread of their own.
@@ -128,6 +145,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     ingest::SHUTDOWN.store(true, Ordering::Release);
     if let Some(a) = &admin {
         a.stop();
+    }
+    if !unix_path.as_os_str().is_empty() {
+        let _ = std::fs::remove_file(&unix_path);
     }
     let _ = writer.join();
     eprintln!("stopped cleanly");

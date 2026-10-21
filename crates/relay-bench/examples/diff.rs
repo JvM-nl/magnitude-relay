@@ -14,7 +14,7 @@ use relay_proto::hex;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-async fn ask(c: &mut relay_net::conn::ClientConn<tokio::net::TcpStream>, n: usize, filter: &str) -> Result<(Vec<([u8; 32], u64)>, Duration), String> {
+async fn ask(c: &mut relay_bench::net::Conn, n: usize, filter: &str) -> Result<(Vec<([u8; 32], u64)>, Duration), String> {
     let sub = format!("d{n}");
     let t = Instant::now();
     c.send_text(&format!("[\"REQ\",\"{sub}\",{filter}]")).await.map_err(|e| e.to_string())?;

@@ -1,4 +1,5 @@
-//! A client connection's socket: plain TCP, or TCP under TLS.
+//! A client connection's socket: plain TCP, TCP under TLS, or a Unix socket (a
+//! web server on the same machine, which saves both sides the TCP stack).
 //!
 //! The reactor's connection code is written against this type so that HTTPS needs
 //! no second copy of it. The plain variant is a bare `TcpStream`; every method here
@@ -13,14 +14,20 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixStream};
 
 /// How a TLS connection is accepted: the certificates and protocol settings.
 pub type TlsConfig = Arc<relay_tls::ServerConfig>;
 
 /// A connection waiting for its reactor: the socket, the peer, and the TLS settings
-/// when it arrived on the HTTPS listener (`None` for the plain one).
-pub type Incoming = (std::net::TcpStream, SocketAddr, Option<TlsConfig>);
+/// when it arrived on the HTTPS listener (`None` otherwise).
+pub type Incoming = (Stream, SocketAddr, Option<TlsConfig>);
+
+/// An accepted socket, before its reactor adopts it.
+pub enum Stream {
+    Tcp(std::net::TcpStream),
+    Unix(std::os::unix::net::UnixStream),
+}
 
 /// The longest a TLS handshake may take before the connection is dropped.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,17 +36,30 @@ pub enum Sock {
     Plain(TcpStream),
     /// Boxed so the common variant stays small.
     Tls(Box<TlsConn>),
+    Unix(UnixStream),
 }
 
 impl Sock {
-    /// The socket for a new connection: as it is, or after the TLS handshake. `None`
-    /// when the handshake fails, times out, or was only a CA validating a challenge.
-    pub async fn open(s: TcpStream, tls: Option<TlsConfig>) -> Option<Sock> {
+    /// The socket for a new connection, on the reactor's runtime: as it is, or
+    /// after the TLS handshake. `None` when it cannot be adopted, or the handshake
+    /// fails, times out, or was only a CA validating a challenge.
+    pub async fn open(s: Stream, tls: Option<TlsConfig>) -> Option<Sock> {
+        let s = match s {
+            Stream::Tcp(s) => TcpStream::from_std(s),
+            Stream::Unix(s) => return UnixStream::from_std(s).inspect_err(|e| eprintln!("cannot adopt connection: {e}")).ok().map(Sock::Unix),
+        };
+        let s = s.inspect_err(|e| eprintln!("cannot adopt connection: {e}")).ok()?;
         let Some(config) = tls else { return Some(Sock::Plain(s)) };
         match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, TlsConn::accept(s, config)).await {
             Ok(Ok(c)) => Some(Sock::Tls(Box::new(c))),
             _ => None,
         }
+    }
+
+    /// Unencrypted: output can be written as it is, shared bodies spliced in.
+    #[inline]
+    pub fn is_clear(&self) -> bool {
+        !matches!(self, Sock::Tls(_))
     }
 
     /// Resolves when a [`try_read`](Self::try_read) is worth making. Cancel-safe.
@@ -48,6 +68,7 @@ impl Sock {
         match self {
             Sock::Plain(s) => s.readable().await,
             Sock::Tls(t) => t.readable().await,
+            Sock::Unix(s) => s.readable().await,
         }
     }
 
@@ -57,6 +78,7 @@ impl Sock {
         match self {
             Sock::Plain(s) => s.try_read(buf),
             Sock::Tls(t) => t.try_read(buf),
+            Sock::Unix(s) => s.try_read(buf),
         }
     }
 
@@ -67,6 +89,7 @@ impl Sock {
         match self {
             Sock::Plain(s) => s.write_all(buf).await,
             Sock::Tls(t) => t.send(buf).await,
+            Sock::Unix(s) => s.write_all(buf).await,
         }
     }
 }
@@ -77,6 +100,7 @@ impl AsyncRead for Sock {
         match self.get_mut() {
             Sock::Plain(s) => Pin::new(s).poll_read(cx, buf),
             Sock::Tls(t) => Pin::new(&mut **t).poll_read(cx, buf),
+            Sock::Unix(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -87,6 +111,7 @@ impl AsyncWrite for Sock {
         match self.get_mut() {
             Sock::Plain(s) => Pin::new(s).poll_write(cx, buf),
             Sock::Tls(t) => Pin::new(&mut **t).poll_write(cx, buf),
+            Sock::Unix(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -95,6 +120,7 @@ impl AsyncWrite for Sock {
         match self.get_mut() {
             Sock::Plain(s) => Pin::new(s).poll_flush(cx),
             Sock::Tls(t) => Pin::new(&mut **t).poll_flush(cx),
+            Sock::Unix(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -103,6 +129,7 @@ impl AsyncWrite for Sock {
         match self.get_mut() {
             Sock::Plain(s) => Pin::new(s).poll_shutdown(cx),
             Sock::Tls(t) => Pin::new(&mut **t).poll_shutdown(cx),
+            Sock::Unix(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
