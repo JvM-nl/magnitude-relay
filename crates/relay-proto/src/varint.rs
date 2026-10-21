@@ -12,6 +12,17 @@ pub fn put(out: &mut Vec<u8>, mut v: u64) {
 /// Reads a varint at `*pos`, advancing it. `None` on truncation or overflow.
 #[inline]
 pub fn get(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    // Lengths, counts and field headers in records are nearly all one byte.
+    let b = *buf.get(*pos)?;
+    if b < 0x80 {
+        *pos += 1;
+        return Some(u64::from(b));
+    }
+    get_long(buf, pos)
+}
+
+#[cold]
+fn get_long(buf: &[u8], pos: &mut usize) -> Option<u64> {
     let mut v = 0u64;
     let mut shift = 0u32;
     loop {

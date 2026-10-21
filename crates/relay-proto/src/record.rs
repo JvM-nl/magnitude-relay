@@ -175,18 +175,33 @@ impl<'a> Record<'a> {
     }
 
     fn write_tags_json(&self, out: &mut Vec<u8>) {
+        // One pass over the encoded tags: `tags()` would walk each tag twice,
+        // once to find where it ends and once for its fields.
+        let b = self.0;
+        let (_, mut p) = self.content_and_tags_pos();
+        let tags = varint::get(b, &mut p).expect("record tag count");
         out.push(b'[');
-        for (i, tag) in self.tags().enumerate() {
+        for i in 0..tags {
             if i > 0 {
                 out.push(b',');
             }
             out.push(b'[');
-            for (j, f) in tag.fields().enumerate() {
+            let fields = varint::get(b, &mut p).expect("record field count");
+            for j in 0..fields {
                 if j > 0 {
                     out.push(b',');
                 }
                 out.push(b'"');
-                f.write_str(out);
+                let h = varint::get(b, &mut p).expect("record field header");
+                if h == FIELD_HEX32 {
+                    hex::encode_into(&b[p..p + 32], out);
+                    p += 32;
+                } else {
+                    // Stored as it is written: escaped JSON string content.
+                    let n = (h >> 1) as usize;
+                    out.extend_from_slice(&b[p..p + n]);
+                    p += n;
+                }
                 out.push(b'"');
             }
             out.push(b']');
