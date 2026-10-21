@@ -434,10 +434,19 @@ impl Segment {
         (off, len, count, before, self.map.slice(e + 26, klen))
     }
 
-    /// Checks every block's checksum (`Err` names the first damaged one), so
-    /// that none is checked again on use.
-    pub fn verify_blocks(&self) -> Result<(), usize> {
-        for i in 0..self.nblocks {
+    pub fn blocks(&self) -> usize {
+        self.nblocks
+    }
+
+    /// Asks the kernel to start reading the whole file in.
+    pub fn will_need(&self) {
+        self.map.advise(crate::mmap::Advice::WillNeed);
+    }
+
+    /// Checks the checksums of blocks `range` (`Err` names the first damaged
+    /// one), so that none is checked again on use.
+    pub fn verify_blocks(&self, range: std::ops::Range<usize>) -> Result<(), usize> {
+        for i in range {
             let (off, len, ..) = self.meta(i);
             let (body, crc) = self.map.slice(off, len).split_at(len - 4);
             if crc32c(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
