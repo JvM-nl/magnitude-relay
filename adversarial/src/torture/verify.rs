@@ -80,7 +80,10 @@ pub fn check_state(m: &Model, store: &Store, w: &Writer) -> Result<(), String> {
             continue;
         }
         let r = v.record(s.seq).expect("live");
-        if r.0 != s.rec.as_slice() {
+        // As the store keeps it: base64 content decoded (`record::compact_into`).
+        let mut want = Vec::new();
+        relay_proto::record::compact_into(&s.rec, &mut want);
+        if r.0 != want.as_slice() {
             let what = if r.0.iter().all(|&b| b == 0) { "zeroed" } else { "different bytes" };
             errs.push(format!("seq {} (event n{} kind {}): record is {what} ({} bytes, want {})", s.seq, s.ev.n, s.ev.kind, r.0.len(), s.rec.len()));
             continue;

@@ -48,7 +48,10 @@ pub fn check_snapshot(v: &Version, f: &Filter, rng: &mut Rng) {
         }
         let json = r.to_json();
         parse_event_json(&json, &mut parser, &mut back, false).unwrap_or_else(|e| panic!("stored record is not an event ({e}): {json}"));
-        assert_eq!(back.as_slice(), r.0, "record does not survive its own JSON");
+        // The store keeps base64 content decoded (`record::compact_into`).
+        let mut kept = Vec::new();
+        relay_proto::record::compact_into(&back, &mut kept);
+        assert_eq!(kept.as_slice(), r.0, "record does not survive its own JSON");
     }
     if rng.chance(1, 3) {
         let all = v.query(f, usize::MAX, NOW);
