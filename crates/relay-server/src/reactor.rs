@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::ingest::{ReactorMsg, WriteReq};
 use crate::metrics::{self, Metrics};
 use crate::session::{self, Ctx, Outbox, Session, SessionCfg};
+use crate::sock::{Incoming, Sock, TlsConfig};
 use crate::subs::{ConnId, FxMap, SubIndex};
 use relay_net::conn::{server_handshake_with, Handshake, OwnedRequest};
 use relay_net::http::{write_response, ExtensionPolicy};
@@ -207,15 +208,16 @@ pub fn listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
 /// Accepts connections and deals them to reactors round-robin. SO_REUSEPORT
 /// hashing leaves reactors idle when connections are few (eight benchmark
 /// clients can land 3-3-1-1 or worse), and signature checks are per core, so an
-/// idle reactor is lost throughput; dealing in turn places them exactly.
-pub fn accept_loop(l: std::net::TcpListener, conns: Vec<mpsc::UnboundedSender<(std::net::TcpStream, SocketAddr)>>) {
+/// idle reactor is lost throughput; dealing in turn places them exactly. `tls` is
+/// set for the HTTPS listener: its connections do the TLS handshake on their reactor.
+pub fn accept_loop(l: std::net::TcpListener, conns: Vec<mpsc::UnboundedSender<Incoming>>, tls: Option<TlsConfig>) {
     let mut next = 0usize;
     loop {
         match l.accept() {
             Ok((s, peer)) => {
                 let _ = s.set_nodelay(true);
                 if s.set_nonblocking(true).is_ok() {
-                    let _ = conns[next % conns.len()].send((s, peer));
+                    let _ = conns[next % conns.len()].send((s, peer, tls.clone()));
                     next = next.wrapping_add(1);
                 }
             }
@@ -232,7 +234,7 @@ pub fn accept_loop(l: std::net::TcpListener, conns: Vec<mpsc::UnboundedSender<(s
 pub fn run(
     idx: usize,
     shared: Arc<Shared>,
-    mut conns: mpsc::UnboundedReceiver<(std::net::TcpStream, SocketAddr)>,
+    mut conns: mpsc::UnboundedReceiver<Incoming>,
     rx: mpsc::UnboundedReceiver<ReactorMsg>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
@@ -250,10 +252,10 @@ pub fn run(
         }));
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
         tokio::task::spawn_local(keep_fresh(st.clone(), shared.clone()));
-        while let Some((s, peer)) = conns.recv().await {
+        while let Some((s, peer, tls)) = conns.recv().await {
             match TcpStream::from_std(s) {
                 Ok(s) => {
-                    tokio::task::spawn_local(connection(s, peer, st.clone(), shared.clone()));
+                    tokio::task::spawn_local(connection(s, peer, tls, st.clone(), shared.clone()));
                 }
                 Err(e) => eprintln!("cannot adopt connection: {e}"),
             }
@@ -369,7 +371,11 @@ fn client_ip(req: &OwnedRequest, peer: SocketAddr, header: &str) -> IpAddr {
     std::str::from_utf8(last).ok().and_then(|s| s.trim().parse::<IpAddr>().ok()).map_or(fallback, |ip| ip.to_canonical())
 }
 
-async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
+async fn connection(s: TcpStream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
+    // Clients of the HTTPS listener connect to the relay directly, so a header
+    // naming "the real address" is theirs to forge: only the socket's peer counts.
+    let real_ip_header = if tls.is_some() { "" } else { shared.cfg.relay.real_ip_header.as_str() };
+    let Some(mut s) = Sock::open(s, tls).await else { return };
     let mut buf = Vec::with_capacity(4096);
     let policy = match shared.cfg.relay.deflate_policy() {
         Some(p) => ExtensionPolicy::with_deflate(p),
@@ -383,7 +389,7 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
         }
         _ => return,
     };
-    let ip = client_ip(&req, peer, &shared.cfg.relay.real_ip_header);
+    let ip = client_ip(&req, peer, real_ip_header);
     let idx = st.borrow().idx;
     if !shared.admit(ip) {
         metrics::inc(&shared.metrics.of(idx).connections_refused);
@@ -497,7 +503,7 @@ fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &Conn
 /// so an idle connection costs almost nothing.
 #[allow(clippy::too_many_arguments)]
 async fn serve(
-    s: &mut TcpStream,
+    s: &mut Sock,
     buf: &mut Vec<u8>,
     conn: ConnId,
     ip: IpAddr,
@@ -606,7 +612,7 @@ async fn serve(
 
 /// Plain HTTP: the NIP-11 document for `Accept: application/nostr+json`, a short
 /// note otherwise.
-async fn plain_http(s: &mut TcpStream, req: &OwnedRequest, shared: &Shared) -> io::Result<()> {
+async fn plain_http(s: &mut Sock, req: &OwnedRequest, shared: &Shared) -> io::Result<()> {
     let mut out = Vec::new();
     let cors = [
         ("Access-Control-Allow-Origin", "*"),
