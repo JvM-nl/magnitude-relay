@@ -34,6 +34,8 @@ pub const BLOCK_TARGET: usize = 4096;
 const MAGIC: &[u8; 8] = b"RLYSEG02";
 /// Keys between restart points.
 const RESTART: usize = 16;
+/// Room for the longest index key (a tag value is capped at 259 bytes).
+const SCAN_KEY_MAX: usize = 1024;
 const FOOTER_LEN: usize = 80;
 const BLOOM_BITS_PER_PREFIX: usize = 10;
 const BLOOM_K: u32 = 7;
@@ -322,10 +324,9 @@ impl<'a> BlockRef<'a> {
         }
     }
 
-    /// Position within the block of the first key `>= k`, leaving the interval
-    /// that holds it (or the last one searched) decoded in `iv` as `iv_at`.
-    fn lower_bound(&self, k: &[u8], iv: &mut Interval) -> (usize, usize) {
-        // The last restart whose key is <= k.
+    /// The last restart whose key is `<= k` (0 if none is).
+    #[inline]
+    fn restart_le(&self, k: &[u8]) -> usize {
         let (mut lo, mut hi) = (0usize, self.nrestarts());
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -335,7 +336,13 @@ impl<'a> BlockRef<'a> {
                 hi = mid;
             }
         }
-        let r = lo.saturating_sub(1);
+        lo.saturating_sub(1)
+    }
+
+    /// Position within the block of the first key `>= k`, leaving the interval
+    /// that holds it (or the last one searched) decoded in `iv` as `iv_at`.
+    fn lower_bound(&self, k: &[u8], iv: &mut Interval) -> (usize, usize) {
+        let r = self.restart_le(k);
         self.decode(r, iv);
         let mut i = 0;
         while i < iv.len() && iv.key(i) < k {
@@ -495,11 +502,60 @@ impl Segment {
         if self.nblocks == 0 || !self.may_contain(keys::bloom_prefix(k)) {
             return false;
         }
-        let b = self.block(self.block_for(k));
-        let mut iv = Interval::default();
-        let (pos, r) = b.lower_bound(k, &mut iv);
-        let i = pos - r * RESTART;
-        i < iv.len() && iv.key(i) == k
+        // Only the first key at or after `k` matters; every key type byte is below 0xFF.
+        let mut found = false;
+        self.scan(k, &[0xFF], &mut |x| {
+            found = x == k;
+            false
+        });
+        found
+    }
+
+    /// Calls `f` with every key in `[lo, hi)`, in order, until it returns false.
+    /// One forward walk from the restart point before `lo`: no cursor, and keys
+    /// are rebuilt one at a time in a stack buffer, so a point or prefix lookup
+    /// decodes a few keys and allocates nothing.
+    pub fn scan(&self, lo: &[u8], hi: &[u8], f: &mut dyn FnMut(&[u8]) -> bool) {
+        if self.nblocks == 0 {
+            return;
+        }
+        let mut buf = [0u8; SCAN_KEY_MAX];
+        let mut bi = self.block_for(lo);
+        let mut r = None;
+        while bi < self.nblocks {
+            let b = self.block(bi);
+            let start = *r.get_or_insert_with(|| b.restart_le(lo));
+            r = Some(0);
+            let mut p = b.restart_off(start);
+            for _ in start * RESTART..b.count {
+                let shared = varint::get(b.entries, &mut p).expect("block entry") as usize;
+                let rest = varint::get(b.entries, &mut p).expect("block entry") as usize;
+                let len = shared + rest;
+                if len > SCAN_KEY_MAX {
+                    // Longer than any key the index writes; take the general path.
+                    return self.scan_cursor(lo, hi, f);
+                }
+                buf[shared..len].copy_from_slice(&b.entries[p..p + rest]);
+                p += rest;
+                let k = &buf[..len];
+                if k < lo {
+                    continue;
+                }
+                if k >= hi || !f(k) {
+                    return;
+                }
+            }
+            bi += 1;
+        }
+    }
+
+    fn scan_cursor(&self, lo: &[u8], hi: &[u8], f: &mut dyn FnMut(&[u8]) -> bool) {
+        let mut c = self.range(lo, hi);
+        while let Some(k) = c.next_front() {
+            if !f(k) {
+                return;
+            }
+        }
     }
 
     /// A cursor over keys in `[lo, hi)`.

@@ -65,14 +65,7 @@ impl Run {
                     i += 1;
                 }
             }
-            Run::Disk(s) => {
-                let mut c = s.range(lo, hi);
-                while let Some(k) = c.next_front() {
-                    if !f(k) {
-                        return;
-                    }
-                }
-            }
+            Run::Disk(s) => s.scan(lo, hi, f),
         }
     }
 
