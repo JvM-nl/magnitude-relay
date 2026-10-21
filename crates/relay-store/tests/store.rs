@@ -1823,6 +1823,9 @@ fn a_damaged_dead_set_is_refused() {
     // checksum: it is longer than the log, and refused.
     patch(&bits, 0, &[0x5Au8; 4096]);
     assert!(Store::open(&dir, opts()).is_err(), "a garbled dead.bits was accepted");
+    // So does one cut to whole words: shorter than the log it covers.
+    std::fs::OpenOptions::new().write(true).open(&bits).unwrap().set_len(0).unwrap();
+    assert!(Store::open(&dir, opts()).is_err(), "a cut dead.bits was accepted");
     // And one without it is refused too: every removal would be undone.
     std::fs::remove_file(&bits).unwrap();
     assert!(Store::open(&dir, opts()).is_err());

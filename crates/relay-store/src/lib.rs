@@ -331,10 +331,11 @@ impl Store {
             locs.sync().map_err(step("finishing an interrupted log compaction"))?;
         }
 
-        // One without a checksum is at least never longer than the log: one
-        // that is was damaged (padded out to whole words, say).
-        if unchecked_words.is_some_and(|w| w as u64 > next_seq.div_ceil(64)) {
-            return Err(io::Error::other("dead.bits is corrupt (longer than the log)"));
+        // One without a checksum is at least as long as the checkpoint's
+        // indexed part of the log, and never longer than the log: one that is
+        // not was damaged (cut, or padded out to whole words).
+        if unchecked_words.is_some_and(|w| (w as u64) < ck.covered.div_ceil(64) || w as u64 > next_seq.div_ceil(64)) {
+            return Err(io::Error::other("dead.bits is corrupt (its length does not match the log)"));
         }
         dead.grow_to(next_seq);
         // A dead frame naming a seq past the end names no record (a damaged
