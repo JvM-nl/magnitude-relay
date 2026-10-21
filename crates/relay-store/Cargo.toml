@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Crash points and injected write failures, for the crash-torture and
+# disk-fault tests (see src/fault.rs). Never part of a release build.
+fault-injection = []
+
 [dependencies]
 relay-proto.workspace = true
 libc.workspace = true

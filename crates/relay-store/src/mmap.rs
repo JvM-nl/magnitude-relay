@@ -96,6 +96,14 @@ impl MappedFile {
 
     pub fn write_at(&self, off: u64, data: &[u8]) -> io::Result<()> {
         debug_assert!(off as usize + data.len() <= self.len);
+        #[cfg(any(test, feature = "fault-injection"))]
+        {
+            let n = crate::fault::allowance(&self.path, data.len());
+            if n < data.len() {
+                self.file.write_all_at(&data[..n], off)?;
+                return Err(crate::fault::enospc());
+            }
+        }
         self.file.write_all_at(data, off)
     }
 
@@ -255,6 +263,7 @@ impl Drop for MappedFile {
             libc::munmap(self.ptr.as_ptr().cast(), self.len);
         }
         if self.obsolete.load(std::sync::atomic::Ordering::Acquire) {
+            crash_point!("file.retiring");
             let _ = std::fs::remove_file(&self.path);
         }
     }

@@ -10,12 +10,23 @@
 //! runs flush to segment files in the background, and a checkpoint records which
 //! segments cover which part of the log, so a restart replays only the tail.
 
+/// A moment worth crashing at, for the crash tests (see [`fault`]). Expands to
+/// nothing in a normal build.
+macro_rules! crash_point {
+    ($name:literal) => {
+        #[cfg(any(test, feature = "fault-injection"))]
+        $crate::fault::crash_point($name);
+    };
+}
+
 pub mod backup;
 pub mod bloom;
 pub mod bg;
 pub mod checkpoint;
 pub mod crc32c;
 pub mod dead;
+#[cfg(any(test, feature = "fault-injection"))]
+pub mod fault;
 pub mod keys;
 pub mod locs;
 pub mod log;
@@ -245,6 +256,7 @@ impl Store {
         if let Some(e) = loc_err {
             return Err(e);
         }
+        crash_point!("open.replayed");
         if !ck.intent_cold.is_empty() {
             let segs = log.segments();
             for &n in &ck.intent_cold {

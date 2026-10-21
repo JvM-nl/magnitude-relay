@@ -79,6 +79,7 @@ impl SyncTicket {
         for f in &self.files {
             f.sync()?;
         }
+        crash_point!("ticket.synced");
         self.durable.fetch_max(self.seq_end, Ordering::AcqRel);
         self.synced.fetch_max(self.epoch, Ordering::AcqRel);
         Ok(())
@@ -529,6 +530,7 @@ impl Writer {
             offs.push(self.log.append(base_count + i as u64, rec)?);
         }
         self.log.flush()?;
+        crash_point!("writer.appended");
         for (i, &off) in offs.iter().enumerate() {
             self.locs.set(base_count + i as u64, off)?;
         }
@@ -557,6 +559,7 @@ impl Writer {
             self.log.mark_dead(off)?;
             zero.push(off);
         }
+        crash_point!("writer.marked_dead");
         let mut t = std::time::Instant::now();
         let files = if self.opts.sync { self.log.take_touched()? } else { self.log.flush().map(|_| Vec::new())? };
         lap(0, &mut t);
@@ -575,6 +578,7 @@ impl Writer {
             lap(2, &mut t);
         }
         drop(self.publish());
+        crash_point!("writer.published");
         self.defer_zero(zero);
         self.reclaim()?;
         self.maybe_flush()?;
@@ -608,7 +612,9 @@ impl Writer {
         for &s in seqs {
             b.kill(s);
         }
-        self.commit(b)
+        self.commit(b)?;
+        crash_point!("writer.killed");
+        Ok(())
     }
 
     /// Kills whichever of `seqs` are still live, in one commit. Returns how many were.
@@ -967,6 +973,7 @@ impl Writer {
         }
         match d {
             Done::Flushed { seg, frozen, covered, replay_from } => {
+                crash_point!("flush.done");
                 self.mem.drain(..frozen);
                 // A fresh shared filter, of the runs still in memory: older
                 // versions keep the one that covers theirs.
@@ -982,6 +989,7 @@ impl Writer {
                 self.maybe_flush()?;
             }
             Done::Compacted { seg, replaced } => {
+                crash_point!("compact.done");
                 let (gone, keep): (Vec<_>, Vec<_>) = self.segments.drain(..).partition(|s| replaced.contains(&s.id));
                 self.segments = keep;
                 self.segments.push(seg);
@@ -990,6 +998,7 @@ impl Writer {
                 // The checkpoint must stop naming the old segments before their
                 // files can be removed (they go when the last snapshot drops them).
                 self.write_checkpoint()?;
+                crash_point!("compact.checkpointed");
                 for s in gone {
                     s.mark_obsolete();
                 }
@@ -1011,10 +1020,12 @@ impl Writer {
                     }
                 }
                 drop(self.publish());
+                crash_point!("logcompact.registered");
                 let reg_gen = self.current().gen;
                 // 2. Record the intent: a crash from here on finishes the exchange at open.
                 self.intent = (intent_cold, retire.clone());
                 self.write_checkpoint()?;
+                crash_point!("logcompact.intent_recorded");
                 // 3. Relink once no reader can hold a version without them.
                 self.log_state = LogState::Waiting { reg_gen, moves, retire };
                 self.step_log_compaction();
@@ -1023,6 +1034,7 @@ impl Writer {
                 let LogState::Relinking { retire } = std::mem::replace(&mut self.log_state, LogState::Idle) else {
                     return Ok(());
                 };
+                crash_point!("relink.done");
                 // Events that died while their copy was being written: the cold
                 // copy dies too, and its bytes go like any other dead record's.
                 let mut zero = Vec::new();
@@ -1044,8 +1056,10 @@ impl Writer {
                 }
                 self.intent = (Vec::new(), Vec::new());
                 drop(self.publish());
+                crash_point!("relink.retired");
                 self.defer_zero(zero);
                 self.write_checkpoint()?;
+                crash_point!("relink.checkpointed");
             }
             Done::Failed(msg) => {
                 eprintln!("store: background job failed: {msg}");
@@ -1113,9 +1127,13 @@ impl Writer {
         self.barrier()?;
         self.locs.sync()?;
         let dead_tmp = self.dir.join("dead.bits.tmp");
-        std::fs::write(&dead_tmp, self.dead.to_bytes(self.next_seq))?;
+        let bits = self.dead.to_bytes(self.next_seq);
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault::check(&dead_tmp, bits.len())?;
+        std::fs::write(&dead_tmp, bits)?;
         std::fs::File::open(&dead_tmp)?.sync_all()?;
         std::fs::rename(&dead_tmp, self.dir.join("dead.bits"))?;
+        crash_point!("checkpoint.dead_bits");
         let ids: Vec<u64> = self.segments.iter().map(|s| s.id).collect();
         crate::checkpoint::write(
             &self.dir,
@@ -1171,6 +1189,7 @@ impl Writer {
             }
             let (_, _, offs, _) = self.pending_zero.pop_front().unwrap();
             for off in offs {
+                crash_point!("reclaim.zeroing");
                 self.log.zero_record(off)?;
             }
         }

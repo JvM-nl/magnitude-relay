@@ -294,6 +294,7 @@ impl LogWriter {
             return Ok(());
         }
         let si = self.buf_start / self.seg_size;
+        crash_point!("log.flushing");
         self.file(si).expect("head segment").write_at(self.buf_start % self.seg_size, &self.buf)?;
         self.touched.insert(si);
         self.buf.clear();
@@ -330,6 +331,7 @@ impl LogWriter {
         const BLOCK: u64 = 4096;
         let (body, end) = (o + FRAME_HEADER as u64, o + FRAME_HEADER as u64 + len as u64);
         let (a, b) = (body.next_multiple_of(BLOCK), end / BLOCK * BLOCK);
+        crash_point!("log.zeroing");
         if b > a && seg.punch_hole(a, b) {
             write_zeros(&seg, body, a)?;
             return write_zeros(&seg, b, end);
@@ -439,6 +441,7 @@ impl LogWriter {
         let seg = self.hot[si].clone().expect("just ensured");
         while from < to {
             let n = ((to - from) as usize).min(ZEROS.len());
+            crash_point!("log.preparing");
             seg.write_at(from % self.seg_size, &ZEROS[..n])?;
             from += n as u64;
         }

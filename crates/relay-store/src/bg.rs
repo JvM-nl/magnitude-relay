@@ -184,7 +184,9 @@ fn write(dir: &Path, id: u64, mut srcs: Vec<Src<'_>>, dead: &DeadSet, stop: &Ato
         have_last = true;
     }
     w.finish()?;
+    crash_point!("bg.segment_written");
     std::fs::rename(&tmp, &path)?;
+    crash_point!("bg.segment_renamed");
     sync_dir(dir)?;
     Ok(Arc::new(Segment::open(id, &path)?))
 }
@@ -301,6 +303,7 @@ impl<'a> ColdOut<'a> {
         c.2 += len;
         self.run_bytes += len;
         if self.buf.len() >= 1 << 20 {
+            crash_point!("cold.writing");
             c.1.write_at(self.buf_at, &self.buf)?;
             self.buf_at += self.buf.len() as u64;
             self.buf.clear();
@@ -311,8 +314,10 @@ impl<'a> ColdOut<'a> {
     /// Writes out and syncs the segment being filled.
     fn seal(&mut self) -> io::Result<()> {
         if let Some((n, f, _)) = self.cur.take() {
+            crash_point!("cold.sealing");
             f.write_at(self.buf_at, &self.buf)?;
             f.sync()?;
+            crash_point!("cold.sealed");
             self.buf.clear();
             self.buf_at = 0;
             self.done.push((n, f));
@@ -525,6 +530,7 @@ fn relink(moves: &[(u64, u64)], dead: &DeadSet, locs: &MappedFile, stop: &Atomic
             i += 1;
         }
         locs.write_at(start * 8, &chunk)?;
+        crash_point!("relink.writing");
     }
     locs.sync()
 }

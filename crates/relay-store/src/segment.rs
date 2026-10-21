@@ -125,6 +125,8 @@ impl SegmentWriter {
         self.restarts.clear();
         let crc = crc32c(&self.block);
         self.block.extend_from_slice(&crc.to_le_bytes());
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault::check(&self.path, self.block.len())?;
         self.out.write_all(&self.block)?;
         let before = self.blocks.last().map_or(0, |b| b.before + u64::from(b.count));
         self.blocks.push(BlockMeta {
@@ -189,6 +191,8 @@ impl SegmentWriter {
         footer.extend_from_slice(&crc32c(&crc_in).to_le_bytes());
         footer.resize(FOOTER_LEN, 0);
 
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault::check(&self.path, index.len() + bloom_bytes.len() + footer.len())?;
         self.out.write_all(&index)?;
         self.out.write_all(&bloom_bytes)?;
         self.out.write_all(&footer)?;
@@ -585,6 +589,7 @@ impl Segment {
 impl Drop for Segment {
     fn drop(&mut self) {
         if self.obsolete.load(Ordering::Acquire) {
+            crash_point!("segment.retiring");
             let _ = std::fs::remove_file(&self.path);
         }
     }
