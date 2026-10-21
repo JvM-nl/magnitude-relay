@@ -1381,17 +1381,29 @@ impl Writer {
                     if !seen.insert(p.to_vec()) {
                         continue;
                     }
-                    let mut members = Vec::new();
+                    // Every member the index still has, live or not: (created_at, seq, live).
+                    let mut all = Vec::new();
                     v.for_prefix(p, |k| {
                         let s = seq_of(k);
-                        if v.is_live(s) {
-                            if v.frame_dead(s) {
-                                kills.push(s);
-                            } else {
-                                members.push((created_at_of(k), s));
-                            }
-                        }
+                        all.push((created_at_of(k), s, v.is_live(s)));
                     });
+                    // A dead member's record may be gone with its segment.
+                    let id = |s: u64| v.segs.file(locs::get(&v.locs, s) / v.seg_size).map(|_| *v.record_unchecked(s).id());
+                    let mut members = Vec::new();
+                    for &(ca, s, live) in &all {
+                        if !live {
+                            continue;
+                        }
+                        // A newer member stored after it replaced it, and that
+                        // holds even if the newer one has died since (deleted, its
+                        // flag on disk, while the replaced one's kill was lost).
+                        let replaced = all.iter().any(|&(ca2, s2, _)| s2 > s && (ca2 > ca || (ca2 == ca && id(s2).is_none_or(|i| Some(i) < id(s)))));
+                        if replaced || v.frame_dead(s) {
+                            kills.push(s);
+                        } else {
+                            members.push((ca, s));
+                        }
+                    }
                     if members.len() > 1 {
                         let best = *members
                             .iter()

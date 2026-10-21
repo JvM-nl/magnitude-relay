@@ -290,3 +290,49 @@ fn a_dead_flag_never_reaches_the_disk_before_its_killer() {
     drop(v);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Found by the adversarial suite's power-cut torture: one acknowledged batch
+/// replaced a profile and deleted the replacement. The dead flags of both
+/// kills went to disk together, after the batch; a power cut kept the
+/// replacement's flag and lost the original's. The restart's repair saw one
+/// live member in the slot and left it: the replaced profile was back. A
+/// newer event stored later replaced it, whether or not it has died since.
+#[test]
+fn a_replacement_deleted_in_its_own_batch_still_replaced() {
+    let dir = tmpdir("replaced-deleted");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    write(&mut w, &[ev_kind(1, 1, 0, 10)]).unwrap();
+    let delete2 = {
+        let json = format!(
+            r#"{{"id":"{}","pubkey":"{}","created_at":2000,"kind":5,"tags":[["e","{}"]],"content":"","sig":"{}"}}"#,
+            hex32(0xEE, 3),
+            hex32(1, 0),
+            hex32(0xEE, 2),
+            "00".repeat(64)
+        );
+        let mut p = EventParser::new();
+        let mut rec = Vec::new();
+        parse_event_json(&json, &mut p, &mut rec, false).unwrap();
+        rec
+    };
+    write(&mut w, &[ev_kind(2, 1, 0, 10), delete2]).unwrap();
+    // The flags of both kills are written now, after the batch is durable.
+    w.maintain().unwrap();
+    w.close();
+    drop(store);
+    // The power cut: the first profile's flag is lost.
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(dir.join("log").join("00000000.log")).unwrap();
+        let mut flags = [0u8; 4];
+        f.read_exact_at(&mut flags, 4).unwrap();
+        assert_eq!(u32::from_le_bytes(flags), crate::log::FLAG_DEAD, "the first profile was flagged");
+        f.write_all_at(&[0; 4], 4).unwrap();
+    }
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    let v = store.snapshot();
+    assert_eq!(v.lookup_id(&id_of(1)), None, "the replaced profile is back");
+    assert_eq!(v.lookup_id(&id_of(2)), None, "the deleted replacement is back");
+    drop(v);
+    let _ = std::fs::remove_dir_all(dir);
+}
