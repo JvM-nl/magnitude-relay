@@ -610,11 +610,43 @@ fn client_ip(req: &OwnedRequest, peer: SocketAddr, header: &str) -> IpAddr {
     std::str::from_utf8(last).ok().and_then(|s| s.trim().parse::<IpAddr>().ok()).map_or(fallback, |ip| ip.to_canonical())
 }
 
+/// An accepted connection: what serving it needs, and nothing of its
+/// handshake (the request, its headers, the parser's state).
+struct Accepted {
+    s: Sock,
+    buf: Vec<u8>,
+    ip: IpAddr,
+    deflate: Option<DeflateParams>,
+    trusted: bool,
+    conn: ConnId,
+    out: Rc<ConnOut>,
+}
+
 async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
+    // The handshake runs in a future of its own, freed once it is done: an
+    // async fn's state is as large as its largest phase, and every idle
+    // connection carried the handshake's (and kept its request's headers).
+    let Some(a) = Box::pin(accept(s, peer, tls, &st, &shared)).await else { return };
+    let Accepted { mut s, mut buf, ip, deflate, trusted, conn, out } = a;
+    let _ = serve(&mut s, &mut buf, conn, ip, deflate, trusted, &out, &st, &shared).await;
+
+    {
+        let mut r = st.borrow_mut();
+        r.subs.remove_conn(conn);
+        r.held.release_conn(conn);
+        r.conns.remove(&conn);
+    }
+    shared.release(ip);
+    shared.metrics.open.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// TLS (on the HTTPS listener), the WebSocket handshake, and admission: the
+/// connection, ready to serve, or `None` once it has been answered or refused.
+async fn accept(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: &Rc<RefCell<Reactor>>, shared: &Arc<Shared>) -> Option<Accepted> {
     // Clients of the HTTPS listener connect to the relay directly, so a header
     // naming "the real address" is theirs to forge: only the socket's peer counts.
     let real_ip_header = if tls.is_some() { "" } else { shared.cfg.relay.real_ip_header.as_str() };
-    let Some(mut s) = Sock::open(s, tls).await else { return };
+    let mut s = Sock::open(s, tls).await?;
     let mut buf = Vec::with_capacity(4096);
     let policy = match shared.cfg.relay.deflate_policy() {
         Some(p) => ExtensionPolicy::with_deflate(p),
@@ -623,10 +655,10 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
     let (req, deflate) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, server_handshake_with(&mut s, &mut buf, MAX_HEAD, &policy)).await {
         Ok(Ok((Handshake::Upgraded(req), ext))) => (req, ext.deflate),
         Ok(Ok((Handshake::PlainHttp(req), _))) => {
-            let _ = plain_http(&mut s, &req, &shared).await;
-            return;
+            let _ = plain_http(&mut s, &req, shared).await;
+            return None;
         }
-        _ => return,
+        _ => return None,
     };
     let ip = client_ip(&req, peer, real_ip_header);
     let idx = st.borrow().idx;
@@ -638,7 +670,7 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
             let mut out = Vec::new();
             ws::write_close(&mut out, 1008, "not a known peer");
             let _ = s.write_all(&out).await;
-            return;
+            return None;
         }
     };
     if !shared.admit(ip) {
@@ -646,7 +678,7 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
         let mut out = Vec::new();
         ws::write_close(&mut out, 1008, "too many connections from your address");
         let _ = s.write_all(&out).await;
-        return;
+        return None;
     }
     shared.metrics.open.fetch_add(1, Ordering::Relaxed);
     metrics::inc(&shared.metrics.of(idx).connections_total);
@@ -658,16 +690,7 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
     let out = Rc::new(ConnOut::new(z, s.is_clear(), trusted));
     st.borrow_mut().conns.insert(conn, out.clone());
 
-    let _ = serve(&mut s, &mut buf, conn, ip, deflate, trusted, &out, &st, &shared).await;
-
-    {
-        let mut r = st.borrow_mut();
-        r.subs.remove_conn(conn);
-        r.held.release_conn(conn);
-        r.conns.remove(&conn);
-    }
-    shared.release(ip);
-    shared.metrics.open.fetch_sub(1, Ordering::Relaxed);
+    Some(Accepted { s, buf, ip, deflate, trusted, conn, out })
 }
 
 /// The least time a write to a client may take before the client counts as
