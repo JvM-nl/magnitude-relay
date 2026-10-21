@@ -12,6 +12,7 @@ pub mod kind;
 pub mod message;
 pub mod negentropy;
 pub mod record;
+pub mod secp;
 pub mod sha256;
 pub mod varint;
 

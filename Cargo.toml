@@ -35,6 +35,7 @@ webpki-roots = "1"
 ring = "0.17"
 # Dev-only: reference implementations our own code is cross-checked against.
 serde_json = "1"
+num-bigint = "0.4"
 
 [profile.release]
 lto = "fat"

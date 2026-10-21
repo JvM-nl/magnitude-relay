@@ -9,11 +9,20 @@
 //!   the Schnorr verify (libsecp256k1). ns per event by line size.
 //! * `sha`: event-id hashing, the sha2 crate against ours, one preimage at a
 //!   time and eight at once.
+//! * `batch`: signature verification alone: libsecp256k1 one at a time (with
+//!   and without the key cache) against our batch verifier at sizes 1 to 4096,
+//!   plus the curve primitives and per-signature bookkeeping underneath.
+//! * `tune`: multi-scalar multiplication, Strauss against Pippenger at each
+//!   window width, by number of terms (`TUNE_MIN=<n>` skips smaller sums).
 //!
 //! Timings are the best of three passes: the production box is never idle.
 
 use relay_proto::event::{parse_event_json, EventParser};
 use relay_proto::json::Scanner;
+use relay_proto::secp::field::Fe;
+use relay_proto::secp::group::{Affine, Jacobian};
+use relay_proto::secp::msm::{self, Term};
+use relay_proto::secp::{verify_one, SigRef, Verifier};
 use relay_proto::{sha256, Record};
 use secp256k1::{schnorr, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
@@ -22,7 +31,7 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: sigbench <steps|sha> <events.jsonl> [max]";
+    let usage = "usage: sigbench <steps|sha|batch|tune> <events.jsonl> [max]";
     let mode = args.get(1).expect(usage).clone();
     let path = args.get(2).expect(usage);
     let max: usize = args.get(3).map_or(usize::MAX, |s| s.parse().unwrap());
@@ -31,6 +40,8 @@ fn main() {
     match mode.as_str() {
         "steps" => steps(&lines),
         "sha" => sha(&lines),
+        "batch" => batch(&lines),
+        "tune" => tune(&lines),
         _ => panic!("{usage}"),
     }
 }
@@ -211,6 +222,246 @@ fn sha(lines: &[&str]) {
         });
         assert!(out == want, "digest_many disagrees with sha2");
         println!("digest_many in groups of {group:>4}: {ns:.0} ns/event, {:.2} ns/byte, {:.2}x", ns * n as f64 / bytes as f64, one / ns);
+    }
+}
+
+fn batch(lines: &[&str]) {
+    let mut parser = EventParser::new();
+    let mut rec = Vec::new();
+    let mut recs: Vec<Vec<u8>> = Vec::new();
+    for l in lines {
+        if parse_event_json(l, &mut parser, &mut rec, true).is_ok() {
+            recs.push(rec.clone());
+        }
+    }
+    let sigs: Vec<SigRef<'_>> = recs.iter().map(|r| SigRef { pubkey: Record(r).pubkey(), msg: Record(r).id(), sig: Record(r).sig() }).collect();
+    let n = sigs.len();
+    eprintln!("{n} valid events");
+
+    // Curve primitives, ns per operation.
+    let x = Fe::from_bytes(Record(&recs[0]).pubkey()).unwrap();
+    let k = 200_000;
+    let mut a = x;
+    let mul = best_ns(k, || {
+        for _ in 0..k {
+            a = a.mul(&x);
+        }
+        black_box(a);
+    });
+    let sqr = best_ns(k, || {
+        for _ in 0..k {
+            a = a.sqr();
+        }
+        black_box(a);
+    });
+    let k2 = 2000;
+    let inv = best_ns(k2, || {
+        for _ in 0..k2 {
+            a = black_box(a).inv();
+        }
+    });
+    let pts: Vec<Affine> = sigs.iter().take(1000).filter_map(|s| Affine::lift_x(s.pubkey)).collect();
+    let mut j = Jacobian::from_affine(&pts[0]);
+    let dbl = best_ns(k, || {
+        for _ in 0..k {
+            j = j.double();
+        }
+        black_box(j);
+    });
+    let add_aff = best_ns(k, || {
+        for i in 0..k {
+            j = j.add_affine(&pts[i % pts.len()]);
+        }
+        black_box(j);
+    });
+    let jpts: Vec<Jacobian> = pts.iter().map(|p| Jacobian::from_affine(p).double()).collect();
+    let add_j = best_ns(k, || {
+        for i in 0..k {
+            j = j.add(&jpts[i % jpts.len()]);
+        }
+        black_box(j);
+    });
+    let lift_ours = best_ns(n, || {
+        for s in &sigs {
+            black_box(Affine::lift_x(s.pubkey));
+        }
+    });
+    let lift_lib = best_ns(n, || {
+        for s in &sigs {
+            black_box(XOnlyPublicKey::from_byte_array(*s.pubkey).is_ok());
+        }
+    });
+    println!("ours: fe mul {mul:.1} ns, sqr {sqr:.1} ns, inv {inv:.0} ns; double {dbl:.0} ns, add_affine {add_aff:.0} ns, add {add_j:.0} ns");
+    println!("lift_x: ours {lift_ours:.0} ns, libsecp256k1 {lift_lib:.0} ns");
+
+    // The per-signature bookkeeping around the curve work in a batch.
+    {
+        use relay_proto::secp::rng::Weights;
+        use relay_proto::secp::scalar::Scalar;
+        let tag = Sha256::digest(b"BIP0340/challenge");
+        let mut prefix = [0u8; 64];
+        prefix[..32].copy_from_slice(&tag);
+        prefix[32..].copy_from_slice(&tag);
+        let mut base = Sha256::new();
+        base.update(prefix);
+        let chal_one = best_ns(n, || {
+            for s in &sigs {
+                let mut h = base.clone();
+                h.update(&s.sig[..32]);
+                h.update(s.pubkey);
+                h.update(s.msg);
+                black_box(Scalar::from_bytes_mod(&h.finalize().into()));
+            }
+        });
+        let mid = sha256::Midstate::after(&prefix);
+        let msgs: Vec<[u8; 96]> = sigs
+            .iter()
+            .map(|s| {
+                let mut m = [0u8; 96];
+                m[..32].copy_from_slice(&s.sig[..32]);
+                m[32..64].copy_from_slice(s.pubkey);
+                m[64..].copy_from_slice(s.msg);
+                m
+            })
+            .collect();
+        let mrefs: Vec<&[u8]> = msgs.iter().map(|m| &m[..]).collect();
+        let mut digests = vec![[0u8; 32]; n];
+        let chal_lanes = best_ns(n, || {
+            for (r, o) in mrefs.chunks(2048).zip(digests.chunks_mut(2048)) {
+                sha256::digest_many_after(&mid, r, o);
+            }
+            for d in &digests {
+                black_box(Scalar::from_bytes_mod(d));
+            }
+        });
+        let mut map = std::collections::HashMap::new();
+        let hmap = best_ns(n, || {
+            map.clear();
+            for (i, s) in sigs.iter().enumerate() {
+                black_box(*map.entry(*s.pubkey).or_insert(i));
+            }
+        });
+        let mut w = Weights::new();
+        let weight_one = best_ns(n, || {
+            for _ in 0..n {
+                black_box(w.weight());
+            }
+        });
+        let mut ws = vec![0u128; 2048];
+        let weight_lanes = best_ns(n / 2048 * 2048, || {
+            for _ in 0..n / 2048 {
+                w.fill(&mut ws);
+                black_box(&ws);
+            }
+        });
+        let sc: Vec<Scalar> = sigs.iter().map(|s| Scalar::from_bytes_mod(s.msg)).collect();
+        let smul = best_ns(n, || {
+            let mut acc = Scalar::ONE;
+            for x in &sc {
+                acc = acc.mul(x);
+            }
+            black_box(acc);
+        });
+        let split = best_ns(n, || {
+            for x in &sc {
+                black_box(x.split_lambda());
+            }
+        });
+        println!("per signature: challenge {chal_one:.0} ns one at a time, {chal_lanes:.0} ns in lanes; weight {weight_one:.0} ns one at a time, {weight_lanes:.0} ns in lanes; key map {hmap:.0} ns; scalar mul {smul:.0} ns; GLV split {split:.0} ns");
+    }
+
+    let one = best_ns(n, || {
+        let ok = sigs.iter().filter(|s| verify_one(s)).count();
+        assert_eq!(ok, n);
+    });
+    let mut cached = Verifier::new();
+    let one_cached = best_ns(n, || {
+        let ok = sigs.iter().filter(|s| cached.verify_one(s)).count();
+        assert_eq!(ok, n);
+    });
+    println!("libsecp256k1 one at a time (lift_x + verify): {one:.0} ns/sig; with the key cache: {one_cached:.0} ns/sig, {:.2}x", one / one_cached);
+    let mut v = Verifier::new();
+    println!("{:>6} {:>10} {:>8}", "batch", "ns/sig", "speedup");
+    for size in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
+        if size > n {
+            break;
+        }
+        let used = n / size * size;
+        let ns = best_ns(used, || {
+            for chunk in sigs[..used].chunks(size) {
+                assert!(v.verify_all(chunk));
+            }
+        });
+        println!("{size:>6} {ns:>10.0} {:>7.2}x", one / ns);
+    }
+}
+
+/// MSM method and window per number of terms (128-bit scalars on real pubkeys).
+fn tune(lines: &[&str]) {
+    let mut parser = EventParser::new();
+    let mut rec = Vec::new();
+    let mut pts = Vec::new();
+    for l in lines.iter().take(20_000) {
+        if parse_event_json(l, &mut parser, &mut rec, false).is_ok() {
+            if let Some(p) = Affine::lift_x(Record(&rec).pubkey()) {
+                pts.push(p);
+            }
+        }
+    }
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut s = msm::Scratch::default();
+    println!("ns per term");
+    print!("{:>6}", "terms");
+    for w in [4, 5] {
+        print!(" {:>6}", format!("S{w}"));
+    }
+    for c in 4..=11 {
+        print!(" {:>6}", format!("P{c}"));
+    }
+    println!();
+    // Each cell runs for about 0.1 s, calibrated from one call.
+    let cell = |f: &mut dyn FnMut()| -> f64 {
+        let t = Instant::now();
+        f();
+        let one = t.elapsed().as_secs_f64();
+        let reps = ((0.1 / one) as usize).clamp(1, 100_000);
+        best_ns(reps, || {
+            for _ in 0..reps {
+                f();
+            }
+        })
+    };
+    let min: usize = std::env::var("TUNE_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    for n in [8usize, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384] {
+        if n < min {
+            continue;
+        }
+        let terms: Vec<Term> = (0..n).map(|i| Term { point: pts[i % pts.len()], k: u128::from(next()) | (u128::from(next()) << 64) }).collect();
+        print!("{n:>6}");
+        for w in [4, 5] {
+            let ns = cell(&mut || {
+                black_box(msm::strauss(&terms, w, &mut s));
+            }) / n as f64;
+            print!(" {ns:>6.0}");
+        }
+        for c in 4..=11u32 {
+            // Far more buckets than terms only wastes time.
+            if (1usize << (c - 1)) > 2 * n.max(8) {
+                print!(" {:>6}", "-");
+                continue;
+            }
+            let ns = cell(&mut || {
+                black_box(msm::pippenger(&terms, c, &mut s));
+            }) / n as f64;
+            print!(" {ns:>6.0}");
+        }
+        println!();
     }
 }
 
