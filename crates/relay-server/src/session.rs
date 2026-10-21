@@ -3,6 +3,7 @@
 //! (the WebSocket layer frames them in place), so all of it is testable alone.
 
 use crate::ingest::{ReactorMsg, Reply, WriteReq};
+use crate::metrics::{self, Block};
 use crate::subs::{ConnId, SubIndex};
 use relay_proto::event::{verify_sig, EventInfo};
 use relay_proto::json::{escape_str, Scanner};
@@ -47,6 +48,8 @@ pub struct Ctx<'a> {
     pub parser: &'a mut EventParser,
     pub rec: &'a mut Vec<u8>,
     pub now: u64,
+    /// This reactor's counters.
+    pub m: &'a Block,
 }
 
 /// Open negentropy sessions per connection (Vector runs one per relay at a time).
@@ -90,6 +93,7 @@ impl Session {
     }
 
     fn on_event(&mut self, text: &str, info: EventInfo, at: usize, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
+        metrics::inc(&cx.m.events_in);
         let id = *Record(cx.rec).id();
         // Cheap checks first: nothing below costs a hash until these pass.
         let rejection = if !(cx.cfg.kind_allowed)(info.kind) {
@@ -109,23 +113,29 @@ impl Session {
             None
         };
         if let Some(msg) = rejection {
+            metrics::inc(&cx.m.events_refused);
             return ok(out, &id, false, &msg);
         }
         if !(cx.allow_event)() {
+            metrics::inc(&cx.m.events_refused);
             return ok(out, &id, false, "rate-limited: slow down, too many events from your address");
         }
         // A resend is answered from the index, before any hashing.
         cx.store.refresh(cx.snap);
         if cx.snap.lookup_id(&id).is_some() {
+            metrics::inc(&cx.m.events_duplicate);
             return ok(out, &id, true, "duplicate: already have this event");
         }
         if cx.parser.confirm_id(Scanner::new_at(text, at), cx.rec, info).is_err() {
+            metrics::inc(&cx.m.events_refused);
             return ok(out, &id, false, "invalid: bad event id");
         }
         if !verify_sig(Record(cx.rec)) {
+            metrics::inc(&cx.m.events_refused);
             return ok(out, &id, false, "invalid: bad signature");
         }
         if kind::is_ephemeral(info.kind) {
+            metrics::inc(&cx.m.events_ephemeral);
             (cx.broadcast)(ReactorMsg::Ephemeral(Arc::from(cx.rec.as_slice())));
             // Even with nobody listening: Vector's relay check treats a refusal as fatal.
             return ok(out, &id, true, "");
@@ -163,6 +173,8 @@ impl Session {
     }
 
     fn on_req(&mut self, sub_id: &str, mut filters: Vec<Filter>, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
+        metrics::inc(&cx.m.reqs);
+        let started = std::time::Instant::now();
         if let Err(msg) = self.check_filters(&mut filters, cx) {
             return closed(out, sub_id, &msg);
         }
@@ -195,12 +207,15 @@ impl Session {
                     continue;
                 }
                 event_msg(out, sub_id, rec);
+                metrics::inc(&cx.m.events_out);
             }
         }
         eose(out, sub_id);
+        metrics::add(&cx.m.req_micros, started.elapsed().as_micros() as u64);
     }
 
     fn on_neg_open(&mut self, sub_id: &str, filter: Filter, msg: &[u8], cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
+        metrics::inc(&cx.m.neg_opens);
         self.neg.retain(|(s, _)| &**s != sub_id);
         let mut fs = [filter];
         if let Err(m) = self.check_filters(&mut fs, cx) {
@@ -249,6 +264,7 @@ impl Session {
     }
 
     fn on_count(&mut self, sub_id: &str, mut filters: Vec<Filter>, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
+        metrics::inc(&cx.m.counts);
         if let Err(msg) = self.check_filters(&mut filters, cx) {
             return closed(out, sub_id, &msg);
         }

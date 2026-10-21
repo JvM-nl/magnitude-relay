@@ -254,6 +254,16 @@ async fn vector_flows_end_to_end() {
     assert!(info["supported_nips"].as_array().unwrap().contains(&json!(77)));
     assert!(!info["supported_nips"].as_array().unwrap().contains(&json!(42)));
 
+    // Stats and metrics over plain HTTP.
+    let mut s = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+    s.write_all(format!("GET /stats HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).await.unwrap();
+    let stats: Value = serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert!(stats["events_stored"].as_u64().unwrap() >= 4, "{stats}");
+    assert!(stats["reqs"].as_u64().unwrap() >= 4);
+    assert_eq!(stats["store"]["live"].as_u64().unwrap(), 4);
+
     // A clean restart keeps everything.
     drop((a, b));
     let dir = relay.stop();

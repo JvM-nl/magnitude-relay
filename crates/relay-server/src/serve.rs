@@ -35,7 +35,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     };
 
     let (wtx, wrx) = mpsc::sync_channel(WRITE_QUEUE);
-    let shared = Arc::new(Shared::new(cfg, scfg, store.clone(), wtx));
+    let shared = Arc::new(Shared::new(cfg, scfg, store.clone(), wtx, threads));
     let mut txs = Vec::with_capacity(threads);
     let mut rxs = Vec::with_capacity(threads);
     for _ in 0..threads {

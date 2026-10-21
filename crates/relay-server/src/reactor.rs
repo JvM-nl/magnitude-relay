@@ -8,6 +8,7 @@
 
 use crate::config::Config;
 use crate::ingest::{ReactorMsg, WriteReq};
+use crate::metrics::{self, Metrics};
 use crate::session::{self, Ctx, Outbox, Session, SessionCfg};
 use crate::subs::{ConnId, FxMap, SubIndex};
 use relay_net::conn::{server_handshake, Handshake, OwnedRequest};
@@ -43,15 +44,7 @@ pub struct Shared {
     pub nip11: String,
     pub next_conn: AtomicU64,
     ips: Mutex<FxMap<IpAddr, IpState>>,
-    pub stats: Stats,
-}
-
-#[derive(Default)]
-pub struct Stats {
-    pub connections: AtomicU64,
-    pub connections_total: AtomicU64,
-    pub messages_in: AtomicU64,
-    pub events_out: AtomicU64,
+    pub metrics: Metrics,
 }
 
 struct IpState {
@@ -62,7 +55,7 @@ struct IpState {
 }
 
 impl Shared {
-    pub fn new(cfg: Config, scfg: SessionCfg, store: Store, writer: SyncSender<WriteReq>) -> Shared {
+    pub fn new(cfg: Config, scfg: SessionCfg, store: Store, writer: SyncSender<WriteReq>, reactors: usize) -> Shared {
         let nip11 = cfg.nip11_json();
         Shared {
             cfg,
@@ -73,7 +66,7 @@ impl Shared {
             nip11,
             next_conn: AtomicU64::new(1),
             ips: Mutex::new(FxMap::default()),
-            stats: Stats::default(),
+            metrics: Metrics::new(reactors),
         }
     }
 
@@ -219,7 +212,13 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
         let r = &mut *guard;
         let (events, gen): (&[Arc<[u8]>], u64) = match &msg {
             ReactorMsg::Committed(c) => {
+                let m = shared.metrics.of(r.idx);
                 for reply in &c.replies[r.idx] {
+                    match reply.outcome {
+                        Some(relay_store::Outcome::Stored(_)) => metrics::inc(&m.events_stored),
+                        Some(relay_store::Outcome::Duplicate) => metrics::inc(&m.events_duplicate),
+                        _ => metrics::inc(&m.events_refused),
+                    }
                     if let Some(o) = r.conns.get(&reply.conn) {
                         session::ok_reply(&mut WsOut { buf: &mut o.buf.borrow_mut() }, reply);
                         o.notify.notify_one();
@@ -245,7 +244,9 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                     o.overflow.set(true);
                 } else {
                     session::event_msg_json(&mut WsOut { buf: &mut b }, sub, &json);
-                    shared.stats.events_out.fetch_add(1, Ordering::Relaxed);
+                    let m = shared.metrics.of(r.idx);
+                    metrics::inc(&m.events_out);
+                    metrics::inc(&m.events_live);
                 }
                 drop(b);
                 o.notify.notify_one();
@@ -276,14 +277,16 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
         _ => return,
     };
     let ip = client_ip(&req, peer, &shared.cfg.relay.real_ip_header);
+    let idx = st.borrow().idx;
     if !shared.admit(ip) {
+        metrics::inc(&shared.metrics.of(idx).connections_refused);
         let mut out = Vec::new();
         ws::write_close(&mut out, 1008, "too many connections from your address");
         let _ = s.write_all(&out).await;
         return;
     }
-    shared.stats.connections.fetch_add(1, Ordering::Relaxed);
-    shared.stats.connections_total.fetch_add(1, Ordering::Relaxed);
+    shared.metrics.open.fetch_add(1, Ordering::Relaxed);
+    metrics::inc(&shared.metrics.of(idx).connections_total);
     let conn = shared.next_conn.fetch_add(1, Ordering::Relaxed);
     let out = Rc::new(ConnOut { buf: RefCell::new(Vec::new()), notify: Notify::new(), overflow: Cell::new(false) });
     st.borrow_mut().conns.insert(conn, out.clone());
@@ -296,7 +299,7 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
         r.conns.remove(&conn);
     }
     shared.release(ip);
-    shared.stats.connections.fetch_sub(1, Ordering::Relaxed);
+    shared.metrics.open.fetch_sub(1, Ordering::Relaxed);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,9 +336,10 @@ async fn serve(
             off += d.consumed;
             match d.event {
                 Some(Event::Text(t)) => {
-                    shared.stats.messages_in.fetch_add(1, Ordering::Relaxed);
                     let mut guard = st.borrow_mut();
                     let r = &mut *guard;
+                    let m = shared.metrics.of(r.idx);
+                    metrics::inc(&m.messages_in);
                     shared.store.refresh(&mut r.snap);
                     let mut cx = Ctx {
                         cfg: &shared.scfg,
@@ -349,6 +353,7 @@ async fn serve(
                         parser: &mut r.parser,
                         rec: &mut r.rec,
                         now: crate::ingest::now(),
+                        m,
                     };
                     session.on_text(t, &mut cx, &mut WsOut { buf: &mut out.buf.borrow_mut() });
                 }
@@ -374,10 +379,12 @@ async fn serve(
         // Flush (taking the buffer, so fan-out keeps appending to a fresh one).
         if out.overflow.get() {
             ws::write_close(&mut out.buf.borrow_mut(), 1008, "too slow: messages were piling up");
+            metrics::inc(&shared.metrics.of(st.borrow().idx).slow_drops);
             closing = true;
         }
         if !out.buf.borrow().is_empty() {
             std::mem::swap(&mut wbuf, &mut *out.buf.borrow_mut());
+            metrics::add(&shared.metrics.of(st.borrow().idx).bytes_out, wbuf.len() as u64);
             s.write_all(&wbuf).await?;
             wbuf.clear();
             if wbuf.capacity() > 1 << 20 {
@@ -400,6 +407,7 @@ async fn serve(
                     Ok(0) => return Ok(()),
                     Ok(n) => {
                         buf.truncate(len + n);
+                        metrics::add(&shared.metrics.of(st.borrow().idx).bytes_in, n as u64);
                         last_rx = Instant::now();
                         pinged = false;
                     }
@@ -428,8 +436,13 @@ async fn plain_http(s: &mut TcpStream, req: &OwnedRequest, shared: &Shared) -> i
         ("Access-Control-Allow-Headers", "*"),
         ("Access-Control-Allow-Methods", "GET, OPTIONS"),
     ];
+    let path = req.path.split('?').next().unwrap_or("");
     if req.method == "OPTIONS" {
         write_response(&mut out, 204, "No Content", "text/plain", &cors, b"", true);
+    } else if path == "/stats" {
+        write_response(&mut out, 200, "OK", "application/json", &cors, crate::stats::json(shared).as_bytes(), true);
+    } else if path == "/metrics" {
+        write_response(&mut out, 200, "OK", "text/plain; version=0.0.4", &[], crate::stats::prometheus(shared).as_bytes(), true);
     } else if req.accepts("application/nostr+json") {
         write_response(&mut out, 200, "OK", "application/nostr+json", &cors, shared.nip11.as_bytes(), true);
     } else {

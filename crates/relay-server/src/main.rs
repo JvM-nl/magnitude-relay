@@ -5,9 +5,11 @@ mod config;
 mod export;
 mod import;
 mod ingest;
+mod metrics;
 mod reactor;
 mod serve;
 mod session;
+mod stats;
 mod subs;
 mod toml;
 
