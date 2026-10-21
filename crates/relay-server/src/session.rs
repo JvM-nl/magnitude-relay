@@ -52,7 +52,15 @@ pub struct Ctx<'a> {
     pub m: &'a Block,
     /// Live batches this reactor relayed that are not yet published.
     pub pending: &'a std::collections::VecDeque<Arc<crate::ingest::LiveBatch>>,
+    /// Hands a large COUNT to the counting workers; false when they are full.
+    pub offload: &'a dyn Fn(crate::ingest::CountJob) -> bool,
+    pub conn: ConnId,
 }
+
+/// COUNTs expected to walk more index keys than this (about 2.5 ms of work)
+/// go to the counting workers, so one big count never stalls a reactor's other
+/// connections. Smaller ones are answered on the spot.
+const INLINE_COUNT_KEYS: u64 = 50_000;
 
 /// Open negentropy sessions per connection (Vector runs one per relay at a time).
 const MAX_NEG_SESSIONS: usize = 8;
@@ -286,29 +294,29 @@ impl Session {
             return closed(out, sub_id, &msg);
         }
         cx.store.refresh(cx.snap);
-        let (n, approximate) = if filters.len() == 1 {
-            cx.snap.count_approx(&filters[0], cx.now)
-        } else {
-            // A union: events matched by several filters count once.
-            let mut seen = HashSet::new();
-            for f in &filters {
-                for h in cx.snap.query(f, usize::MAX, cx.now) {
-                    seen.insert(h.seq);
-                }
+        // Exact, always: Vector sizes its syncs with it.
+        if cx.snap.count_cost(&filters) > INLINE_COUNT_KEYS {
+            let job = crate::ingest::CountJob { snap: cx.snap.clone(), filters, now: cx.now, reactor: cx.reactor, conn: cx.conn, sub: sub_id.to_string() };
+            if (cx.offload)(job) {
+                metrics::inc(&cx.m.counts_offloaded);
+            } else {
+                closed(out, sub_id, "rate-limited: too many large counts in progress, try again shortly");
             }
-            (seen.len() as u64, false)
-        };
-        out.text(&mut |b| {
-            b.extend_from_slice(b"[\"COUNT\",\"");
-            b.extend_from_slice(sub_id.as_bytes());
-            b.extend_from_slice(b"\",{\"count\":");
-            relay_proto::record::push_u64(b, n);
-            if approximate {
-                b.extend_from_slice(b",\"approximate\":true");
-            }
-            b.extend_from_slice(b"}]");
-        });
+            return;
+        }
+        count_msg(out, sub_id, cx.snap.count_all(&filters, cx.now));
     }
+}
+
+/// `["COUNT", sub, {"count": n}]`.
+pub fn count_msg(out: &mut dyn Outbox, sub_id: &str, n: u64) {
+    out.text(&mut |b| {
+        b.extend_from_slice(b"[\"COUNT\",\"");
+        b.extend_from_slice(sub_id.as_bytes());
+        b.extend_from_slice(b"\",{\"count\":");
+        relay_proto::record::push_u64(b, n);
+        b.extend_from_slice(b"}]");
+    });
 }
 
 /// A filter that names no kinds, authors, recipients or ids is a broad scan.

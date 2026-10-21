@@ -156,10 +156,6 @@ const ESTIMATE_SAMPLE: usize = 16;
 const MAX_PRODUCT: usize = 4096;
 /// A plan touching at most this many index entries is taken without looking further.
 const GOOD_ENOUGH: u64 = 256;
-/// COUNTs over more entries than this are answered from the block index
-/// (NIP-45 `approximate`) instead of walking every key.
-pub const COUNT_EXACT_LIMIT: u64 = 20_000;
-
 impl Version {
     #[inline]
     pub fn is_live(&self, seq: u64) -> bool {
@@ -513,51 +509,30 @@ impl Version {
         Some(items)
     }
 
-    /// Number of matching events (NIP-45). Exact plans never read a record.
+    /// Number of matching events (NIP-45), exact.
     pub fn count(&self, f: &Filter, now: u64) -> u64 {
-        self.count_approx(f, now).0
+        self.count_all(std::slice::from_ref(f), now)
     }
 
-    /// NIP-45 COUNT with its `approximate` flag. An exact plan over a very large
-    /// range is answered from block counts in O(log n), never walking the keys:
-    /// Vector uses COUNT to size a sync, where "about 255 000" is the answer
-    /// that matters, and it comes back in microseconds.
-    pub fn count_approx(&self, f: &Filter, now: u64) -> (u64, bool) {
-        match self.plan(f) {
-            Plan::Nothing => (0, false),
-            Plan::Ids => (self.query(f, usize::MAX, now).len() as u64, false),
-            Plan::Scan { prefixes, exact } => {
-                let since = f.since.unwrap_or(0);
-                let until = f.until.unwrap_or(u64::MAX);
-                if exact {
-                    let est = self.estimate_all(&prefixes, since, until);
-                    if est > COUNT_EXACT_LIMIT {
-                        return (est, true);
-                    }
-                }
-                let mut m = Merge::new(self, &prefixes, since, until);
-                let mut last = u64::MAX;
-                let mut n = 0;
-                while let Some((_, seq)) = m.next() {
-                    if seq == last {
-                        continue;
-                    }
-                    last = seq;
-                    if !self.is_live(seq) {
-                        continue;
-                    }
-                    if exact {
-                        n += 1;
-                        continue;
-                    }
-                    let rec = self.record_unchecked(seq);
-                    if !expired(rec, now) && f.matches(rec) {
-                        n += 1;
-                    }
-                }
-                (n, false)
-            }
-        }
+    /// Exact NIP-45 COUNT of a union of filters: each event once, expired ones
+    /// left out. A filter the index answers whole reads no record (about 50 ns
+    /// a key: a million-wrap mailbox in ~50 ms); see [`count_cost`](Self::count_cost)
+    /// to decide where to run a big one.
+    pub fn count_all(&self, filters: &[Filter], now: u64) -> u64 {
+        self.matching_seqs(filters, None, now).count() as u64
+    }
+
+    /// Roughly how many index keys counting `filters` walks, from the block
+    /// index alone (no block decoded).
+    pub fn count_cost(&self, filters: &[Filter]) -> u64 {
+        filters
+            .iter()
+            .map(|f| match self.plan(f) {
+                Plan::Nothing => 0,
+                Plan::Ids => f.ids.as_ref().map_or(0, |i| i.len() as u64),
+                Plan::Scan { prefixes, .. } => self.estimate_all(&prefixes, f.since.unwrap_or(0), f.until.unwrap_or(u64::MAX)),
+            })
+            .sum()
     }
 }
 

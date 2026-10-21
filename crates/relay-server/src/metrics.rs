@@ -67,6 +67,8 @@ counters! {
     reqs,
     /// COUNT messages.
     counts,
+    /// COUNTs large enough to be handed to the counting workers.
+    counts_offloaded,
     /// NEG-OPEN messages.
     neg_opens,
     /// Sum of REQ time to EOSE, microseconds (with reqs: the mean).

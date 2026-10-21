@@ -705,3 +705,72 @@ async fn a_big_delete_runs_beside_live_writes() {
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn counts_are_exact_and_big_ones_leave_the_reactors() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-count-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    // Settings first, then a mailbox of 60 000 wraps loaded unsigned (signing
+    // that many in a debug build would take minutes).
+    relay_stop_quietly(Relay::start(dir.clone(), port));
+    let hex = |b: u8, n: u64| {
+        let mut v = [b; 32];
+        v[..8].copy_from_slice(&n.to_le_bytes());
+        hex::encode_string(&v)
+    };
+    let (big, small) = (hex(0xB1, 0), hex(0xB2, 0));
+    let mut lines = String::new();
+    for n in 0..60_100u64 {
+        let to = if n < 60_000 { &big } else { &small };
+        lines.push_str(&format!(
+            r#"{{"id":"{}","pubkey":"{}","created_at":{},"kind":1059,"tags":[["p","{to}"]],"content":"w","sig":"{}"}}"#,
+            hex(0xEE, n),
+            hex(0xC0, n),
+            1_700_000_000 + n,
+            "00".repeat(64)
+        ));
+        lines.push('\n');
+    }
+    let file = dir.join("wraps.jsonl");
+    std::fs::write(&file, lines).unwrap();
+    run_ok(&dir, &["import", "--no-verify", file.to_str().unwrap()]);
+
+    let relay = Relay::start(dir.clone(), port);
+    let host = format!("127.0.0.1:{port}");
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    let count = |sub: &str, filters: Vec<Value>| {
+        let mut m = vec![json!("COUNT"), json!(sub)];
+        m.extend(filters);
+        Value::Array(m)
+    };
+    // Small: answered on the spot. Big: by a counting worker. Both exact.
+    send(&mut c, count("s", vec![json!({"kinds": [1059], "#p": [small]})])).await;
+    let m = recv(&mut c).await;
+    assert_eq!(m, json!(["COUNT", "s", {"count": 100}]));
+    send(&mut c, count("b", vec![json!({"kinds": [1059], "#p": [big]})])).await;
+    let m = recv(&mut c).await;
+    assert_eq!(m, json!(["COUNT", "b", {"count": 60_000}]), "exact, no approximation");
+    // A union counts each event once.
+    send(&mut c, count("u", vec![json!({"kinds": [1059], "#p": [big]}), json!({"kinds": [1059], "#p": [big, small]})])).await;
+    assert_eq!(recv(&mut c).await, json!(["COUNT", "u", {"count": 60_100}]));
+    // A window inside the big mailbox.
+    send(&mut c, count("w", vec![json!({"kinds": [1059], "#p": [big], "since": 1_700_010_000u64, "until": 1_700_019_999u64})])).await;
+    assert_eq!(recv(&mut c).await, json!(["COUNT", "w", {"count": 10_000}]));
+
+    let mut s = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    s.write_all(format!("GET /stats HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).await.unwrap();
+    let stats: Value = serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert_eq!(stats["counts_offloaded"].as_u64(), Some(2), "{stats}");
+
+    drop(c);
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn relay_stop_quietly(r: Relay) {
+    let _ = r.stop();
+}

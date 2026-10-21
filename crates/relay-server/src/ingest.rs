@@ -98,6 +98,19 @@ pub enum ReactorMsg {
     Replies(Arc<Replies>),
     /// An ephemeral event: delivered live, never stored.
     Ephemeral(Arc<[u8]>),
+    /// A COUNT answered by a counting worker, for one connection.
+    Count { conn: ConnId, sub: String, n: u64 },
+}
+
+/// A COUNT too big to run on a reactor: the snapshot it is counted on, and
+/// where the answer goes.
+pub struct CountJob {
+    pub snap: Arc<relay_store::Version>,
+    pub filters: Vec<relay_proto::Filter>,
+    pub now: u64,
+    pub reactor: usize,
+    pub conn: ConnId,
+    pub sub: String,
 }
 
 pub type Sink = Box<dyn Fn(ReactorMsg) + Send>;

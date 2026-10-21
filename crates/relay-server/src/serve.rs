@@ -46,6 +46,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
         rxs.push(rx);
     }
     assert!(shared.reactors.set(txs.clone()).is_ok(), "reactors are set once");
+    // A quarter of the reactors' cores, at least one: big COUNTs are rare.
+    reactor::count_workers(&shared, threads.div_ceil(4));
 
     let make_sinks = |txs: &[tmpsc::UnboundedSender<crate::ingest::ReactorMsg>]| -> Vec<Sink> {
         txs.iter()

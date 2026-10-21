@@ -43,6 +43,8 @@ pub struct Shared {
     pub store: Store,
     pub writer: SyncSender<WriteReq>,
     pub reactors: OnceLock<Vec<mpsc::UnboundedSender<ReactorMsg>>>,
+    /// The counting workers' queue (see `count_workers`).
+    pub counts: OnceLock<SyncSender<crate::ingest::CountJob>>,
     pub nip11: String,
     pub next_conn: AtomicU64,
     ips: Mutex<FxMap<IpAddr, IpState>>,
@@ -65,6 +67,7 @@ impl Shared {
             store,
             writer,
             reactors: OnceLock::new(),
+            counts: OnceLock::new(),
             nip11,
             next_conn: AtomicU64::new(1),
             ips: Mutex::new(FxMap::default()),
@@ -320,6 +323,35 @@ async fn keep_fresh(st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
     }
 }
 
+/// COUNTs too big for a reactor, run on their own threads against the
+/// snapshot the request saw; each answer goes back to the connection's reactor.
+/// The queue is bounded: when it is full, a big COUNT is refused, not queued.
+pub fn count_workers(shared: &Arc<Shared>, workers: usize) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<crate::ingest::CountJob>(COUNT_QUEUE);
+    assert!(shared.counts.set(tx).is_ok(), "counting workers start once");
+    let rx = Arc::new(Mutex::new(rx));
+    for i in 0..workers {
+        let (rx, shared) = (rx.clone(), shared.clone());
+        std::thread::Builder::new()
+            .name(format!("count-{i}"))
+            .spawn(move || loop {
+                let job = match rx.lock().unwrap().recv() {
+                    Ok(j) => j,
+                    Err(_) => return,
+                };
+                let n = job.snap.count_all(&job.filters, job.now);
+                drop(job.snap);
+                if let Some(r) = shared.reactors.get().and_then(|r| r.get(job.reactor)) {
+                    let _ = r.send(ReactorMsg::Count { conn: job.conn, sub: job.sub, n });
+                }
+            })
+            .expect("counting worker");
+    }
+}
+
+/// Large COUNTs waiting for a worker before new ones are refused.
+const COUNT_QUEUE: usize = 64;
+
 /// Delivers OK replies and live events from each committed batch.
 async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
     let mut targets = Vec::new();
@@ -378,6 +410,13 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                 (&[], 0)
             }
             ReactorMsg::Ephemeral(e) => (std::slice::from_ref(e), u64::MAX),
+            ReactorMsg::Count { conn, sub, n } => {
+                if let Some(o) = r.conns.get(conn) {
+                    o.write(|w| session::count_msg(w, sub, *n));
+                    o.notify.notify_one();
+                }
+                (&[], 0)
+            }
         };
         for rec in events {
             targets.clear();
@@ -509,6 +548,7 @@ struct Pass {
 fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &ConnOut, st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr) -> Pass {
     let broadcast = |m: ReactorMsg| shared.broadcast(m);
     let allow_event = || shared.take_event(ip);
+    let offload = |job: crate::ingest::CountJob| shared.counts.get().is_some_and(|q| q.try_send(job).is_ok());
     let started = Instant::now();
     let mut off = 0;
     loop {
@@ -544,6 +584,8 @@ fn process(data: &mut [u8], dec: &mut Decoder, session: &mut Session, out: &Conn
                     now: crate::ingest::now(),
                     m,
                     pending: &r.pending,
+                    offload: &offload,
+                    conn: session.conn,
                 };
                 out.write(|w| session.on_text(t, &mut cx, w));
             }
