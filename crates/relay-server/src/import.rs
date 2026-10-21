@@ -171,6 +171,7 @@ pub fn run(input: impl Read + Send, w: &mut Writer, opts: ImportOptions, mut pro
                         Outcome::Duplicate => stats.duplicate += 1,
                         Outcome::Superseded => stats.superseded += 1,
                         Outcome::Deleted => stats.deleted += 1,
+                        Outcome::Rejected(m) => *stats.invalid.entry(m.to_string()).or_default() += 1,
                     }
                 }
                 if last_report.elapsed().as_secs() >= 2 {

@@ -17,6 +17,7 @@
 //! EXPIRY        09 ‖ expiration ‖ seq
 //! DELETED       0A ‖ target id ‖ deleter pubkey          (kind-5 `e` tombstone, permanent)
 //! ADDR_DELETED  0B ‖ pubkey ‖ kind ‖ d-field ‖ created_at (kind-5 `a` tombstone, permanent)
+//! VANISH        0C ‖ pubkey ‖ created_at                  (NIP-62 tombstone, permanent)
 //! ```
 
 use relay_proto::record::{Field, Record};
@@ -33,6 +34,7 @@ pub const T_ADDR: u8 = 0x08;
 pub const T_EXPIRY: u8 = 0x09;
 pub const T_DELETED: u8 = 0x0A;
 pub const T_ADDR_DELETED: u8 = 0x0B;
+pub const T_VANISH: u8 = 0x0C;
 
 /// Tag values longer than this (stored form) are not indexed, as in strfry.
 pub const MAX_INDEXED_VALUE: usize = 256;
@@ -44,6 +46,23 @@ pub const EMPTY_FIELD: [u8; 1] = [0];
 #[inline]
 pub fn has_seq(key: &[u8]) -> bool {
     key.first().is_some_and(|&t| t <= T_EXPIRY)
+}
+
+/// The part of a key that queries name exactly, and so what bloom filters are
+/// keyed on: everything but the trailing `created_at ‖ seq` of scan keys; the id
+/// of an id key; the whole key of a tombstone (looked up exactly); the address
+/// of an address or vanish tombstone (its trailing time is a value, not a name).
+/// Every prefix the planner and writer look up is one of these.
+#[inline]
+pub fn bloom_prefix(key: &[u8]) -> &[u8] {
+    let n = key.len();
+    match key.first() {
+        Some(&T_ID) => &key[..n.min(33)],
+        Some(&T_CREATED | &T_EXPIRY) => &key[..n.min(1)],
+        Some(&T_KIND | &T_AUTHOR | &T_AUTHOR_KIND | &T_TAG | &T_TAG_KIND | &T_ADDR) => &key[..n.saturating_sub(16)],
+        Some(&T_ADDR_DELETED | &T_VANISH) => &key[..n.saturating_sub(8)],
+        _ => key,
+    }
 }
 
 #[inline]
@@ -117,7 +136,7 @@ pub fn address_d(rec: Record<'_>, out: &mut Vec<u8>) {
 }
 
 /// Appends every index key of `rec` (stored at `seq`) to `kb`.
-pub fn index_keys(rec: Record<'_>, seq: u64, kb: &mut KeyBuf, scratch: &mut Vec<u8>) {
+pub fn index_keys(rec: Record<'_>, seq: u64, kb: &mut KeyBuf, scratch: &mut Vec<u8>, vanish: &crate::VanishCfg) {
     let id = rec.id();
     let pk = rec.pubkey();
     let ca = rec.created_at();
@@ -193,6 +212,12 @@ pub fn index_keys(rec: Record<'_>, seq: u64, kb: &mut KeyBuf, scratch: &mut Vec<
 
     if k == kind::DELETION {
         deletion_keys(rec, kb, scratch);
+    }
+
+    if k == kind::VANISH && vanish.targets(rec) {
+        kb.begin(T_VANISH);
+        kb.put(pk);
+        kb.put_u64(ca);
     }
 }
 

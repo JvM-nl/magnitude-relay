@@ -6,8 +6,12 @@
 //! - A **dead set** marks deleted, replaced and expired events.
 //!
 //! Everything but the log is derivable from it. One [`Writer`] applies batches;
-//! any number of readers take [`Version`] snapshots and never block it.
+//! any number of readers take [`Version`] snapshots and never block it. Memory
+//! runs flush to segment files in the background, and a checkpoint records which
+//! segments cover which part of the log, so a restart replays only the tail.
 
+pub mod bg;
+pub mod checkpoint;
 pub mod crc32c;
 pub mod dead;
 pub mod keys;
@@ -15,6 +19,7 @@ pub mod locs;
 pub mod log;
 pub mod memrun;
 pub mod mmap;
+pub mod segment;
 pub mod version;
 pub mod writer;
 
@@ -26,6 +31,9 @@ use crate::keys::KeyBuf;
 use crate::locs::LocsWriter;
 use crate::log::LogWriter;
 use crate::memrun::MemRun;
+use crate::segment::Segment;
+use crate::version::Run;
+use relay_proto::record::Field;
 use relay_proto::Record;
 use std::io;
 use std::path::Path;
@@ -39,12 +47,48 @@ pub struct Options {
     /// Sync every batch before acknowledging it. Off only for benchmarks that
     /// compare against relays that never sync.
     pub sync: bool,
+    /// Memory runs are flushed to a segment once they hold this many bytes.
+    /// Smaller uses less RAM; larger means fewer, bigger segments.
+    pub flush_bytes: usize,
+    /// This relay's own URLs (`wss://host/path`). A NIP-62 request to vanish is
+    /// honoured when it names one of them or `ALL_RELAYS`.
+    pub vanish_urls: Vec<String>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { segment_size: 1 << 30, sync: true }
+        Options { segment_size: 1 << 30, sync: true, flush_bytes: 64 << 20, vanish_urls: Vec::new() }
     }
+}
+
+/// Which NIP-62 requests target this relay.
+#[derive(Debug, Clone, Default)]
+pub struct VanishCfg {
+    urls: Vec<String>,
+}
+
+impl VanishCfg {
+    pub fn new(urls: &[String]) -> VanishCfg {
+        VanishCfg { urls: urls.iter().map(|u| normalize_url(u.as_bytes())).collect() }
+    }
+
+    /// True when a `relay` tag says `ALL_RELAYS` or names one of our URLs.
+    pub fn targets(&self, rec: Record<'_>) -> bool {
+        rec.tags().any(|t| {
+            let mut f = t.fields();
+            match (f.next(), f.next()) {
+                (Some(n), Some(Field::Str(v))) if n.is_str(b"relay") => v == b"ALL_RELAYS" || self.urls.contains(&normalize_url(v)),
+                _ => false,
+            }
+        })
+    }
+}
+
+/// `wss://Host/path/` and `ws://host/path` compare equal.
+fn normalize_url(u: &[u8]) -> String {
+    let s = String::from_utf8_lossy(u).trim().to_ascii_lowercase();
+    let s = s.strip_prefix("wss://").or_else(|| s.strip_prefix("ws://")).unwrap_or(&s).to_string();
+    s.trim_end_matches('/').to_string()
 }
 
 pub(crate) struct Shared {
@@ -88,18 +132,47 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens (or creates) a store in `dir`, replaying the log. Returns the reader
-    /// handle and the one writer.
+    /// Opens (or creates) a store in `dir`: maps the checkpointed segments and
+    /// replays only the log after the checkpoint. Returns the reader handle and
+    /// the one writer.
     pub fn open(dir: &Path, opts: Options) -> io::Result<(Store, Writer)> {
         std::fs::create_dir_all(dir)?;
         check_meta(dir, &opts)?;
+        let idx = dir.join("idx");
+        std::fs::create_dir_all(&idx)?;
+        let ck = checkpoint::read(dir)?;
+        let have_ck = ck.is_some();
+        let ck = ck.unwrap_or_default();
+
+        let mut segments = Vec::with_capacity(ck.segments.len());
+        for &id in &ck.segments {
+            segments.push(Arc::new(Segment::open(id, &bg::seg_path(&idx, id))?));
+        }
+        // Leftovers of a flush or compaction that never reached a checkpoint.
+        for e in std::fs::read_dir(&idx)?.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let listed = name.strip_suffix(".seg").and_then(|n| n.parse::<u64>().ok()).is_some_and(|id| ck.segments.contains(&id));
+            if !listed && (name.ends_with(".seg") || name.ends_with(".tmp")) {
+                std::fs::remove_file(e.path())?;
+            }
+        }
+
+        let mut dead = DeadSet::default();
+        if have_ck {
+            if let Ok(img) = std::fs::read(dir.join("dead.bits")) {
+                dead.load(&img);
+            }
+        }
+
+        let vanish = VanishCfg::new(&opts.vanish_urls);
         let mut locs = LocsWriter::open(&dir.join("locs"))?;
         let mut kb = KeyBuf::default();
         let mut scratch = Vec::new();
         let mut dead_seqs = Vec::new();
-        let mut next_seq = 0u64;
+        let mut next_seq = ck.covered;
         let mut loc_err: Option<io::Error> = None;
-        let log = LogWriter::open(&dir.join("log"), opts.segment_size, |fr| {
+        let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, |fr| {
             if loc_err.is_none() {
                 if let Err(e) = locs.set(fr.seq, fr.off) {
                     loc_err = Some(e);
@@ -108,22 +181,30 @@ impl Store {
             next_seq = next_seq.max(fr.seq + 1);
             if fr.dead {
                 dead_seqs.push(fr.seq);
-            } else {
-                keys::index_keys(Record(fr.record), fr.seq, &mut kb, &mut scratch);
+            } else if fr.seq >= ck.covered {
+                keys::index_keys(Record(fr.record), fr.seq, &mut kb, &mut scratch, &vanish);
             }
         })?;
         if let Some(e) = loc_err {
             return Err(e);
         }
 
-        let mut dead = DeadSet::default();
         dead.grow_to(next_seq);
         for s in dead_seqs {
             dead.set(s);
         }
-        let runs = if kb.is_empty() { Vec::new() } else { vec![Arc::new(MemRun::build(&kb))] };
+        // The tail's rule-bearing keys: replaying them re-derives any kill a
+        // crash between syncs could have lost.
+        let tail: Vec<Vec<u8>> = (0..kb.len())
+            .map(|i| kb.key(i))
+            .filter(|k| matches!(k[0], keys::T_ADDR | keys::T_DELETED | keys::T_ADDR_DELETED | keys::T_VANISH))
+            .map(|k| k.to_vec())
+            .collect();
+        let mem = if kb.is_empty() { Vec::new() } else { vec![Arc::new(MemRun::build(&kb))] };
         drop(kb);
 
+        let mut runs: Vec<Run> = segments.iter().map(|s| Run::Disk(s.clone())).collect();
+        runs.extend(mem.iter().map(|m| Run::Mem(m.clone())));
         let v = Arc::new(Version {
             gen: 0,
             count: next_seq,
@@ -131,11 +212,11 @@ impl Store {
             segs: log.segments(),
             locs: locs.map(),
             dead: dead.clone(),
-            runs: Arc::new(runs.clone()),
+            runs: Arc::new(runs),
         });
         let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0) });
-        let mut w = Writer::new(shared.clone(), log, locs, dead, runs, next_seq, opts);
-        w.repair()?;
+        let mut w = Writer::new(shared.clone(), log, locs, dead, segments, mem, next_seq, opts, dir.to_path_buf(), ck.next_seg_id, ck.covered, ck.replay_from)?;
+        w.repair(&tail)?;
         Ok((Store { shared }, w))
     }
 

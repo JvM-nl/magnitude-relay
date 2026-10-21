@@ -16,8 +16,10 @@ fn tmpdir(name: &str) -> PathBuf {
 }
 
 fn opts() -> Options {
-    // Small segments so tests cross segment boundaries.
-    Options { segment_size: 64 * 1024, sync: true }
+    // Small log segments so tests cross segment boundaries, and a tiny flush
+    // threshold so every test runs through segment files, background flushes,
+    // compactions and checkpoints, not just memory runs.
+    Options { segment_size: 64 * 1024, sync: true, flush_bytes: 4096, vanish_urls: vec!["wss://relay.example/nostr".into()] }
 }
 
 fn hex32(b: u8, n: u64) -> String {
@@ -335,8 +337,102 @@ fn queries_match_brute_force() {
 fn segment_size_cannot_change() {
     let dir = tmpdir("meta");
     drop(Store::open(&dir, opts()).unwrap());
-    let other = Options { segment_size: 128 * 1024, sync: true };
+    let other = Options { segment_size: 128 * 1024, ..opts() };
     let err = Store::open(&dir, other).err().expect("must refuse");
     assert!(err.to_string().contains("segment size"), "{err}");
     assert!(Store::open(&dir, opts()).is_ok());
+}
+
+#[test]
+fn restart_uses_checkpoint_and_compacts() {
+    let dir = tmpdir("ckpt");
+    let mut all = Vec::new();
+    {
+        let (store, mut w) = Store::open(&dir, opts()).unwrap();
+        for i in 0..2000u64 {
+            let r = ev(i, (i % 5) as u8 + 1, 1000 + i, 1059, &format!(r#"[["p","{}"]]"#, pk((i % 7) as u8 + 30)), "x");
+            write(&mut w, std::slice::from_ref(&r));
+            all.push(r);
+        }
+        w.compact_all().unwrap();
+        assert_eq!(w.segment_count(), 1, "everything merged into one segment");
+        let v = store.snapshot();
+        assert_eq!(v.index_bytes(), 0, "no index left in memory after a full flush");
+        assert_eq!(ids(&store, "{}", 5000).len(), 2000);
+        // A little more after the checkpoint: the tail a restart must replay.
+        write(&mut w, &[ev(5000, 1, 9000, 1059, "[]", "tail")]);
+    }
+    let t = std::time::Instant::now();
+    let (store, w) = Store::open(&dir, opts()).unwrap();
+    let opened = t.elapsed();
+    assert_eq!(w.next_seq(), 2001);
+    let v = store.snapshot();
+    assert!(v.index_keys() > 2000 * 5);
+    assert!(v.index_bytes() < 10_000, "only the tail is in memory ({} bytes)", v.index_bytes());
+    assert_eq!(ids(&store, "{}", 5000).len(), 2001);
+    let me = pk(30);
+    let got = ids(&store, &format!(r##"{{"kinds":[1059],"#p":["{me}"],"limit":10}}"##), 10);
+    let mut expect: Vec<_> = all.iter().map(|r| Record(r)).filter(|r| r.tags().any(|t| t.indexable().is_some())).filter(|r| {
+        let f = filter(&format!(r##"{{"#p":["{me}"]}}"##));
+        f.matches(*r)
+    }).map(|r| (r.created_at(), *r.id())).collect();
+    expect.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    assert_eq!(got, expect.iter().take(10).map(|e| e.1).collect::<Vec<_>>());
+    eprintln!("reopen with checkpoint: {opened:?}");
+}
+
+#[test]
+fn crash_leftovers_are_removed() {
+    let dir = tmpdir("leftover");
+    {
+        let (_s, mut w) = Store::open(&dir, opts()).unwrap();
+        for i in 0..300u64 {
+            write(&mut w, &[ev(i, 1, 100 + i, 1059, "[]", "x")]);
+        }
+        w.flush_all().unwrap();
+    }
+    // A flush and a compaction that died before their checkpoint.
+    std::fs::write(dir.join("idx").join("0000000000009999.seg"), b"partial").unwrap();
+    std::fs::write(dir.join("idx").join("0000000000009998.seg.tmp"), b"partial").unwrap();
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    assert!(!dir.join("idx").join("0000000000009999.seg").exists());
+    assert!(!dir.join("idx").join("0000000000009998.seg.tmp").exists());
+    assert_eq!(ids(&store, "{}", 1000).len(), 300);
+}
+
+#[test]
+fn vanish_nip62() {
+    let dir = tmpdir("vanish");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    let me = pk(40);
+    write(&mut w, &[
+        ev(1, 40, 100, 0, "[]", "profile"),
+        ev(2, 40, 110, 30078, r#"[["d","vector/pinned"]]"#, "prefs"),
+        ev(3, 41, 120, 1059, &format!(r#"[["p","{me}"]]"#), "dm to me"),
+        ev(4, 42, 130, 0, "[]", "someone else"),
+        // Key 41 is also a Concord-style plane key: a wrap to someone else.
+        ev(12, 41, 125, 1059, &format!(r#"[["p","{}"]]"#, pk(44)), "plane traffic"),
+    ]);
+    // A request naming another relay does nothing here.
+    let elsewhere = ev(5, 40, 200, 62, r#"[["relay","wss://other.example"]]"#, "");
+    assert!(matches!(write(&mut w, &[elsewhere])[0], Outcome::Stored(_)));
+    assert_eq!(ids(&store, &format!(r#"{{"authors":["{}"],"kinds":[0]}}"#, pk(40)), 10).len(), 1);
+    // ALL_RELAYS (and our own URL) do: my events and wraps to me go.
+    let v = ev(6, 40, 200, 62, r#"[["relay","ALL_RELAYS"]]"#, "");
+    assert!(matches!(write(&mut w, &[v])[0], Outcome::Stored(_)));
+    assert!(ids(&store, &format!(r#"{{"authors":["{}"],"kinds":[0,30078]}}"#, pk(40)), 10).is_empty());
+    assert!(ids(&store, &format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##), 10).is_empty());
+    assert_eq!(ids(&store, r#"{"kinds":[0]}"#, 10), vec![id_of(4)]);
+    // Older events from me, or wraps to me, cannot come back; newer ones can.
+    assert_eq!(write(&mut w, &[ev(7, 40, 150, 0, "[]", "old")]), vec![Outcome::Deleted]);
+    assert_eq!(write(&mut w, &[ev(8, 43, 150, 1059, &format!(r#"[["p","{me}"]]"#), "old wrap")]), vec![Outcome::Deleted]);
+    assert!(matches!(write(&mut w, &[ev(9, 40, 300, 0, "[]", "new me")])[0], Outcome::Stored(_)));
+    // A Concord plane key (it authored wraps) cannot vanish.
+    let r = write(&mut w, &[ev(10, 41, 400, 62, r#"[["relay","wss://relay.example/nostr/"]]"#, "")]);
+    assert!(matches!(r[0], Outcome::Rejected(_)), "{r:?}");
+    drop((store, w));
+    // All of it holds after a restart.
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    assert!(ids(&store, &format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##), 10).is_empty());
+    assert_eq!(write(&mut w, &[ev(11, 40, 199, 30078, r#"[["d","x"]]"#, "old")]), vec![Outcome::Deleted]);
 }

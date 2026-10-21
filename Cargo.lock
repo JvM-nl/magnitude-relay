@@ -206,6 +206,14 @@ dependencies = [
 [[package]]
 name = "relay-bench"
 version = "0.1.0"
+dependencies = [
+ "negentropy",
+ "relay-net",
+ "relay-proto",
+ "secp256k1",
+ "sha2",
+ "tokio",
+]
 
 [[package]]
 name = "relay-net"

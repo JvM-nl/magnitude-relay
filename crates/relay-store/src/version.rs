@@ -1,9 +1,9 @@
 //! A published, immutable view of the store, and every read that runs on it.
 //!
 //! Readers hold an `Arc<Version>`. Nothing a version points at changes in a way
-//! the version can see: runs are immutable, the log only grows past `count`, and
-//! the writer zeroes a dead record only after every version that could still
-//! read it has been dropped (see `Writer::reclaim`).
+//! the version can see: runs and segments are immutable, the log only grows past
+//! `count`, and the writer zeroes a dead record only after every version that
+//! could still read it has been dropped (see `Writer::reclaim`).
 
 use crate::dead::DeadSet;
 use crate::keys::{self, *};
@@ -11,10 +11,118 @@ use crate::log::{self, Segs};
 use crate::locs;
 use crate::memrun::MemRun;
 use crate::mmap::MappedFile;
+use crate::segment::{SegCursor, Segment};
 use relay_proto::filter::Filter;
 use relay_proto::Record;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
+
+/// One sorted run of index keys: in memory (recent writes) or a segment file.
+#[derive(Clone)]
+pub enum Run {
+    Mem(Arc<MemRun>),
+    Disk(Arc<Segment>),
+}
+
+impl Run {
+    pub fn keys(&self) -> u64 {
+        match self {
+            Run::Mem(m) => m.len() as u64,
+            Run::Disk(s) => s.keys(),
+        }
+    }
+
+    /// Bytes held: memory for a memory run, file size for a segment.
+    pub fn bytes(&self) -> u64 {
+        match self {
+            Run::Mem(m) => m.bytes() as u64,
+            Run::Disk(s) => s.bytes(),
+        }
+    }
+
+    /// False only when the run certainly holds no key with bloom prefix `p`.
+    #[inline]
+    fn may_contain(&self, p: Option<&[u8]>) -> bool {
+        match (self, p) {
+            (Run::Disk(s), Some(p)) => s.may_contain(p),
+            _ => true,
+        }
+    }
+
+    /// Visits keys in `[lo, hi)` in ascending order until `f` returns false.
+    pub fn scan(&self, lo: &[u8], hi: &[u8], bloom: Option<&[u8]>, f: &mut dyn FnMut(&[u8]) -> bool) {
+        if !self.may_contain(bloom) {
+            return;
+        }
+        match self {
+            Run::Mem(m) => {
+                let mut i = m.lower_bound(lo);
+                let end = m.lower_bound(hi);
+                while i < end {
+                    if !f(m.key(i)) {
+                        return;
+                    }
+                    i += 1;
+                }
+            }
+            Run::Disk(s) => {
+                let mut c = s.range(lo, hi);
+                while let Some(k) = c.next_front() {
+                    if !f(k) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn count(&self, lo: &[u8], hi: &[u8], bloom: Option<&[u8]>) -> u64 {
+        if !self.may_contain(bloom) {
+            return 0;
+        }
+        match self {
+            Run::Mem(m) => (m.lower_bound(hi) - m.lower_bound(lo)) as u64,
+            Run::Disk(s) => s.count_range(lo, hi),
+        }
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        match self {
+            Run::Mem(m) => {
+                let i = m.lower_bound(key);
+                i < m.len() && m.key(i) == key
+            }
+            Run::Disk(s) => s.contains(key),
+        }
+    }
+
+    fn cursor(&self, lo: &[u8], hi: &[u8]) -> Option<RunCursor<'_>> {
+        match self {
+            Run::Mem(m) => {
+                let lo = m.lower_bound(lo);
+                let at = m.lower_bound(hi);
+                (lo < at).then_some(RunCursor::Mem { run: m, lo, at })
+            }
+            Run::Disk(s) => {
+                let c = s.range(lo, hi);
+                (c.remaining() > 0).then_some(RunCursor::Disk(c))
+            }
+        }
+    }
+}
+
+/// The exclusive upper bound of every key starting with `p`.
+pub fn prefix_end(p: &[u8]) -> Vec<u8> {
+    let mut e = p.to_vec();
+    while let Some(last) = e.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return e;
+        }
+        e.pop();
+    }
+    vec![0xFF; p.len() + 1]
+}
 
 pub struct Version {
     pub gen: u64,
@@ -24,8 +132,8 @@ pub struct Version {
     pub(crate) segs: Segs,
     pub(crate) locs: Arc<MappedFile>,
     pub(crate) dead: DeadSet,
-    /// Oldest first.
-    pub(crate) runs: Arc<Vec<Arc<MemRun>>>,
+    /// Segments first (oldest first), then memory runs (oldest first).
+    pub(crate) runs: Arc<Vec<Run>>,
 }
 
 /// One query result, enough to order it and fetch it.
@@ -77,53 +185,76 @@ impl Version {
         self.dead.count()
     }
 
-    pub fn index_keys(&self) -> usize {
-        self.runs.iter().map(|r| r.len()).sum()
+    pub fn index_keys(&self) -> u64 {
+        self.runs.iter().map(|r| r.keys()).sum()
     }
 
-    pub fn index_bytes(&self) -> usize {
-        self.runs.iter().map(|r| r.bytes()).sum()
+    /// Index bytes held in memory (memory runs only; segments live in files).
+    pub fn index_bytes(&self) -> u64 {
+        self.runs.iter().filter(|r| matches!(r, Run::Mem(_))).map(|r| r.bytes()).sum()
+    }
+
+    /// Index bytes in segment files.
+    pub fn segment_bytes(&self) -> u64 {
+        self.runs.iter().filter(|r| matches!(r, Run::Disk(_))).map(|r| r.bytes()).sum()
+    }
+
+    pub fn runs(&self) -> &[Run] {
+        &self.runs
+    }
+
+    /// Visits every key in `[lo, hi)`, run by run (not merged across runs).
+    pub fn for_range(&self, lo: &[u8], hi: &[u8], mut f: impl FnMut(&[u8])) {
+        for r in self.runs.iter() {
+            r.scan(lo, hi, None, &mut |k| {
+                f(k);
+                true
+            });
+        }
+    }
+
+    /// Visits every key starting with `p`, which must be a whole bloom prefix
+    /// (so segments that lack it are skipped with one bloom probe).
+    pub fn for_prefix(&self, p: &[u8], mut f: impl FnMut(&[u8])) {
+        let end = prefix_end(p);
+        for r in self.runs.iter() {
+            r.scan(p, &end, Some(p), &mut |k| {
+                f(k);
+                true
+            });
+        }
     }
 
     /// The live seq holding event `id`, if any.
     pub fn lookup_id(&self, id: &[u8; 32]) -> Option<u64> {
         let p = prefix(T_ID, &[id]);
-        for run in self.runs.iter().rev() {
-            let mut i = run.lower_bound(&p);
-            while i < run.len() && run.key(i).starts_with(&p) {
-                let seq = seq_of(run.key(i));
+        let end = prefix_end(&p);
+        let mut found = None;
+        for r in self.runs.iter().rev() {
+            r.scan(&p, &end, Some(&p), &mut |k| {
+                let seq = seq_of(k);
                 if self.is_live(seq) {
-                    return Some(seq);
+                    found = Some(seq);
+                    return false;
                 }
-                i += 1;
+                true
+            });
+            if found.is_some() {
+                break;
             }
         }
-        None
+        found
     }
 
     /// True if exactly `key` exists in some run (tombstone lookups).
     pub fn has_key(&self, key: &[u8]) -> bool {
-        self.runs.iter().any(|r| {
-            let i = r.lower_bound(key);
-            i < r.len() && r.key(i) == key
-        })
-    }
-
-    /// Visits every key starting with `p`, all runs, unordered across runs.
-    pub fn for_prefix(&self, p: &[u8], mut f: impl FnMut(&[u8])) {
-        for run in self.runs.iter() {
-            let mut i = run.lower_bound(p);
-            while i < run.len() && run.key(i).starts_with(p) {
-                f(run.key(i));
-                i += 1;
-            }
-        }
+        self.runs.iter().any(|r| r.contains(key))
     }
 
     /// Number of index entries under `p` with created_at in `[since, until]`.
     fn estimate(&self, p: &[u8], since: u64, until: u64) -> u64 {
         let (lo, hi) = bounds(p, since, until);
-        self.runs.iter().map(|r| (r.lower_bound(&hi) - r.lower_bound(&lo)) as u64).sum()
+        self.runs.iter().map(|r| r.count(&lo, &hi, Some(p))).sum()
     }
 
     fn estimate_all(&self, prefixes: &[Vec<u8>], since: u64, until: u64) -> u64 {
@@ -311,16 +442,35 @@ fn bounds(p: &[u8], since: u64, until: u64) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// A backwards cursor over one prefix range of one run.
-struct Cursor<'a> {
-    run: &'a MemRun,
-    lo: usize,
-    /// One past the next key to yield.
-    at: usize,
+enum RunCursor<'a> {
+    Mem { run: &'a MemRun, lo: usize, at: usize },
+    Disk(SegCursor<'a>),
+}
+
+impl RunCursor<'_> {
+    /// Suffix of the next key (walking backwards), not consumed.
+    #[inline]
+    fn peek(&mut self) -> Option<u128> {
+        match self {
+            RunCursor::Mem { run, lo, at } => (*at > *lo).then(|| suffix(run.key(*at - 1))),
+            RunCursor::Disk(c) => c.peek_back().map(suffix),
+        }
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        match self {
+            RunCursor::Mem { at, .. } => *at -= 1,
+            RunCursor::Disk(c) => {
+                c.next_back();
+            }
+        }
+    }
 }
 
 /// Newest-first merge of many cursors, by `(created_at, seq)`.
 struct Merge<'a> {
-    cursors: Vec<Cursor<'a>>,
+    cursors: Vec<RunCursor<'a>>,
     heap: BinaryHeap<(u128, usize)>,
 }
 
@@ -331,12 +481,14 @@ impl<'a> Merge<'a> {
         for p in prefixes {
             let (lo_key, hi_key) = bounds(p, since, until);
             for run in v.runs.iter() {
-                let lo = run.lower_bound(&lo_key);
-                let hi = run.lower_bound(&hi_key);
-                if lo < hi {
-                    let c = Cursor { run, lo, at: hi };
-                    heap.push((suffix(c.run.key(hi - 1)), cursors.len()));
-                    cursors.push(c);
+                if !run.may_contain(Some(p)) {
+                    continue;
+                }
+                if let Some(mut c) = run.cursor(&lo_key, &hi_key) {
+                    if let Some(s) = c.peek() {
+                        heap.push((s, cursors.len()));
+                        cursors.push(c);
+                    }
                 }
             }
         }
@@ -347,9 +499,9 @@ impl<'a> Merge<'a> {
     fn next(&mut self) -> Option<(u64, u64)> {
         let (s, ci) = self.heap.pop()?;
         let c = &mut self.cursors[ci];
-        c.at -= 1;
-        if c.at > c.lo {
-            self.heap.push((suffix(c.run.key(c.at - 1)), ci));
+        c.advance();
+        if let Some(n) = c.peek() {
+            self.heap.push((n, ci));
         }
         Some(((s >> 64) as u64, s as u64))
     }

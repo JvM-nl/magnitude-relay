@@ -78,7 +78,7 @@ pub const SUPPORTED_NIPS: &[u32] = &[1, 9, 11, 40, 45, 59, 62, 70, 77];
 /// Every section and its keys. The single source for "did you mean" hints and
 /// for the test that keeps the documented default file complete.
 const KEYS: &[(&str, &[&str])] = &[
-    ("relay", &["bind", "threads", "real_ip_header"]),
+    ("relay", &["bind", "threads", "real_ip_header", "urls"]),
     (
         "info",
         &["name", "description", "pubkey", "contact", "icon", "banner", "privacy_policy", "terms_of_service", "privacy_addresses"],
@@ -98,7 +98,7 @@ const KEYS: &[(&str, &[&str])] = &[
             "outbound_buffer_bytes",
         ],
     ),
-    ("store", &["data", "sync", "segment_mb"]),
+    ("store", &["data", "sync", "segment_mb", "memory_mb"]),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -121,6 +121,8 @@ pub struct RelayCfg {
     /// proxy that sets it: otherwise any client can forge it and sidestep every
     /// per-IP limit.
     pub real_ip_header: String,
+    /// This relay's public addresses; NIP-62 vanish requests naming one are honoured.
+    pub urls: Vec<String>,
 }
 
 /// `[info]`: the NIP-11 document.
@@ -190,12 +192,14 @@ pub struct StoreCfg {
     pub data: PathBuf,
     pub sync: bool,
     pub segment_mb: u32,
+    /// Memory recent index entries may use before they are written to disk.
+    pub memory_mb: u32,
 }
 
 impl Default for RelayCfg {
     fn default() -> Self {
         // 7777 is strfry's port, so an existing nginx upstream keeps working.
-        RelayCfg { bind: SocketAddr::from(([127, 0, 0, 1], 7777)), threads: 0, real_ip_header: String::new() }
+        RelayCfg { bind: SocketAddr::from(([127, 0, 0, 1], 7777)), threads: 0, real_ip_header: String::new(), urls: Vec::new() }
     }
 }
 
@@ -246,15 +250,25 @@ impl Default for LimitsCfg {
 
 impl Default for StoreCfg {
     fn default() -> Self {
-        StoreCfg { data: PathBuf::from("./data"), sync: true, segment_mb: 1024 }
+        StoreCfg { data: PathBuf::from("./data"), sync: true, segment_mb: 1024, memory_mb: 64 }
     }
 }
 
 impl StoreCfg {
     /// The storage engine's options for this section.
     pub fn options(&self) -> relay_store::Options {
-        relay_store::Options { segment_size: u64::from(self.segment_mb) << 20, sync: self.sync }
+        relay_store::Options {
+            segment_size: u64::from(self.segment_mb) << 20,
+            sync: self.sync,
+            flush_bytes: (self.memory_mb as usize) << 20,
+            vanish_urls: Vec::new(),
+        }
     }
+}
+
+/// Store options from the whole config (the store also needs the relay's URLs).
+pub fn store_options(cfg: &Config) -> relay_store::Options {
+    relay_store::Options { vanish_urls: cfg.relay.urls.clone(), ..cfg.store.options() }
 }
 
 impl PolicyCfg {
@@ -662,6 +676,16 @@ fn apply_relay(c: &mut RelayCfg, e: &Entry) -> Result<bool, String> {
             // Header names are case-insensitive; compare them in one case.
             c.real_ip_header = s.to_ascii_lowercase();
         }
+        "urls" => {
+            let list = strings(e)?;
+            for a in list {
+                let host = a.strip_prefix("wss://").or_else(|| a.strip_prefix("ws://"));
+                if host.is_none_or(str::is_empty) {
+                    return Err(format!("`urls` entries must be websocket URLs starting with ws:// or wss://, but \"{a}\" is not"));
+                }
+            }
+            c.urls = list.to_vec();
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -765,6 +789,7 @@ fn apply_store(c: &mut StoreCfg, e: &Entry) -> Result<bool, String> {
             }
             c.segment_mb = n as u32;
         }
+        "memory_mb" => c.memory_mb = int(e, 1, 65536)? as u32,
         _ => return Ok(false),
     }
     Ok(true)
@@ -888,6 +913,11 @@ const TEMPLATE: &str = r##"# {name} settings
 # per-IP limit. Empty means use the connecting address.
 # real_ip_header = ""
 
+# The addresses people use to reach this relay, like "wss://relay.example.com".
+# A user's request to vanish (NIP-62) is honoured when it names one of these or
+# says ALL_RELAYS: everything they published here is then deleted for good.
+# urls = []
+
 [info]
 # What the relay tells apps about itself (NIP-11).
 # name = "{name}"
@@ -984,6 +1014,11 @@ const TEMPLATE: &str = r##"# {name} settings
 # the data folder is first created; changing it afterwards makes the data there
 # unreadable.
 # segment_mb = 1024
+
+# Memory (MiB) the newest index entries may use before they are written to disk.
+# The relay never needs the whole database in memory; spare RAM simply becomes
+# cache. Lower this on a very small machine, raise it on a busy one.
+# memory_mb = 64
 "##;
 
 #[cfg(test)]
@@ -1118,7 +1153,7 @@ segment_mb = 64
 "#
         );
         let c = ok(&text);
-        assert_eq!(c.relay, RelayCfg { bind: "0.0.0.0:8080".parse().unwrap(), threads: 4, real_ip_header: "x-forwarded-for".into() });
+        assert_eq!(c.relay, RelayCfg { bind: "0.0.0.0:8080".parse().unwrap(), threads: 4, real_ip_header: "x-forwarded-for".into(), urls: Vec::new() });
         assert_eq!(c.info.name, "My relay");
         assert_eq!(c.info.pubkey, pk);
         assert_eq!(c.info.banner, "https://example.com/b.png");
@@ -1129,7 +1164,7 @@ segment_mb = 64
         assert_eq!(c.limits.max_message_bytes, 500_000);
         assert_eq!((c.limits.max_connections_per_ip, c.limits.events_per_minute_per_ip), (0, 0));
         assert_eq!(c.limits.outbound_buffer_bytes, 1_000_000);
-        assert_eq!(c.store, StoreCfg { data: PathBuf::from("/var/lib/relay"), sync: false, segment_mb: 64 });
+        assert_eq!(c.store, StoreCfg { data: PathBuf::from("/var/lib/relay"), sync: false, segment_mb: 64, memory_mb: 64 });
         assert_eq!(c.store.options().segment_size, 64 << 20);
         assert!(!c.store.options().sync);
         let k = c.policy.kind_policy();
@@ -1159,7 +1194,7 @@ segment_mb = 64
         fails("[limits]\nMax_Filters = 5", Some(2), "did you mean `max_filters`?");
         fails("[relay]\nname = \"x\"", Some(2), "`name` belongs in [info]");
         fails("[info]\nsync = true", Some(2), "belongs in [store]");
-        fails("[store]\nzzzzzzzz = 1", Some(2), "The settings in [store] are data, sync, segment_mb");
+        fails("[store]\nzzzzzzzz = 1", Some(2), "The settings in [store] are data, sync, segment_mb, memory_mb");
         fails("[limit]\nmax_limit = 5", Some(1), "did you mean [limits]?");
         fails("[servers]\n", Some(1), "The sections are [relay], [info], [policy], [limits], [store]");
         // Hints come from the first problem in the file, by line.

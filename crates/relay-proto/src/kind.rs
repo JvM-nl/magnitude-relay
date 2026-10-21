@@ -19,3 +19,4 @@ pub fn is_addressable(kind: u64) -> bool {
 
 pub const DELETION: u64 = 5;
 pub const GIFT_WRAP: u64 = 1059;
+pub const VANISH: u64 = 62;

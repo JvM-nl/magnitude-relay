@@ -1,6 +1,6 @@
 //! `serve`: start the relay. Also what running the binary with no arguments does.
 
-use crate::config::Config;
+use crate::config::{store_options, Config};
 use crate::ingest::{self, Sink};
 use crate::reactor::{self, Shared};
 use crate::session::SessionCfg;
@@ -16,7 +16,7 @@ const WRITE_QUEUE: usize = 65_536;
 
 pub fn run(cfg: Config) -> Result<(), String> {
     let t = Instant::now();
-    let (store, w) = Store::open(&cfg.store.data, cfg.store.options()).map_err(|e| format!("{}: {e}", cfg.store.data.display()))?;
+    let (store, w) = Store::open(&cfg.store.data, store_options(&cfg)).map_err(|e| format!("{}: {e}", cfg.store.data.display()))?;
     let events = w.next_seq();
     let threads = if cfg.relay.threads == 0 { std::thread::available_parallelism().map_or(4, |n| n.get()) } else { cfg.relay.threads };
     let bind = cfg.relay.bind;

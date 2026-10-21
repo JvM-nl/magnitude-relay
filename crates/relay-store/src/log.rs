@@ -58,9 +58,10 @@ pub struct LogWriter {
 }
 
 impl LogWriter {
-    /// Opens the log in `dir`, replaying every frame through `f` in log order.
-    /// A torn tail (crc mismatch at the end of the last segment) is cut off.
-    pub fn open(dir: &Path, seg_size: u64, mut f: impl FnMut(Frame<'_>)) -> io::Result<LogWriter> {
+    /// Opens the log in `dir`, replaying every frame from global offset `from`
+    /// (a checkpoint's replay point; 0 for all) through `f` in log order. A torn
+    /// tail (crc mismatch at the end of the last segment) is cut off.
+    pub fn open(dir: &Path, seg_size: u64, from: u64, mut f: impl FnMut(Frame<'_>)) -> io::Result<LogWriter> {
         std::fs::create_dir_all(dir)?;
         let mut names: Vec<usize> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
@@ -80,12 +81,19 @@ impl LogWriter {
             files.push(Arc::new(MappedFile::open(&seg_path(dir, 0), seg_size as usize)?));
         }
 
+        let from_seg = (from / seg_size) as usize;
+        if from_seg >= files.len() {
+            return Err(io::Error::other(format!("checkpoint replay point {from} is past the end of the log")));
+        }
         let mut head = 0u64;
         let last = files.len() - 1;
         for (si, seg) in files.iter().enumerate() {
+            if si < from_seg {
+                continue;
+            }
             seg.advise(Advice::Sequential);
             let base = si as u64 * seg_size;
-            let mut o = 0usize;
+            let mut o = if si == from_seg { (from % seg_size) as usize } else { 0 };
             // (where the good frames end, whether they ended cleanly)
             let (end, clean) = loop {
                 if o + FRAME_HEADER > seg_size as usize {

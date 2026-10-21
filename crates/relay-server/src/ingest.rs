@@ -75,6 +75,9 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
         let first = match rx.recv_timeout(IDLE_TICK) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
+                if let Err(e) = w.maintain() {
+                    eprintln!("index maintenance failed: {e}");
+                }
                 if last_sweep.elapsed() >= SWEEP_EVERY {
                     sweep(&mut w, &mut last_sweep);
                 }
@@ -120,8 +123,9 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, sinks: Vec<Sink>
             sweep(&mut w, &mut last_sweep);
         }
     }
-    if let Err(e) = w.sync() {
-        eprintln!("final sync failed: {e}");
+    // Flush the index on the way out so the next start replays nothing.
+    if let Err(e) = w.flush_all().and_then(|_| w.sync()) {
+        eprintln!("final flush failed: {e}");
     }
 }
 

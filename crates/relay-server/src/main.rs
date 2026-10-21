@@ -11,7 +11,7 @@ mod session;
 mod subs;
 mod toml;
 
-use config::Config;
+use config::{store_options, Config};
 use relay_store::{Options, Store};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -98,7 +98,7 @@ fn run() -> Result<(), String> {
             let relaxed = flag(&mut args, "--relaxed");
             let path = args.first().ok_or("import needs a file (or - for stdin)")?.clone();
             let cfg = load()?;
-            let opts = Options { sync: cfg.store.sync && !relaxed, ..cfg.store.options() };
+            let opts = Options { sync: cfg.store.sync && !relaxed, ..store_options(&cfg) };
             let (_store, mut w) = Store::open(&cfg.store.data, opts).map_err(|e| e.to_string())?;
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
             let opts = import::ImportOptions { verify, skip_kind: None, threads };
@@ -115,6 +115,10 @@ fn run() -> Result<(), String> {
             }
             .map_err(|e| e.to_string())?;
             let secs = t.elapsed().as_secs_f64();
+            // One segment means one probe per lookup: worth doing once after a bulk load.
+            let tc = Instant::now();
+            w.compact_all().map_err(|e| e.to_string())?;
+            eprintln!("index flushed and compacted into {} segment(s) in {:.2}s", w.segment_count(), tc.elapsed().as_secs_f64());
             eprintln!(
                 "imported {} lines ({:.1} MB) in {:.2}s: {:.0} lines/s, {:.1} MB/s",
                 stats.lines,
@@ -138,7 +142,7 @@ fn run() -> Result<(), String> {
             let since = value(&mut args, "--since")?;
             let until = value(&mut args, "--until")?;
             let cfg = load()?;
-            let (store, _w) = Store::open(&cfg.store.data, cfg.store.options()).map_err(|e| e.to_string())?;
+            let (store, _w) = Store::open(&cfg.store.data, store_options(&cfg)).map_err(|e| e.to_string())?;
             let v = store.snapshot();
             let stdout = std::io::stdout();
             let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
@@ -149,12 +153,12 @@ fn run() -> Result<(), String> {
         "stats" => {
             let cfg = load()?;
             let t = Instant::now();
-            let (store, w) = Store::open(&cfg.store.data, cfg.store.options()).map_err(|e| e.to_string())?;
+            let (store, w) = Store::open(&cfg.store.data, store_options(&cfg)).map_err(|e| e.to_string())?;
             let v = store.snapshot();
             println!("opened in {:.2}s", t.elapsed().as_secs_f64());
             println!("events (seqs): {}", w.next_seq());
             println!("dead: {}", v.dead_count());
-            println!("index keys: {} ({:.1} MB in memory)", v.index_keys(), v.index_bytes() as f64 / 1e6);
+            println!("index keys: {} ({:.1} MB in memory, {:.1} MB in {} segment files)", v.index_keys(), v.index_bytes() as f64 / 1e6, v.segment_bytes() as f64 / 1e6, w.segment_count());
             Ok(())
         }
         "help" | "--help" | "-h" => {
