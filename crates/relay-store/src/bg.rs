@@ -213,7 +213,7 @@ struct ColdOut<'a> {
 impl ColdOut<'_> {
     fn put(&mut self, seq: u64, frame: &[u8]) -> io::Result<()> {
         let len = frame.len() as u64;
-        if !self.cur.as_ref().is_some_and(|c| c.2 + len <= self.seg_size) {
+        if self.cur.as_ref().is_none_or(|c| c.2 + len > self.seg_size) {
             self.seal()?;
             let f = Arc::new(MappedFile::open(&log::cold_path(self.log_dir, self.next), self.seg_size as usize)?);
             self.cur = Some((self.next, f, 0));
@@ -306,8 +306,8 @@ fn compact_log(hot: &[(u64, Arc<MappedFile>)], first_cold: u64, seg_size: u64, l
             return Err(io::Error::other(format!("log segment {n:08}.log has a damaged frame; not compacting it")));
         }
     }
-    if let Some((last, seg)) = hot.iter().enumerate().last().map(|(i, h)| (i, &h.1)) {
-        copy_chunk(&mut recs, hot, from, (last, seg.len() as u64), &mut out)?;
+    if let Some((_, seg)) = hot.last() {
+        copy_chunk(&mut recs, hot, from, (hot.len() - 1, seg.len() as u64), &mut out)?;
     }
     out.seal()?;
     sync_dir(&log_dir.join("cold"))?;
