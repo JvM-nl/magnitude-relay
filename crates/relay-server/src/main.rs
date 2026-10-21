@@ -184,8 +184,8 @@ fn run() -> Result<(), String> {
                 stats.bytes as f64 / 1e6 / secs
             );
             eprintln!(
-                "  stored {}, duplicate {}, superseded {}, deleted {}, ephemeral skipped {}, kind skipped {}",
-                stats.stored, stats.duplicate, stats.superseded, stats.deleted, stats.ephemeral, stats.skipped_kind
+                "  stored {}, duplicate {}, superseded {}, deleted {}, vanished {}, ephemeral skipped {}, kind skipped {}",
+                stats.stored, stats.duplicate, stats.superseded, stats.deleted, stats.vanished, stats.ephemeral, stats.skipped_kind
             );
             let mut inv: Vec<_> = stats.invalid.into_iter().collect();
             inv.sort_by_key(|e| std::cmp::Reverse(e.1));

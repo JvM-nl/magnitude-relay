@@ -32,6 +32,10 @@ pub enum Outcome {
     Superseded,
     /// Its author (or, for a gift wrap, its recipient) asked for it to be deleted.
     Deleted,
+    /// Its author (or, for a gift wrap, its recipient) asked this relay to
+    /// forget them (NIP-62) after it was created. Told apart from `Deleted` so
+    /// a sync or an import can say which rule refused what.
+    Vanished,
     /// Refused by a storage rule; the message is for the client.
     Rejected(&'static str),
 }
@@ -389,15 +393,18 @@ impl Writer {
         // refused for it (Concord CORD-01; see PLAN.md decisions).
         if k == kind::GIFT_WRAP {
             for p in p_tags(r) {
-                if b.has_key(&prefix(T_DELETED, &[id, &p])) || b.latest_tombstone(&prefix(T_VANISH, &[&p])).is_some_and(|t| t >= ca) {
+                if b.has_key(&prefix(T_DELETED, &[id, &p])) {
                     return Outcome::Deleted;
+                }
+                if b.latest_tombstone(&prefix(T_VANISH, &[&p])).is_some_and(|t| t >= ca) {
+                    return Outcome::Vanished;
                 }
             }
         } else if b.has_key(&prefix(T_DELETED, &[id, pk])) {
             return Outcome::Deleted;
         }
         if b.latest_tombstone(&prefix(T_VANISH, &[pk])).is_some_and(|t| t >= ca) {
-            return Outcome::Deleted;
+            return Outcome::Vanished;
         }
 
         if kind::is_replaceable(k) || kind::is_addressable(k) {

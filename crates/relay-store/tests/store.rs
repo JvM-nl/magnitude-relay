@@ -441,8 +441,8 @@ fn vanish_nip62() {
     assert!(ids(&store, &format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##), 10).is_empty());
     assert_eq!(ids(&store, r#"{"kinds":[0]}"#, 10), vec![id_of(4)]);
     // Older events from me, or wraps to me, cannot come back; newer ones can.
-    assert_eq!(write(&mut w, &[ev(7, 40, 150, 0, "[]", "old")]), vec![Outcome::Deleted]);
-    assert_eq!(write(&mut w, &[ev(8, 43, 150, 1059, &format!(r#"[["p","{me}"]]"#), "old wrap")]), vec![Outcome::Deleted]);
+    assert_eq!(write(&mut w, &[ev(7, 40, 150, 0, "[]", "old")]), vec![Outcome::Vanished]);
+    assert_eq!(write(&mut w, &[ev(8, 43, 150, 1059, &format!(r#"[["p","{me}"]]"#), "old wrap")]), vec![Outcome::Vanished]);
     assert!(matches!(write(&mut w, &[ev(9, 40, 300, 0, "[]", "new me")])[0], Outcome::Stored(_)));
     // A Concord plane key (it authored wraps) cannot vanish.
     let r = write(&mut w, &[ev(10, 41, 400, 62, r#"[["relay","wss://relay.example/nostr/"]]"#, "")]);
@@ -451,7 +451,7 @@ fn vanish_nip62() {
     // All of it holds after a restart.
     let (store, mut w) = Store::open(&dir, opts()).unwrap();
     assert!(ids(&store, &format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##), 10).is_empty());
-    assert_eq!(write(&mut w, &[ev(11, 40, 199, 30078, r#"[["d","x"]]"#, "old")]), vec![Outcome::Deleted]);
+    assert_eq!(write(&mut w, &[ev(11, 40, 199, 30078, r#"[["d","x"]]"#, "old")]), vec![Outcome::Vanished]);
 }
 
 #[test]

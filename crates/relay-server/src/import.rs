@@ -30,6 +30,8 @@ pub struct ImportStats {
     pub duplicate: u64,
     pub superseded: u64,
     pub deleted: u64,
+    /// Refused because their author (or a gift wrap's recipient) vanished (NIP-62).
+    pub vanished: u64,
     pub ephemeral: u64,
     pub skipped_kind: u64,
     pub invalid: HashMap<String, u64>,
@@ -171,6 +173,7 @@ pub fn run(input: impl Read + Send, w: &mut Writer, opts: ImportOptions, mut pro
                         Outcome::Duplicate => stats.duplicate += 1,
                         Outcome::Superseded => stats.superseded += 1,
                         Outcome::Deleted => stats.deleted += 1,
+                        Outcome::Vanished => stats.vanished += 1,
                         Outcome::Rejected(m) => *stats.invalid.entry(m.to_string()).or_default() += 1,
                     }
                 }

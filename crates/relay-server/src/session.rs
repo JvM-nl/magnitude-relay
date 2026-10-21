@@ -378,7 +378,7 @@ pub fn ok_reply(out: &mut dyn Outbox, r: &Reply) {
         Some(Outcome::Stored(_)) => (true, ""),
         Some(Outcome::Duplicate) => (true, "duplicate: already have this event"),
         Some(Outcome::Superseded) => (false, "duplicate: a newer version of this event is already stored"),
-        Some(Outcome::Deleted) => (false, "blocked: this event was deleted"),
+        Some(Outcome::Deleted | Outcome::Vanished) => (false, "blocked: this event was deleted"),
         Some(Outcome::Rejected(m)) => (false, m),
         None => (false, "error: could not store the event, try again"),
     };
