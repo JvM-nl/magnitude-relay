@@ -25,7 +25,7 @@ fn main() {
     let dir = args.get(1).expect("data dir");
     let threads: usize = args.get(2).and_then(|t| t.parse().ok()).unwrap_or(6);
     let t = Instant::now();
-    let (store, _w) = Store::open(std::path::Path::new(dir), Options::default()).unwrap();
+    let (store, _w) = Store::open(std::path::Path::new(dir), Options { log_compact_segments: 0, ..Options::default() }).unwrap();
     let v = store.snapshot();
     eprintln!("open {:.3}s, {} events, {} index keys", t.elapsed().as_secs_f64(), v.count, v.index_keys());
 

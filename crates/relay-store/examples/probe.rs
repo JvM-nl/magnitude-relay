@@ -13,7 +13,7 @@ fn main() {
     let f = Filter::parse(&mut Scanner::new(&a[2])).expect("filter");
     let limit: usize = a.get(3).and_then(|x| x.parse().ok()).unwrap_or(500);
     let reps: usize = a.get(4).and_then(|x| x.parse().ok()).unwrap_or(2000);
-    let (store, _w) = Store::open(std::path::Path::new(dir), Options::default()).unwrap();
+    let (store, _w) = Store::open(std::path::Path::new(dir), Options { log_compact_segments: 0, ..Options::default() }).unwrap();
     let v = store.snapshot();
     let runs = v.runs().len();
     let t = Instant::now();

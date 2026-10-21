@@ -28,5 +28,7 @@ start=$(date +%s)
 systemd-run --scope --quiet -p "AllowedCPUs=$CAP_CPUS" nice -n "$NICE_LEVEL" cargo build --release "${PKG[@]}"
 echo "built $BIN in $(( $(date +%s) - start ))s"
 mkdir -p "$BIN_DIR"
-cp "target/release/$BIN" "$DEST"
+# Copy, then rename over: a running relay keeps its old binary (cp onto it would fail).
+cp "target/release/$BIN" "$DEST.new"
+mv -f "$DEST.new" "$DEST"
 ls -l "$DEST"
