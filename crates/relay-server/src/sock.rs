@@ -29,6 +29,37 @@ pub enum Stream {
     Unix(std::os::unix::net::UnixStream),
 }
 
+/// One `recv` that, when it comes back short, also tells tokio the socket is
+/// drained: a stream socket returns less than asked only when it has nothing
+/// more. tokio forgets a socket's readiness only on `WouldBlock`, so every read
+/// that found data was followed by one that found none (1.6 empty reads a
+/// query, as many as reads with data). tokio clears just the readiness it saw
+/// at the start, so data arriving meanwhile still wakes the connection.
+macro_rules! drain_read {
+    ($s:expr, $buf:expr) => {{
+        let (s, buf): (_, &mut [u8]) = ($s, $buf);
+        let fd = std::os::fd::AsRawFd::as_raw_fd(s);
+        let mut got = 0;
+        let r = s.try_io(tokio::io::Interest::READABLE, || {
+            // SAFETY: `buf` is valid for writes of its length.
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            got = n as usize;
+            if got > 0 && got < buf.len() {
+                Err(io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(got)
+            }
+        });
+        match r {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && got > 0 => Ok(got),
+            r => r,
+        }
+    }};
+}
+
 /// The longest a TLS handshake may take before the connection is dropped.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -76,9 +107,10 @@ impl Sock {
     #[inline]
     pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Sock::Plain(s) => s.try_read(buf),
+            Sock::Plain(s) => drain_read!(s, buf),
+            // Reads until the socket would block (see `TlsConn::try_read`).
             Sock::Tls(t) => t.try_read(buf),
-            Sock::Unix(s) => s.try_read(buf),
+            Sock::Unix(s) => drain_read!(s, buf),
         }
     }
 
