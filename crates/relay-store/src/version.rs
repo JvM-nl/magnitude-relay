@@ -320,6 +320,10 @@ impl Version {
         let until = f.until.unwrap_or(u64::MAX);
         let n_tags = f.tags.len();
         let mut candidates: Vec<(Vec<Vec<u8>>, bool)> = Vec::new();
+        // An author+kind or tag+kind index reads a subset of what the kind
+        // index would, and is at least as exact: with one of them, kinds alone
+        // is never the better plan and is not worth estimating.
+        let mut kinds_combined = false;
 
         let kinds = f.kinds.as_deref();
         if let Some(authors) = &f.authors {
@@ -330,6 +334,7 @@ impl Version {
                         .flat_map(|a| ks.iter().map(move |k| prefix(T_AUTHOR_KIND, &[a, &k.to_be_bytes()])))
                         .collect();
                     candidates.push((ps, n_tags == 0));
+                    kinds_combined = true;
                 }
                 _ => {
                     let ps = authors.iter().map(|a| prefix(T_AUTHOR, &[a])).collect();
@@ -347,6 +352,7 @@ impl Version {
                         .flat_map(|v| ks.iter().map(move |k| prefix(T_TAG_KIND, &[&[t.name], v, &k.to_be_bytes()])))
                         .collect();
                     candidates.push((ps, alone));
+                    kinds_combined = true;
                 }
                 _ => {
                     let ps = t.values.iter().map(|v| prefix(T_TAG, &[&[t.name], v])).collect();
@@ -354,7 +360,7 @@ impl Version {
                 }
             }
         }
-        if let Some(ks) = kinds {
+        if let Some(ks) = kinds.filter(|_| !kinds_combined) {
             let ps = ks.iter().map(|k| prefix(T_KIND, &[&k.to_be_bytes()])).collect();
             candidates.push((ps, f.authors.is_none() && n_tags == 0));
         }
