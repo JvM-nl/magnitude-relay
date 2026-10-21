@@ -77,6 +77,7 @@ fn signed_event_round_trips() {
         assert!(at >= last, "{k} out of order in {out}");
         last = at;
     }
+    assert_eq!(r.json_len(), out.len());
     // ...and re-parses to the identical record (a fixed point).
     assert_eq!(parse(&out).unwrap(), rec);
 

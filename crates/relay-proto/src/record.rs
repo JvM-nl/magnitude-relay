@@ -148,6 +148,25 @@ impl<'a> Record<'a> {
         out.push(b'}');
     }
 
+    /// Length of [`write_json`](Self::write_json)'s output, without writing it
+    /// (event size limits are measured on the serialised event).
+    pub fn json_len(&self) -> usize {
+        let (content, _) = self.content_and_tags_pos();
+        let digits = |v: u64| if v == 0 { 1 } else { v.ilog10() as usize + 1 };
+        let mut n = r#"{"content":"","created_at":,"id":"","kind":,"pubkey":"","sig":"","tags":[]}"#.len();
+        n += content.len() + digits(self.created_at()) + digits(self.kind()) + 64 + 64 + 128;
+        for (i, tag) in self.tags().enumerate() {
+            n += usize::from(i > 0) + 2;
+            for (j, f) in tag.fields().enumerate() {
+                n += usize::from(j > 0) + 2 + match f {
+                    Field::Hex32(_) => 64,
+                    Field::Str(s) => s.len(),
+                };
+            }
+        }
+        n
+    }
+
     pub fn to_json(&self) -> String {
         let mut out = Vec::new();
         self.write_json(&mut out);

@@ -220,6 +220,10 @@ dependencies = [
 [[package]]
 name = "relay-server"
 version = "0.1.0"
+dependencies = [
+ "relay-proto",
+ "relay-store",
+]
 
 [[package]]
 name = "relay-store"
