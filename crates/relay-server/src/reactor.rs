@@ -126,6 +126,11 @@ impl Shared {
 /// One connection's outgoing bytes, filled by its own task and by fan-out.
 struct ConnOut {
     buf: RefCell<Vec<u8>>,
+    /// Event bodies shared by every subscriber they go to, each spliced into
+    /// `buf` at an offset: written with one vectored write, never copied per
+    /// connection. Only large live events take this path (see `SHARE_MIN`).
+    spliced: RefCell<Vec<(usize, Rc<[u8]>)>>,
+    spliced_bytes: Cell<usize>,
     notify: Notify,
     /// Set when the client fell too far behind; its task closes it.
     overflow: Cell<bool>,
@@ -134,6 +139,17 @@ struct ConnOut {
 }
 
 impl ConnOut {
+    fn new(deflate: Option<Compressor>) -> ConnOut {
+        ConnOut {
+            buf: RefCell::new(Vec::new()),
+            spliced: RefCell::new(Vec::new()),
+            spliced_bytes: Cell::new(0),
+            notify: Notify::new(),
+            overflow: Cell::new(false),
+            deflate: RefCell::new(deflate),
+        }
+    }
+
     /// Appends messages to this connection's output, compressed if it negotiated that.
     #[inline]
     fn write(&self, f: impl FnOnce(&mut WsOut<'_>)) {
@@ -141,7 +157,37 @@ impl ConnOut {
         let mut z = self.deflate.borrow_mut();
         f(&mut WsOut { buf: &mut buf, z: z.as_mut() });
     }
+
+    /// Bytes waiting to be written.
+    #[inline]
+    fn queued(&self) -> usize {
+        self.buf.borrow().len() + self.spliced_bytes.get()
+    }
+
+    /// A live `["EVENT",sub,body]` with `body` shared rather than copied, or
+    /// false when this connection needs its own bytes (it compresses).
+    #[inline]
+    fn event_shared(&self, sub: &str, body: &Rc<[u8]>) -> bool {
+        if self.deflate.borrow().is_some() {
+            return false;
+        }
+        let mut buf = self.buf.borrow_mut();
+        let prefix = b"[\"EVENT\",\"".len() + sub.len() + 2;
+        ws::write_frame_header(&mut buf, ws::Opcode::Text, true, prefix + body.len() + 1);
+        buf.extend_from_slice(b"[\"EVENT\",\"");
+        buf.extend_from_slice(sub.as_bytes());
+        buf.extend_from_slice(b"\",");
+        self.spliced.borrow_mut().push((buf.len(), body.clone()));
+        self.spliced_bytes.set(self.spliced_bytes.get() + body.len());
+        buf.push(b']');
+        true
+    }
 }
+
+/// Live events at least this large are shared between subscribers instead of
+/// copied into each one's output. Below it a copy costs less than the extra
+/// vectored-write entries.
+const SHARE_MIN: usize = 1024;
 
 struct Reactor {
     idx: usize,
@@ -339,16 +385,22 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
             if targets.is_empty() {
                 continue;
             }
-            // Encoded once, whatever the number of subscribers.
+            // Encoded once, whatever the number of subscribers; a large one is
+            // also stored once, shared by every plain connection it goes to.
             json.clear();
             Record(rec).write_json(&mut json);
+            let body: Option<Rc<[u8]>> = (json.len() >= SHARE_MIN && targets.len() > 1).then(|| Rc::from(&json[..]));
             for (conn, sub) in &targets {
                 let Some(o) = r.conns.get(conn) else { continue };
-                if o.buf.borrow().len() > limit {
+                if o.queued() > limit {
                     o.overflow.set(true);
                 } else {
-                    o.write(|w| session::event_msg_json(w, sub, &json));
                     let m = shared.metrics.of(r.idx);
+                    if body.as_ref().is_some_and(|b| o.event_shared(sub, b)) {
+                        metrics::inc(&m.events_shared);
+                    } else {
+                        o.write(|w| session::event_msg_json(w, sub, &json));
+                    }
                     metrics::inc(&m.events_out);
                     metrics::inc(&m.events_live);
                 }
@@ -399,7 +451,7 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
     if z.is_some() {
         metrics::inc(&shared.metrics.of(idx).connections_deflate);
     }
-    let out = Rc::new(ConnOut { buf: RefCell::new(Vec::new()), notify: Notify::new(), overflow: Cell::new(false), deflate: RefCell::new(z) });
+    let out = Rc::new(ConnOut::new(z));
     st.borrow_mut().conns.insert(conn, out.clone());
 
     let _ = serve(&mut s, &mut buf, conn, ip, deflate, &out, &st, &shared).await;
@@ -411,6 +463,28 @@ async fn connection(mut s: TcpStream, peer: SocketAddr, st: Rc<RefCell<Reactor>>
     }
     shared.release(ip);
     shared.metrics.open.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Writes `buf` with each shared body inserted at its offset, in vectored writes.
+async fn write_spliced(s: &mut TcpStream, buf: &[u8], spliced: &[(usize, Rc<[u8]>)]) -> io::Result<()> {
+    let mut parts: Vec<io::IoSlice<'_>> = Vec::with_capacity(spliced.len() * 2 + 1);
+    let mut at = 0;
+    for (off, body) in spliced {
+        parts.push(io::IoSlice::new(&buf[at..*off]));
+        parts.push(io::IoSlice::new(body));
+        at = *off;
+    }
+    parts.push(io::IoSlice::new(&buf[at..]));
+    let mut rest = &mut parts[..];
+    while !rest.is_empty() {
+        // IOV_MAX is 1024 on Linux and macOS.
+        let n = s.write_vectored(&rest[..rest.len().min(1024)]).await?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        io::IoSlice::advance_slices(&mut rest, n);
+    }
+    Ok(())
 }
 
 /// Bytes read per readiness event, into the reactor's shared scratch buffer.
@@ -513,6 +587,7 @@ async fn serve(
     }
     let mut session = Session::new(conn);
     let mut wbuf = Vec::new();
+    let mut wspliced: Vec<(usize, Rc<[u8]>)> = Vec::new();
     let mut last_rx = Instant::now();
     let mut pinged = false;
     // Frames that arrived with the handshake.
@@ -529,8 +604,15 @@ async fn serve(
         }
         if !out.buf.borrow().is_empty() {
             std::mem::swap(&mut wbuf, &mut *out.buf.borrow_mut());
-            metrics::add(&shared.metrics.of(st.borrow().idx).bytes_out, wbuf.len() as u64);
-            s.write_all(&wbuf).await?;
+            std::mem::swap(&mut wspliced, &mut *out.spliced.borrow_mut());
+            let spliced = out.spliced_bytes.replace(0);
+            metrics::add(&shared.metrics.of(st.borrow().idx).bytes_out, (wbuf.len() + spliced) as u64);
+            if wspliced.is_empty() {
+                s.write_all(&wbuf).await?;
+            } else {
+                write_spliced(s, &wbuf, &wspliced).await?;
+                wspliced.clear();
+            }
             wbuf.clear();
             // Idle connections keep no output buffer; a busy one keeps a modest one.
             if wbuf.capacity() > 64 * 1024 {

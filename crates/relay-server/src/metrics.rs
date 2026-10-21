@@ -61,6 +61,8 @@ counters! {
     events_out,
     /// Live deliveries (subset of events_out).
     events_live,
+    /// Live deliveries whose bytes were shared with other subscribers, not copied.
+    events_shared,
     /// REQ messages.
     reqs,
     /// COUNT messages.

@@ -380,3 +380,71 @@ async fn compressing_clients_get_stateless_deflate() {
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn large_live_events_reach_every_subscriber_intact() {
+    use relay_net::conn::{client_connect_with, ClientDeflate};
+    let dir = std::env::temp_dir().join(format!("relay-e2e-share-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start(dir.clone(), port);
+    let host = format!("127.0.0.1:{port}");
+    let me = Signer::new(11);
+    let author = Signer::new(12);
+
+    // Two plain subscribers (they share each large event's bytes), one that
+    // compresses (it gets its own), and one that stops reading for a while.
+    let filter = json!({"kinds": [1059], "#p": [me.pk()], "limit": 0});
+    let mut subs = Vec::new();
+    for i in 0..4 {
+        let mut c = if i == 2 {
+            client_connect_with(relay.addr, &host, "/", Some(ClientDeflate::default())).await.unwrap()
+        } else {
+            client_connect(relay.addr, &host, "/").await.unwrap()
+        };
+        send(&mut c, json!(["REQ", format!("s{i}"), filter])).await;
+        let (_, end) = collect(&mut c, &format!("s{i}")).await;
+        assert_eq!(end[0], "EOSE");
+        subs.push(c);
+    }
+
+    // A burst of large wraps, interleaved with small ones (which are copied).
+    let mut publisher = client_connect(relay.addr, &host, "/").await.unwrap();
+    let mut sent = Vec::new();
+    for n in 0..200u64 {
+        let size = if n % 5 == 0 { 300 } else { 4000 + (n as usize * 37) % 3000 };
+        let content: String = (0..size).map(|k| (b'a' + ((k as u64 + n) % 26) as u8) as char).collect();
+        let ev = author.event(now() - n, 1059, json!([["p", me.pk()]]), &content);
+        send(&mut publisher, json!(["EVENT", ev])).await;
+        sent.push(ev);
+    }
+    for _ in 0..sent.len() {
+        assert!(ok_of(&mut publisher).await.0);
+    }
+
+    // Every subscriber, the slow one included, gets every event, in order, byte for byte.
+    for (i, c) in subs.iter_mut().enumerate() {
+        if i == 3 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        for (n, ev) in sent.iter().enumerate() {
+            let m = recv(c).await;
+            assert_eq!(m[0], "EVENT", "subscriber {i}, event {n}: {m}");
+            assert_eq!(m[1], format!("s{i}"));
+            assert_eq!(&m[2], ev, "subscriber {i}, event {n}");
+        }
+    }
+
+    // The large ones went out shared to the three plain subscribers.
+    let mut s = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    s.write_all(format!("GET /stats HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).await.unwrap();
+    let stats: Value = serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert_eq!(stats["events_shared"].as_u64(), Some(160 * 3), "{stats}");
+
+    drop((subs, publisher));
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}

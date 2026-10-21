@@ -217,6 +217,7 @@ async fn every_workload_validates_against_our_relay() {
         label: "ours".into(),
         src_ips: 1,
         json: None,
+        pad: 0,
     };
     let r = fanout::run(o).await.unwrap();
     assert_clean("fanout", std::slice::from_ref(&r));

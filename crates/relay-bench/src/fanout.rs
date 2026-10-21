@@ -63,6 +63,9 @@ pub struct FanoutOpts {
     pub label: String,
     pub src_ips: usize,
     pub json: Option<String>,
+    /// Bytes of filler appended to every event's content (0: none), to measure
+    /// delivery of realistic or large events.
+    pub pad: usize,
 }
 
 /// Plane keys per Concord subscription.
@@ -91,7 +94,7 @@ fn build_plan(o: &FanoutOpts, dm_subs: usize, communities: usize, created_at: u6
         let mut rng = Rng::for_item(seed, i as u64, 0xFA);
         let sched_ns = (i as f64 * 1e9 / o.rate) as u64;
         let dm = dm_subs > 0 && (communities == 0 || rng.below(100) < u64::from(o.dm_share));
-        let content = format!("i:{i} ts:{sched_ns}");
+        let content = if o.pad == 0 { format!("i:{i} ts:{sched_ns}") } else { format!("i:{i} ts:{sched_ns} {}", "x".repeat(o.pad)) };
         let mut tags = String::from("[");
         let (ev, target) = if dm {
             let j = rng.below(dm_subs as u64) as usize;
@@ -604,6 +607,7 @@ mod tests {
             label: String::new(),
             src_ips: 1,
             json: None,
+            pad: 0,
         };
         let plan = build_plan(&o, 5, 3, 1_700_000_000);
         assert_eq!(plan.msgs.len(), 50);

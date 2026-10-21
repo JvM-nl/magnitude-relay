@@ -16,7 +16,7 @@ relay-bench: load generator and validating tester for Nostr relays
   relay-bench load   --url ws://HOST:PORT --file FILE [--conns C] [--window W] [--batch-ack] [--duplicates] [--count N] [--skip N]
   relay-bench query  --url ws://HOST:PORT --file FILE [--workload W] [--conns C] [--queries Q] [--limit L] [--distinct D] [--strict-ties] [--warmup N]
   relay-bench neg    --url ws://HOST:PORT --file FILE [--recipient-mode heavy|light] [--have PCT] [--sessions S] [--conns C]
-  relay-bench fanout --url ws://HOST:PORT [--subscribers N] [--publishers P] [--rate R] [--duration D] [--community K] [--dm-share PCT] [--drain SECS]
+  relay-bench fanout --url ws://HOST:PORT [--subscribers N] [--publishers P] [--rate R] [--duration D] [--community K] [--dm-share PCT] [--drain SECS] [--pad BYTES]
   relay-bench idle   --url ws://HOST:PORT [--conns N] [--hold SECS] [--pid PID] [--src-ips K]
 
 Common to every command but gen:
@@ -147,6 +147,7 @@ fn run() -> Result<bool, String> {
                 label,
                 src_ips,
                 json,
+                pad: a.count("pad", 0)? as usize,
             };
             a.finish()?;
             print_header();
