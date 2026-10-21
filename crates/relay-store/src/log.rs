@@ -392,6 +392,20 @@ impl LogWriter {
         }
     }
 
+    /// Drops a merged cold segment from the table; its file goes once no
+    /// published version holds it.
+    pub fn retire_cold(&mut self, n: u64) {
+        if let Some(slot) = self.cold.get_mut(n as usize) {
+            if let Some(f) = slot.take() {
+                f.mark_obsolete();
+            }
+        }
+    }
+
+    pub fn cold_file(&self, n: u64) -> Option<Arc<MappedFile>> {
+        self.cold.get(n as usize)?.clone()
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }

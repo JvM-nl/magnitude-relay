@@ -206,11 +206,28 @@ impl Store {
         let mut dead_seqs = Vec::new();
         let mut next_seq = ck.covered;
         let mut loc_err: Option<io::Error> = None;
-        // A log compaction the last run did not finish: its old hot segments go
-        // (their records all have cold copies), and `locs` is re-derived below.
+        // A log compaction or merge the last run did not finish: the segments it
+        // replaces go (every live record has a copy in its output), and `locs`
+        // is re-derived from that output below.
         let mut retired = ck.retired.clone();
-        retired.extend(&ck.intent_retire);
-        let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, &retired, &ck.cold, |fr: log::Frame<'_>| {
+        retired.extend(ck.intent_retire.iter().filter(|&&n| n < log::COLD_BASE));
+        let gone_cold: Vec<u64> = ck.intent_retire.iter().filter(|&&n| n >= log::COLD_BASE).map(|n| n - log::COLD_BASE).collect();
+        let mut cold_runs: Vec<(Vec<u64>, u64)> = Vec::with_capacity(ck.run_lens.len());
+        let mut at = 0;
+        for (&len, &bytes) in ck.run_lens.iter().zip(&ck.run_bytes) {
+            let nums = ck.cold[at..at + len as usize].to_vec();
+            at += len as usize;
+            if !nums.iter().any(|n| gone_cold.contains(n)) {
+                cold_runs.push((nums, bytes));
+            }
+        }
+        // Runs from before sizes were recorded: what their files hold on disk.
+        for run in cold_runs.iter_mut().filter(|r| r.1 == 0) {
+            use std::os::unix::fs::MetadataExt;
+            run.1 = run.0.iter().filter_map(|&n| std::fs::metadata(log::cold_path(&dir.join("log"), n)).ok()).map(|m| m.blocks() * 512).sum();
+        }
+        let cold_keep: Vec<u64> = cold_runs.iter().flat_map(|r| r.0.iter().copied()).collect();
+        let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, &retired, &cold_keep, |fr: log::Frame<'_>| {
             if loc_err.is_none() {
                 if let Err(e) = locs.set(fr.seq, fr.off) {
                     loc_err = Some(e);
@@ -288,7 +305,7 @@ impl Store {
             ck.next_seg_id,
             ck.covered,
             ck.replay_from,
-            (ck.next_cold, ck.cold.clone(), retired),
+            (ck.next_cold, cold_runs, retired),
         )?;
         if finish_intent {
             w.write_checkpoint()?;

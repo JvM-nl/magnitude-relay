@@ -181,6 +181,18 @@ impl MappedFile {
     }
 }
 
+/// Free bytes on the filesystem holding `path`, for unprivileged writers.
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a valid C string and a zeroed out-parameter.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
 /// Memory this process may use: physical memory, or less if its cgroup (v2) is
 /// capped. Sizes work that must fit in memory to run at disk speed.
 pub fn memory_budget() -> u64 {

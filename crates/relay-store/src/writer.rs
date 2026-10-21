@@ -7,7 +7,7 @@ use crate::bg::{self, Done, Job};
 use crate::dead::DeadSet;
 use crate::keys::{self, *};
 use crate::locs::{self, LocsWriter};
-use crate::log::{LogWriter, Segs};
+use crate::log::{LogWriter, Segs, COLD_BASE};
 use crate::memrun::MemRun;
 use crate::segment::Segment;
 use crate::version::{Run, Version};
@@ -99,6 +99,13 @@ enum LogState {
     Relinking { retire: Vec<u64> },
 }
 
+/// Cold segments as sorted runs (segment numbers, frame bytes), oldest first.
+pub(crate) type ColdRuns = Vec<(Vec<u64>, u64)>;
+
+/// Cold runs merged at once, and how far apart in size they may be.
+const MERGE_FANIN: usize = 4;
+const MERGE_RATIO: u64 = 4;
+
 /// A segment tier: segments within a factor of 4 in size share a level, and a
 /// level holding this many is merged into one.
 const COMPACT_FANIN: usize = 4;
@@ -137,7 +144,7 @@ pub struct Writer {
     epoch: u64,
     synced: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) next_cold: u64,
-    pub(crate) cold_list: Vec<u64>,
+    pub(crate) cold_runs: ColdRuns,
     pub(crate) retired: Vec<u64>,
     log_state: LogState,
     /// A log compaction's cold segments and the hot segments they replace,
@@ -286,7 +293,7 @@ impl Writer {
         next_seg_id: u64,
         covered: u64,
         replay_from: u64,
-        log_lists: (u64, Vec<u64>, Vec<u64>),
+        log_lists: (u64, ColdRuns, Vec<u64>),
     ) -> io::Result<Writer> {
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -319,7 +326,7 @@ impl Writer {
             epoch: 0,
             synced: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             next_cold: log_lists.0,
-            cold_list: log_lists.1,
+            cold_runs: log_lists.1,
             retired: log_lists.2,
             log_state: LogState::Idle,
             intent: (Vec::new(), Vec::new()),
@@ -658,6 +665,8 @@ impl Writer {
                 let sealed = self.log.sealed(self.replay_from);
                 if sealed.len() >= min {
                     self.start_log_compaction(sealed);
+                } else if let Some(pick) = self.pick_merge() {
+                    self.start_merge(pick);
                 }
             }
             LogState::Waiting { reg_gen, .. } => {
@@ -692,19 +701,79 @@ impl Writer {
         }
     }
 
-    /// Rewrites every sealed hot segment into clustered cold ones and waits for
-    /// the whole exchange to finish (after a bulk import).
+    /// The runs a merge should combine: the smallest `MERGE_FANIN` whose sizes
+    /// are within `MERGE_RATIO` of each other (size tiers, so a record is
+    /// rewritten a few times over its life), if the disk has room for the copy.
+    fn pick_merge(&self) -> Option<Vec<usize>> {
+        if self.cold_runs.len() < MERGE_FANIN {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..self.cold_runs.len()).collect();
+        order.sort_by_key(|&i| self.cold_runs[i].1);
+        let pick = order.windows(MERGE_FANIN).find(|w| self.cold_runs[w[MERGE_FANIN - 1]].1 <= self.cold_runs[w[0]].1.max(1) * MERGE_RATIO)?;
+        self.room_for(pick).then(|| pick.to_vec())
+    }
+
+    /// Whether the log's filesystem can hold a copy of these runs (with a margin).
+    fn room_for(&self, runs: &[usize]) -> bool {
+        let need: u64 = runs.iter().map(|&i| self.cold_runs[i].1).sum();
+        crate::mmap::free_bytes(self.log.dir()).is_none_or(|free| free >= need + need / 8 + (64 << 20))
+    }
+
+    fn start_merge(&mut self, runs: Vec<usize>) {
+        let segs: Vec<Vec<(u64, Arc<crate::mmap::MappedFile>)>> = runs
+            .iter()
+            .map(|&i| self.cold_runs[i].0.iter().filter_map(|&n| Some((n, self.log.cold_file(n)?))).collect())
+            .collect();
+        let job = Job::LogMerge {
+            runs: segs,
+            first_cold: self.next_cold,
+            seg_size: self.log.seg_size(),
+            log_dir: self.log.dir().to_path_buf(),
+            dead: self.dead.clone(),
+            version: self.current(),
+        };
+        if self.jobs.send(job).is_ok() {
+            self.log_state = LogState::Writing;
+        }
+    }
+
+    /// Rewrites every sealed hot segment into clustered cold ones, then merges
+    /// all cold runs into one, and waits for both (after a bulk import: one run
+    /// means every history is contiguous).
     pub fn compact_log_all(&mut self) -> io::Result<()> {
+        self.compact_log_hot()?;
+        self.merge_log_runs()
+    }
+
+    /// The first half of `compact_log_all`: sealed hot segments into cold runs.
+    pub fn compact_log_hot(&mut self) -> io::Result<()> {
         // The rewrite may only take segments a restart would not replay, so the
         // replay point must first move past them: flush_all checkpoints it.
         self.flush_all()?;
         self.settle_log_compaction()?;
         let sealed = self.log.sealed(self.replay_from);
-        if sealed.is_empty() {
-            return Ok(());
+        if !sealed.is_empty() {
+            self.start_log_compaction(sealed);
+            self.settle_log_compaction()?;
         }
-        self.start_log_compaction(sealed);
-        self.settle_log_compaction()
+        Ok(())
+    }
+
+    /// The second half: every cold run merged into one, if the disk has room.
+    pub fn merge_log_runs(&mut self) -> io::Result<()> {
+        self.settle_log_compaction()?;
+        let all: Vec<usize> = (0..self.cold_runs.len()).collect();
+        if all.len() > 1 && self.room_for(&all) {
+            self.start_merge(all);
+            self.settle_log_compaction()?;
+        }
+        Ok(())
+    }
+
+    /// Cold runs, as the checkpoint records them.
+    pub fn cold_runs(&self) -> usize {
+        self.cold_runs.len()
     }
 
     /// Drives the log compaction in flight to its end without starting another.
@@ -770,14 +839,20 @@ impl Writer {
                 }
                 self.maybe_compact();
             }
-            Done::LogCompacted { cold, moves, retire } => {
+            Done::LogCompacted { runs, moves, retire } => {
                 // 1. The cold segments join the table; every version from here on can read them.
-                let mut intent_cold = Vec::with_capacity(cold.len());
-                for (n, f) in cold {
-                    self.log.register_cold(n, f);
-                    self.cold_list.push(n);
-                    intent_cold.push(n);
-                    self.next_cold = self.next_cold.max(n + 1);
+                let mut intent_cold = Vec::new();
+                for run in runs {
+                    let mut nums = Vec::with_capacity(run.segs.len());
+                    for (n, f) in run.segs {
+                        self.log.register_cold(n, f);
+                        nums.push(n);
+                        intent_cold.push(n);
+                        self.next_cold = self.next_cold.max(n + 1);
+                    }
+                    if !nums.is_empty() {
+                        self.cold_runs.push((nums, run.bytes));
+                    }
                 }
                 drop(self.publish());
                 let reg_gen = self.current().gen;
@@ -801,9 +876,15 @@ impl Writer {
                         zero.push(off);
                     }
                 }
-                for n in &retire {
-                    self.log.retire_hot(*n);
-                    self.retired.push(*n);
+                for &n in &retire {
+                    if n >= COLD_BASE {
+                        // A merge's input: its whole run goes.
+                        self.log.retire_cold(n - COLD_BASE);
+                        self.cold_runs.retain(|r| !r.0.contains(&(n - COLD_BASE)));
+                    } else {
+                        self.log.retire_hot(n);
+                        self.retired.push(n);
+                    }
                 }
                 self.intent = (Vec::new(), Vec::new());
                 drop(self.publish());
@@ -884,7 +965,9 @@ impl Writer {
                 next_seg_id: self.next_seg_id,
                 segments: ids,
                 next_cold: self.next_cold,
-                cold: self.cold_list.clone(),
+                cold: self.cold_runs.iter().flat_map(|r| r.0.iter().copied()).collect(),
+                run_lens: self.cold_runs.iter().map(|r| r.0.len() as u64).collect(),
+                run_bytes: self.cold_runs.iter().map(|r| r.1).collect(),
                 retired: self.retired.clone(),
                 intent_cold: self.intent.0.clone(),
                 intent_retire: self.intent.1.clone(),

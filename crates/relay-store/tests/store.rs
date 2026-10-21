@@ -763,8 +763,21 @@ fn log_compaction_keeps_every_answer() {
             checked += keys.len();
         }
         assert!(checked > 500, "most records live in cold segments ({checked})");
-        eprintln!("cold segments: {checked} records in {runs} sorted runs");
         assert!(checked >= runs * 10, "{checked} records in {runs} sorted runs: not clustered");
+
+        // After compact_log_all the whole cold log is one run, sorted end to end
+        // (read in the run's order, which the checkpoint records).
+        assert_eq!(w.cold_runs(), 1);
+        let ck = relay_store::checkpoint::read(&dir).unwrap().unwrap();
+        assert_eq!(ck.run_lens, vec![ck.cold.len() as u64]);
+        let keys: Vec<_> = ck
+            .cold
+            .iter()
+            .flat_map(|n| frames(&log.join("cold").join(format!("{n:08}.log"))))
+            .filter(|f| f.0 == 0)
+            .map(|f| cluster_class(Record(&f.1)))
+            .collect();
+        assert!(keys.windows(2).all(|w| w[0] <= w[1]), "the merged run is out of cluster order");
 
         // Nothing that died is left readable on disk, hot or cold.
         for f in files_under(&log) {
@@ -840,6 +853,8 @@ fn interrupted_log_compaction_finishes_at_open() {
         let mut ck = ck_before.clone();
         ck.next_cold = ck_after.next_cold;
         ck.cold = ck_after.cold.clone();
+        ck.run_lens = ck_after.run_lens.clone();
+        ck.run_bytes = ck_after.run_bytes.clone();
         ck.intent_cold = new_cold.clone();
         ck.intent_retire = retired.clone();
         relay_store::checkpoint::write(&crash2, &ck).unwrap();
@@ -890,4 +905,64 @@ fn deleted_large_records_give_their_blocks_back() {
     let after = std::fs::metadata(&seg).unwrap().blocks();
     assert!(before - after >= 1900, "1 MiB deleted, only {} KiB given back", (before - after) / 2);
     assert!(!std::fs::read(&seg).unwrap().windows(64).any(|w| w == content[..64].as_bytes()));
+}
+
+#[test]
+fn interrupted_log_merge_finishes_at_open() {
+    let dir = tmpdir("merge-crash");
+    let mut wl = Workload::new();
+    {
+        let (_s, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+        for _ in 0..60 {
+            let b = wl.batch(12);
+            write(&mut w, &b);
+        }
+        let b = wl.finish();
+        write(&mut w, &b);
+        w.compact_log_hot().unwrap();
+        assert!(w.cold_runs() > 4, "tiny chunks give many runs ({})", w.cold_runs());
+    }
+    // Several runs, before the merge.
+    let before = tmpdir("merge-before");
+    copy_dir(&dir, &before);
+    let ck_before = relay_store::checkpoint::read(&dir).unwrap().unwrap();
+    {
+        let (store, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+        w.merge_log_runs().unwrap();
+        assert_eq!(w.cold_runs(), 1);
+        wl.check(&store, "after the merge");
+    }
+    let ck_after = relay_store::checkpoint::read(&dir).unwrap().unwrap();
+    let merged: Vec<u64> = ck_after.cold.clone();
+    assert!(merged.iter().all(|n| !ck_before.cold.contains(n)));
+    for n in &ck_before.cold {
+        assert!(!dir.join("log").join("cold").join(format!("{n:08}.log")).exists(), "merged input {n} removed");
+    }
+
+    // Died after the merge's intent was recorded, before `locs` moved: the old
+    // runs are still there and listed, the new one is too, and open finishes it.
+    let crash = tmpdir("merge-crash2");
+    copy_dir(&before, &crash);
+    copy_dir(&dir.join("log").join("cold"), &crash.join("log").join("cold"));
+    let mut ck = ck_before.clone();
+    ck.next_cold = ck_after.next_cold;
+    ck.cold.extend(&merged);
+    ck.run_lens.push(merged.len() as u64);
+    ck.run_bytes.push(ck_after.run_bytes[0]);
+    ck.intent_cold = merged.clone();
+    ck.intent_retire = ck_before.cold.iter().map(|n| relay_store::log::COLD_BASE + n).collect();
+    relay_store::checkpoint::write(&crash, &ck).unwrap();
+    {
+        let (store, w) = Store::open(&crash, log_opts(0)).unwrap();
+        assert_eq!(w.cold_runs(), 1);
+        wl.check(&store, "merge finished at open");
+    }
+    let ck = relay_store::checkpoint::read(&crash).unwrap().unwrap();
+    assert!(ck.intent_cold.is_empty() && ck.intent_retire.is_empty());
+    assert_eq!(ck.cold, merged);
+    for n in &ck_before.cold {
+        assert!(!crash.join("log").join("cold").join(format!("{n:08}.log")).exists(), "input {n} removed at open");
+    }
+    let (store, _w) = Store::open(&crash, log_opts(0)).unwrap();
+    wl.check(&store, "reopen after the merge");
 }

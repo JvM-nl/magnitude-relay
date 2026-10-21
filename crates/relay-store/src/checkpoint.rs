@@ -4,19 +4,22 @@
 //! either the old one or the new.
 //!
 //! ```text
-//! "RLYCKPT2" ‖ covered u64 ‖ replay_from u64 ‖ next_seg_id u64 ‖ next_cold u64
-//!            ‖ 5 × (n u32 ‖ n × u64): index segments, cold log segments,
-//!              retired hot segments, intent cold, intent retire
+//! "RLYCKPT3" ‖ covered u64 ‖ replay_from u64 ‖ next_seg_id u64 ‖ next_cold u64
+//!            ‖ 7 × (n u32 ‖ n × u64): index segments, cold log segments,
+//!              retired hot segments, intent cold, intent retire,
+//!              cold run lengths (segments), cold run bytes
 //!            ‖ crc32c u32
 //! ```
-//! Version 1 files (no log compaction yet) read as having empty log lists.
+//! Version 1 files (no log compaction yet) read as having empty log lists;
+//! version 2 files (no runs recorded) as one run per cold segment, size unknown.
 
 use crate::crc32c::crc32c;
 use std::io;
 use std::path::Path;
 
 const MAGIC_V1: &[u8; 8] = b"RLYCKPT1";
-const MAGIC: &[u8; 8] = b"RLYCKPT2";
+const MAGIC_V2: &[u8; 8] = b"RLYCKPT2";
+const MAGIC: &[u8; 8] = b"RLYCKPT3";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
@@ -35,9 +38,14 @@ pub struct Checkpoint {
     pub retired: Vec<u64>,
     /// A log compaction in flight: its cold segments are in `cold`, and
     /// `locs` may or may not point into them yet. On open, `locs` is re-derived
-    /// from their frames and `intent_retire` joins `retired`.
+    /// from their frames and `intent_retire` joins `retired`. A retired number
+    /// of `COLD_BASE` or more is a cold segment (a merge's input).
     pub intent_cold: Vec<u64>,
     pub intent_retire: Vec<u64>,
+    /// `cold` cut into sorted runs: how many segments each holds, in order, and
+    /// their bytes (0: unknown).
+    pub run_lens: Vec<u64>,
+    pub run_bytes: Vec<u64>,
 }
 
 impl Default for Checkpoint {
@@ -52,6 +60,8 @@ impl Default for Checkpoint {
             retired: Vec::new(),
             intent_cold: Vec::new(),
             intent_retire: Vec::new(),
+            run_lens: Vec::new(),
+            run_bytes: Vec::new(),
         }
     }
 }
@@ -70,7 +80,7 @@ pub fn write(dir: &Path, c: &Checkpoint) -> io::Result<()> {
     b.extend_from_slice(&c.replay_from.to_le_bytes());
     b.extend_from_slice(&c.next_seg_id.to_le_bytes());
     b.extend_from_slice(&c.next_cold.to_le_bytes());
-    for l in [&c.segments, &c.cold, &c.retired, &c.intent_cold, &c.intent_retire] {
+    for l in [&c.segments, &c.cold, &c.retired, &c.intent_cold, &c.intent_retire, &c.run_lens, &c.run_bytes] {
         put_list(&mut b, l);
     }
     let crc = crc32c(&b);
@@ -115,7 +125,7 @@ pub fn read(dir: &Path) -> io::Result<Option<Checkpoint>> {
         c.next_seg_id = u64_at(24)?;
         p = 32;
         c.segments = list(&mut p)?;
-    } else if &body[..8] == MAGIC {
+    } else if &body[..8] == MAGIC_V2 || &body[..8] == MAGIC {
         c.covered = u64_at(8)?;
         c.replay_from = u64_at(16)?;
         c.next_seg_id = u64_at(24)?;
@@ -126,6 +136,16 @@ pub fn read(dir: &Path) -> io::Result<Option<Checkpoint>> {
         c.retired = list(&mut p)?;
         c.intent_cold = list(&mut p)?;
         c.intent_retire = list(&mut p)?;
+        if &body[..8] == MAGIC {
+            c.run_lens = list(&mut p)?;
+            c.run_bytes = list(&mut p)?;
+            if c.run_lens.len() != c.run_bytes.len() || c.run_lens.iter().sum::<u64>() != c.cold.len() as u64 {
+                return Err(bad());
+            }
+        } else {
+            c.run_lens = vec![1; c.cold.len()];
+            c.run_bytes = vec![0; c.cold.len()];
+        }
     } else {
         return Err(bad());
     }
@@ -154,6 +174,8 @@ mod tests {
             retired: vec![0, 1],
             intent_cold: vec![3],
             intent_retire: vec![2],
+            run_lens: vec![2, 1],
+            run_bytes: vec![1 << 20, 4096],
         };
         write(&dir, &c).unwrap();
         assert_eq!(read(&dir).unwrap(), Some(c));
