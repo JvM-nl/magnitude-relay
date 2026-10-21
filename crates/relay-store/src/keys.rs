@@ -30,6 +30,36 @@
 use relay_proto::record::{Field, Record};
 use relay_proto::{hex, kind, varint};
 
+/// Byte order of two keys, as `<[u8]>::cmp`, eight bytes at a time and inlined.
+/// Index keys are short and share long prefixes (a type byte, then a 32-byte
+/// key), so a call into the C library's memcmp costs more than the comparison.
+#[inline(always)]
+pub fn key_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let n = a.len().min(b.len());
+    let (a8, b8) = (&a[..n], &b[..n]);
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = u64::from_be_bytes(a8[i..i + 8].try_into().unwrap());
+        let y = u64::from_be_bytes(b8[i..i + 8].try_into().unwrap());
+        if x != y {
+            return x.cmp(&y);
+        }
+        i += 8;
+    }
+    while i < n {
+        if a8[i] != b8[i] {
+            return a8[i].cmp(&b8[i]);
+        }
+        i += 1;
+    }
+    a.len().cmp(&b.len())
+}
+
+#[inline(always)]
+pub fn key_lt(a: &[u8], b: &[u8]) -> bool {
+    key_cmp(a, b) == std::cmp::Ordering::Less
+}
+
 pub const T_ID: u8 = 0x01;
 pub const T_CREATED: u8 = 0x02;
 pub const T_KIND: u8 = 0x03;
@@ -326,5 +356,30 @@ mod tests {
         let empty = format!("33301:{pk}:");
         let (_, _, d) = parse_address(empty.as_bytes()).unwrap();
         assert_eq!(d, b"");
+    }
+}
+
+#[cfg(test)]
+mod cmp_tests {
+    use super::key_cmp;
+
+    #[test]
+    fn key_cmp_matches_slice_order() {
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..200_000 {
+            let la = (next() % 50) as usize;
+            let lb = if next() % 3 == 0 { la } else { (next() % 50) as usize };
+            // Mostly shared prefixes, as in the index.
+            let common = (next() % (la.min(lb) as u64 + 1)) as usize;
+            let a: Vec<u8> = (0..la).map(|i| if i < common { (i * 7) as u8 } else { next() as u8 % 4 }).collect();
+            let b: Vec<u8> = (0..lb).map(|i| if i < common { (i * 7) as u8 } else { next() as u8 % 4 }).collect();
+            assert_eq!(key_cmp(&a, &b), a.cmp(&b), "{a:?} vs {b:?}");
+        }
     }
 }

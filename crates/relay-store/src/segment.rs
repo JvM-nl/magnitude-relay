@@ -330,7 +330,7 @@ impl<'a> BlockRef<'a> {
         let (mut lo, mut hi) = (0usize, self.nrestarts());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.restart_key(mid) <= k {
+            if !keys::key_lt(k, self.restart_key(mid)) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -354,7 +354,7 @@ impl<'a> BlockRef<'a> {
             }
             buf[shared..shared + rest].copy_from_slice(&self.entries[p..p + rest]);
             p += rest;
-            if &buf[..shared + rest] >= k {
+            if !keys::key_lt(&buf[..shared + rest], k) {
                 return i;
             }
         }
@@ -464,7 +464,7 @@ impl Segment {
         let (mut lo, mut hi) = (0usize, self.nblocks);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.meta(mid).4 <= k {
+            if !keys::key_lt(k, self.meta(mid).4) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -558,10 +558,10 @@ impl Segment {
                 buf[shared..len].copy_from_slice(&b.entries[p..p + rest]);
                 p += rest;
                 let k = &buf[..len];
-                if k < lo {
+                if keys::key_lt(k, lo) {
                     continue;
                 }
-                if k >= hi || !f(k) {
+                if !keys::key_lt(k, hi) || !f(k) {
                     return;
                 }
             }

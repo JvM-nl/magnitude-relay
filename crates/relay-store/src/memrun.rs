@@ -16,7 +16,7 @@ impl MemRun {
     /// Sorts and deduplicates a batch of keys into a run.
     pub fn build(kb: &KeyBuf) -> MemRun {
         let mut idx: Vec<u32> = (0..kb.len() as u32).collect();
-        idx.sort_unstable_by(|&a, &b| kb.key(a as usize).cmp(kb.key(b as usize)));
+        idx.sort_unstable_by(|&a, &b| keys::key_cmp(kb.key(a as usize), kb.key(b as usize)));
         idx.dedup_by(|a, b| kb.key(*a as usize) == kb.key(*b as usize));
         let mut data = Vec::with_capacity(kb.data.len());
         let mut offs = Vec::with_capacity(idx.len() + 1);
@@ -54,7 +54,7 @@ impl MemRun {
         let (mut lo, mut hi) = (0usize, self.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.key(mid) < k {
+            if keys::key_lt(self.key(mid), k) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -78,7 +78,7 @@ impl MemRun {
         };
         while i < a.len() && j < b.len() {
             let (ka, kb) = (a.key(i), b.key(j));
-            match ka.cmp(kb) {
+            match keys::key_cmp(ka, kb) {
                 std::cmp::Ordering::Less => {
                     push(ka, &mut data, &mut offs);
                     i += 1;
