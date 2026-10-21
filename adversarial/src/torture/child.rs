@@ -41,6 +41,7 @@ impl Shape {
             vanish_urls: vec![work::URL.to_string()],
             log_compact_segments: self.log_compact_segments,
             log_chunk_bytes: self.log_chunk_bytes,
+            verify_index: true,
         }
     }
 

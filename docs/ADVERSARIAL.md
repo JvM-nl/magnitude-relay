@@ -223,37 +223,34 @@ Tests named without a crate are in `crates/relay-store` (`tests/store.rs`, or
 
 Found, measured or reasoned about, and left for a decision:
 
-- **A flipped bit inside a record is served** (medium, damage). Frames carry
-  a CRC-32C, checked by replay and log compaction but not when a record is
-  read for an answer: `adv corrupt` gets "reads as other bytes" from about half
-  of the damage that lands in hot or cold log segments. Clients that verify
-  signatures reject such an event; the relay still sends it. Checking the
-  CRC on every read costs about 0.1 µs per KiB of record (hardware CRC),
-  also for every candidate a non-exact scan reads; a per-seq "verified"
-  bitset (like the index blocks' `verified`) would pay it once per record
-  per process.
+- **A flipped bit inside a record is served**: fixed (5766a68). A record's
+  frame CRC is checked the first time a process reads it (one bit per seq,
+  `relay_store::verified`), a damaged one is skipped and counted
+  (`store.damaged_reads` in /stats). Cost on the box: read CPU +2-3% on a fresh
+  store, where every read is a first read; once per record per process after.
 - **A flipped dead flag in a frame header is unseen** (medium, damage). The
   header (length, flags, seq) is not covered by the CRC: a flag flipped on
   makes replay drop an acknowledged event; flipped off, it brings a dead one
   back (if its bytes were not zeroed yet). Needs a header check, a format
   change.
-- **A damaged index block aborts the relay** (medium, damage). The block's
-  CRC is checked on first use with an `assert`, and `panic = "abort"`: the
-  query that reads it takes the relay down, and so does the same query after
-  the restart. The message names the file and block. A segment could
-  instead be marked bad and rebuilt from the log, or all blocks verified at
-  open (slow on a big index).
+- **A damaged index block aborts the relay**: fixed (5766a68, d865cb1).
+  Opening checks every block of every listed segment (8 MB reads, threads
+  side by side: a cold 1.46 GB index in 0.52-0.58 s, warm 0.27-0.30 s, against
+  0.04-0.19 s before) and refuses a damaged one, naming the file and how to
+  rebuild (`export`, which reads by seq without the index, then `import`). CI
+  damage runs: panics 10 -> 0. Still open: about five index-damage cases a run
+  give wrong query hits. The one examined (finding-57: a bit flipped in a
+  segment written after the last checkpoint) is not a block-check gap: the
+  checkpoint does not list that segment, opening deletes it and replays the
+  log, so the wrong hits come from replay and repair. To investigate.
 - **NIP-77 sessions** (medium, memory): each open NEG session holds its item
   list, about 90 bytes per item: 650 KB on a 5k-event store, 4.4 MB on a 50k
   one (16 connections x 8 whole-store sessions took the relay from 470 MB
   to 1 GB). Bounded by the connection and session limits, not by memory.
-- **Expensive REQs run on the reactor threads** (medium, availability).
-  On a 50k-event store, four connections sending REQs of 50 filters x 60
-  authors x 64 kinds (about 13 a second, the slowest 411 ms) raised the
-  canary's p99 from about 2 ms to 672 ms: every connection on a busy
-  reactor waits behind them. Big COUNTs already run off the reactors; REQs
-  above a cost estimate could do the same. On a 20k store the same attack
-  stayed under the canary's budget (about 50 ms per REQ).
+- **Expensive REQs run on the reactor threads**: fixed (5766a68). A REQ over
+  256 index ranges or ~20 000 entries to read goes to the query workers; its
+  subscription is held (live events buffered, sent after the stored ones and
+  EOSE). The same attack: canary p99 672 ms -> 0.8 ms.
 - **Write cost per tag** (low): an event with 880 distinct `p` tags costs
   about 2.5 ms of writer time (476 a second from one flood; the canary's p99
   rose to 26 ms).
