@@ -306,6 +306,12 @@ impl LogWriter {
             self.head = next * self.seg_size;
             self.buf_start = self.head;
             self.ensure_hot(next as usize)?;
+        } else if self.head % self.seg_size == 0 {
+            // The last frame filled its segment exactly (or the log reopened
+            // there): what is buffered belongs to that segment, this frame to
+            // the next one.
+            self.flush()?;
+            self.ensure_hot((self.head / self.seg_size) as usize)?;
         }
         let off = self.head;
         self.buf.extend_from_slice(&(record.len() as u32).to_le_bytes());

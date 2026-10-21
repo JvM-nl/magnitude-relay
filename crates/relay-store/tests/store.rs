@@ -502,6 +502,117 @@ fn a_kill_during_an_interrupted_log_compaction_survives() {
     assert_eq!(v.lookup_id(&id), None);
 }
 
+/// A log whose last frame filled its segment exactly, reopened: the first
+/// append goes to the start of a segment that does not exist yet.
+#[test]
+fn reopening_with_the_head_at_a_segment_boundary() {
+    let o = opts();
+    let seg = o.segment_size as usize;
+    let dir = tmpdir("boundary-reopen");
+    {
+        let (_store, mut w) = Store::open(&dir, o.clone()).unwrap();
+        let mut used = 0usize;
+        let mut n = 0u64;
+        while used < seg {
+            let left = seg - used;
+            let base = 20 + ev(n, 1, 100 + n, 14, "[]", "").len();
+            let rec = if left < base + 400 {
+                let mut c = left - base;
+                let mut r = ev(n, 1, 100 + n, 14, "[]", &"x".repeat(c));
+                while 20 + r.len() > left {
+                    c -= 1;
+                    r = ev(n, 1, 100 + n, 14, "[]", &"x".repeat(c));
+                }
+                r
+            } else {
+                ev(n, 1, 100 + n, 14, "[]", "filler")
+            };
+            used += 20 + rec.len();
+            write(&mut w, &[rec]);
+            n += 1;
+        }
+        assert_eq!(used, seg);
+    }
+    // Nothing (not even the idle pre-zeroing) has created the next segment.
+    let next = dir.join("log").join("00000001.log");
+    let _ = std::fs::remove_file(&next);
+    let (store, mut w) = Store::open(&dir, o).unwrap();
+    write(&mut w, &[ev(10_000, 1, 99_999, 14, "[]", "first after reopening")]);
+    let v = store.snapshot();
+    let s = v.lookup_id(&id_of(10_000)).expect("stored");
+    assert_eq!(v.record(s).unwrap().id(), &id_of(10_000));
+}
+
+/// Found by the crash torture: when a frame ended exactly at the end of its
+/// log segment, the next frame was buffered behind it and written past the
+/// segment's end (into the wrong file), while its address said "start of the
+/// next segment". Readers then found zeros there, and a restart lost the
+/// event and everything after it in that segment.
+#[test]
+fn a_frame_that_fills_its_segment_exactly() {
+    let o = opts();
+    let seg = o.segment_size as usize;
+    for second_batch in [false, true] {
+        let dir = tmpdir("exact-fill");
+        let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+        let mut used = 0usize;
+        let mut n = 0u64;
+        let mut expect = Vec::new();
+        // Fill the first segment to within a few hundred bytes, then exactly.
+        loop {
+            let left = seg - used;
+            let probe = ev(n, 1, 100 + n, 14, "[]", "");
+            let base = 20 + probe.len();
+            let rec = if left < base + 400 {
+                // A content length that makes this frame end at the segment's end.
+                let mut c = left - base;
+                let mut r = ev(n, 1, 100 + n, 14, "[]", &"x".repeat(c));
+                while 20 + r.len() > left {
+                    c -= 1;
+                    r = ev(n, 1, 100 + n, 14, "[]", &"x".repeat(c));
+                }
+                assert_eq!(20 + r.len(), left, "could not size the filler frame");
+                r
+            } else {
+                ev(n, 1, 100 + n, 14, "[]", "filler")
+            };
+            used += 20 + rec.len();
+            let last = used == seg;
+            if last && !second_batch {
+                // The boundary frame and the next one in one batch.
+                write(&mut w, &[rec, ev(n + 1, 1, 100 + n + 1, 14, "[]", "after the boundary")]);
+                expect.push(n);
+                expect.push(n + 1);
+                break;
+            }
+            write(&mut w, &[rec]);
+            expect.push(n);
+            n += 1;
+            if last {
+                write(&mut w, &[ev(n, 1, 100 + n, 14, "[]", "after the boundary")]);
+                expect.push(n);
+                break;
+            }
+        }
+        let check = |store: &Store, when: &str| {
+            let v = store.snapshot();
+            for &k in &expect {
+                let seq = v.lookup_id(&id_of(k)).unwrap_or_else(|| panic!("event {k} missing {when}"));
+                assert_eq!(v.record(seq).unwrap().id(), &id_of(k), "event {k} reads as something else {when}");
+            }
+        };
+        check(&store, "before the restart");
+        drop((store, w));
+        let (store, _w) = Store::open(&dir, o.clone()).unwrap();
+        check(&store, "after the restart");
+        for f in std::fs::read_dir(dir.join("log")).unwrap().flatten() {
+            if f.path().extension().is_some_and(|e| e == "log") {
+                assert_eq!(f.metadata().unwrap().len(), seg as u64, "{} grew past its segment size", f.path().display());
+            }
+        }
+    }
+}
+
 /// Deterministic xorshift for reproducible random tests.
 struct Rng(u64);
 impl Rng {
