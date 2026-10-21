@@ -1378,92 +1378,103 @@ impl Writer {
         let v = self.current();
         let mut kills: Vec<u64> = Vec::new();
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        for key in tail {
-            match key[0] {
-                T_ADDR => {
-                    let p = &key[..key.len() - 16];
-                    if !seen.insert(p.to_vec()) {
-                        continue;
-                    }
-                    // Every member the index still has, live or not: (created_at, seq, live).
-                    let mut all = Vec::new();
-                    v.for_prefix(p, |k| {
-                        let s = seq_of(k);
-                        all.push((created_at_of(k), s, v.is_live(s)));
-                    });
-                    // A dead member's record may be gone with its segment.
-                    let id = |s: u64| v.segs.file(locs::get(&v.locs, s) / v.seg_size).map(|_| *v.record_unchecked(s).id());
-                    let mut members = Vec::new();
-                    for &(ca, s, live) in &all {
-                        if !live {
+        // The deletions, vanishes and duplicate copies first: a slot's member
+        // they kill must not then win the slot from one stored after it.
+        let mut killed: HashSet<u64> = HashSet::new();
+        for pass in 0..2 {
+            if pass == 1 {
+                killed.extend(kills.iter().copied());
+            }
+            for key in tail {
+                if (key[0] == T_ADDR) != (pass == 1) {
+                    continue;
+                }
+                match key[0] {
+                    T_ADDR => {
+                        let p = &key[..key.len() - 16];
+                        if !seen.insert(p.to_vec()) {
                             continue;
                         }
-                        // A newer member stored after it replaced it, and that
-                        // holds even if the newer one has died since (deleted, its
-                        // flag on disk, while the replaced one's kill was lost).
-                        let replaced = all.iter().any(|&(ca2, s2, _)| s2 > s && (ca2 > ca || (ca2 == ca && id(s2).is_none_or(|i| Some(i) < id(s)))));
-                        if replaced || v.frame_dead(s) {
-                            kills.push(s);
-                        } else {
-                            members.push((ca, s));
+                        // Every member the index still has, live or not: (created_at, seq, live).
+                        let mut all = Vec::new();
+                        v.for_prefix(p, |k| {
+                            let s = seq_of(k);
+                            all.push((created_at_of(k), s, v.is_live(s)));
+                        });
+                        // A dead member's record may be gone with its segment.
+                        let id = |s: u64| v.segs.file(locs::get(&v.locs, s) / v.seg_size).map(|_| *v.record_unchecked(s).id());
+                        let mut members = Vec::new();
+                        for &(ca, s, live) in &all {
+                            if !live || killed.contains(&s) {
+                                continue;
+                            }
+                            // A newer member stored after it replaced it, and that
+                            // holds even if the newer one has died since (deleted, its
+                            // flag on disk, while the replaced one's kill was lost).
+                            let replaced = all.iter().any(|&(ca2, s2, _)| s2 > s && (ca2 > ca || (ca2 == ca && id(s2).is_none_or(|i| Some(i) < id(s)))));
+                            if replaced || v.frame_dead(s) {
+                                kills.push(s);
+                            } else {
+                                members.push((ca, s));
+                            }
+                        }
+                        if members.len() > 1 {
+                            let best = *members
+                                .iter()
+                                .min_by(|a, b| b.0.cmp(&a.0).then_with(|| v.record_unchecked(a.1).id().cmp(v.record_unchecked(b.1).id())))
+                                .unwrap();
+                            kills.extend(members.iter().filter(|m| m.1 != best.1).map(|m| m.1));
                         }
                     }
-                    if members.len() > 1 {
-                        let best = *members
-                            .iter()
-                            .min_by(|a, b| b.0.cmp(&a.0).then_with(|| v.record_unchecked(a.1).id().cmp(v.record_unchecked(b.1).id())))
-                            .unwrap();
-                        kills.extend(members.iter().filter(|m| m.1 != best.1).map(|m| m.1));
-                    }
-                }
-                T_ID => {
-                    // Two live copies of one event: the older was removed (by an
-                    // operator, whose kills last only from the next checkpoint)
-                    // before the newer was stored, and the crash forgot it.
-                    let p = &key[..33];
-                    if !seen.insert(p.to_vec()) {
-                        continue;
-                    }
-                    let mut copies = Vec::new();
-                    v.for_prefix(p, |k| {
-                        let s = seq_of(k);
-                        if v.is_live(s) {
-                            copies.push(s);
+                    T_ID => {
+                        // Two live copies of one event: the older was removed (by an
+                        // operator, whose kills last only from the next checkpoint)
+                        // before the newer was stored, and the crash forgot it.
+                        let p = &key[..33];
+                        if !seen.insert(p.to_vec()) {
+                            continue;
                         }
-                    });
-                    if let Some(&newest) = copies.iter().max() {
-                        kills.extend(copies.iter().filter(|&&s| s != newest));
-                    }
-                }
-                T_DELETED => {
-                    let target: [u8; 32] = key[1..33].try_into().unwrap();
-                    let deleter: [u8; 32] = key[33..65].try_into().unwrap();
-                    if let Some(t) = v.lookup_id(&target) {
-                        if v.frame_dead(t) || deletable_by(v.record_unchecked(t), &deleter) {
-                            kills.push(t);
+                        let mut copies = Vec::new();
+                        v.for_prefix(p, |k| {
+                            let s = seq_of(k);
+                            if v.is_live(s) {
+                                copies.push(s);
+                            }
+                        });
+                        if let Some(&newest) = copies.iter().max() {
+                            kills.extend(copies.iter().filter(|&&s| s != newest));
                         }
                     }
-                }
-                T_ADDR_DELETED => {
-                    let upto = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
-                    let mut p = Vec::with_capacity(key.len());
-                    p.push(T_ADDR);
-                    p.extend_from_slice(&key[1..key.len() - 8]);
-                    v.for_prefix(&p, |ak| {
-                        let s = seq_of(ak);
-                        if created_at_of(ak) <= upto && v.is_live(s) {
-                            kills.push(s);
+                    T_DELETED => {
+                        let target: [u8; 32] = key[1..33].try_into().unwrap();
+                        let deleter: [u8; 32] = key[33..65].try_into().unwrap();
+                        if let Some(t) = v.lookup_id(&target) {
+                            if v.frame_dead(t) || deletable_by(v.record_unchecked(t), &deleter) {
+                                kills.push(t);
+                            }
                         }
-                    });
+                    }
+                    T_ADDR_DELETED => {
+                        let upto = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                        let mut p = Vec::with_capacity(key.len());
+                        p.push(T_ADDR);
+                        p.extend_from_slice(&key[1..key.len() - 8]);
+                        v.for_prefix(&p, |ak| {
+                            let s = seq_of(ak);
+                            if created_at_of(ak) <= upto && v.is_live(s) {
+                                kills.push(s);
+                            }
+                        });
+                    }
+                    T_VANISH => {
+                        let pk: [u8; 32] = key[1..33].try_into().unwrap();
+                        let upto = u64::from_be_bytes(key[33..41].try_into().unwrap());
+                        let mut b = Batch::new(v.clone());
+                        vanish_kills(&mut b, &pk, upto);
+                        kills.extend(b.kills);
+                    }
+                    _ => {}
                 }
-                T_VANISH => {
-                    let pk: [u8; 32] = key[1..33].try_into().unwrap();
-                    let upto = u64::from_be_bytes(key[33..41].try_into().unwrap());
-                    let mut b = Batch::new(v.clone());
-                    vanish_kills(&mut b, &pk, upto);
-                    kills.extend(b.kills);
-                }
-                _ => {}
             }
         }
         kills.sort_unstable();

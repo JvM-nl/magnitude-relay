@@ -336,3 +336,53 @@ fn a_replacement_deleted_in_its_own_batch_still_replaced() {
     drop(v);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Found by the adversarial suite's crash torture once dead flags waited for
+/// their batch's sync: one batch stored a profile, deleted it, and stored an
+/// older profile into the emptied slot. After a crash before the flags were
+/// down, `repair` killed the deleted one (its deletion is in the log) but
+/// also the older one, which it judged against the deleted one as if it
+/// were still live: an acknowledged profile lost. Deletions are now applied
+/// before slots are resolved.
+#[test]
+fn an_event_stored_into_a_slot_its_deletion_emptied_survives_a_crash() {
+    let dir = tmpdir("slot-after-delete");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    let newer = {
+        let json = format!(
+            r#"{{"id":"{}","pubkey":"{}","created_at":3000,"kind":0,"tags":[],"content":"newer","sig":"{}"}}"#,
+            hex32(0xEE, 1),
+            hex32(1, 0),
+            "00".repeat(64)
+        );
+        let mut p = EventParser::new();
+        let mut rec = Vec::new();
+        parse_event_json(&json, &mut p, &mut rec, false).unwrap();
+        rec
+    };
+    let delete = {
+        let json = format!(
+            r#"{{"id":"{}","pubkey":"{}","created_at":3001,"kind":5,"tags":[["e","{}"]],"content":"","sig":"{}"}}"#,
+            hex32(0xEE, 2),
+            hex32(1, 0),
+            hex32(0xEE, 1),
+            "00".repeat(64)
+        );
+        let mut p = EventParser::new();
+        let mut rec = Vec::new();
+        parse_event_json(&json, &mut p, &mut rec, false).unwrap();
+        rec
+    };
+    // Created at 1003: older than the deleted one, stored once the slot is empty.
+    let older = ev_kind(3, 1, 0, 10);
+    assert_eq!(write(&mut w, &[newer, delete, older]).unwrap(), vec![Outcome::Stored(0), Outcome::Stored(1), Outcome::Stored(2)]);
+    // The crash: before any later batch wrote the dead flag.
+    w.close();
+    drop(store);
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    let v = store.snapshot();
+    assert_eq!(v.lookup_id(&id_of(1)), None, "the deleted profile is back");
+    assert_eq!(v.lookup_id(&id_of(3)), Some(2), "the acknowledged older profile is gone");
+    drop(v);
+    let _ = std::fs::remove_dir_all(dir);
+}
