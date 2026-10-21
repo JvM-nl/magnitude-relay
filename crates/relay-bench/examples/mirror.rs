@@ -5,11 +5,22 @@
 //!
 //! Used to keep a hidden instance fed with real production traffic. Reconnects
 //! on any error; prints a tally line every `--stats` seconds.
+//!
+//! A live REQ alone misses things: relays cap what a REQ returns from storage
+//! (strfry at 500), so after a gap only the newest events come back, and gift
+//! wraps are backdated up to two days, so a wrap that arrived during the gap can
+//! be older than all of those. On every (re)connect the whole window is therefore
+//! also copied page by page, on connections of its own, beside the live feed.
 
 use relay_bench::net::{connect, recv_text, resolve, RecvError};
 use relay_bench::wire::{parse_relay_msg, RelayMsg};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
+
+/// Events asked for per backfill page (strfry's cap).
+const PAGE: usize = 500;
+/// Gift wraps are backdated up to this much (NIP-59).
+const BACKDATE: u64 = 2 * 86400;
 
 /// The raw event object inside `["EVENT","sub",{...}]`.
 fn event_json(msg: &str) -> Option<&str> {
@@ -20,6 +31,83 @@ fn event_json(msg: &str) -> Option<&str> {
 
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// Copies every event with `created_at >= since` from `from` to `to`, newest
+/// first, paging back with `until`. A page's oldest second is asked for again
+/// (its other events may not have fit), so ids already sent are skipped.
+async fn backfill(from: &str, to: &str, since: u64) -> Result<BTreeMap<String, u64>, String> {
+    let mut src = connect(&resolve(from).await?, None).await.map_err(|e| e.to_string())?;
+    let mut dst = connect(&resolve(to).await?, None).await.map_err(|e| e.to_string())?;
+    let mut tally: BTreeMap<String, u64> = BTreeMap::new();
+    let mut sent: HashSet<[u8; 32]> = HashSet::new();
+    let mut until = now();
+    let mut page = 0u64;
+    let drain = |text: &str, tally: &mut BTreeMap<String, u64>| {
+        if let RelayMsg::Ok { accepted, msg, .. } = parse_relay_msg(text) {
+            let prefix = msg.split(':').next().unwrap_or("").to_string();
+            *tally.entry(format!("{}{}", if accepted { "ok " } else { "refused " }, if prefix.is_empty() { "stored".into() } else { prefix })).or_default() += 1;
+        }
+    };
+    while until >= since {
+        page += 1;
+        let sub = format!("b{page}");
+        src.send_text(&format!("[\"REQ\",\"{sub}\",{{\"since\":{since},\"until\":{until},\"limit\":{PAGE}}}]")).await.map_err(|e| e.to_string())?;
+        let (mut n, mut oldest) = (0usize, u64::MAX);
+        loop {
+            let text = recv_text(&mut src, Duration::from_secs(60)).await.map_err(|e| format!("backfill source: {e:?}"))?;
+            match parse_relay_msg(&text) {
+                RelayMsg::Event { sub: s, id, created_at, .. } if s == sub => {
+                    n += 1;
+                    oldest = oldest.min(created_at);
+                    if sent.insert(id) {
+                        if let Some(ev) = event_json(&text) {
+                            dst.send_text(&format!("[\"EVENT\",{ev}]")).await.map_err(|e| e.to_string())?;
+                            *tally.entry("sent".into()).or_default() += 1;
+                        }
+                    }
+                }
+                RelayMsg::Eose { sub: s } if s == sub => break,
+                RelayMsg::Closed { sub: s, msg } if s == sub => return Err(format!("backfill refused: {msg}")),
+                _ => {}
+            }
+        }
+        src.send_text(&format!("[\"CLOSE\",\"{sub}\"]")).await.map_err(|e| e.to_string())?;
+        while let Ok(text) = recv_text(&mut dst, Duration::from_millis(1)).await {
+            drain(&text, &mut tally);
+        }
+        if n == 0 {
+            break;
+        }
+        // A full page all in one second: more of that second than one page holds.
+        if oldest >= until {
+            if n >= PAGE {
+                *tally.entry("crowded seconds".into()).or_default() += 1;
+            }
+            until = until.saturating_sub(1);
+            if until == 0 {
+                break;
+            }
+        } else {
+            until = oldest;
+        }
+    }
+    // The last OKs.
+    let quiet = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < quiet {
+        match recv_text(&mut dst, Duration::from_millis(200)).await {
+            Ok(text) => drain(&text, &mut tally),
+            Err(RecvError::Timeout) => {
+                let acked: u64 = tally.iter().filter(|(k, _)| k.starts_with("ok") || k.starts_with("refused")).map(|(_, v)| v).sum();
+                if acked >= tally.get("sent").copied().unwrap_or(0) {
+                    break;
+                }
+            }
+            Err(e) => return Err(format!("backfill destination: {e:?}")),
+        }
+    }
+    *tally.entry("pages".into()).or_default() = page;
+    Ok(tally)
 }
 
 fn main() {
@@ -35,6 +123,14 @@ fn main() {
         let mut tally: BTreeMap<String, u64> = BTreeMap::new();
         let mut last = Instant::now();
         loop {
+            let window_start = since.saturating_sub(BACKDATE);
+            let fill = async {
+                match backfill(&from, &to, window_start).await {
+                    Ok(t) => println!("{} backfill since {window_start} done: {:?}", now(), t),
+                    Err(e) => println!("{} backfill since {window_start} failed: {e}", now()),
+                }
+                std::future::pending::<()>().await
+            };
             let run = async {
                 let mut src = connect(&resolve(&from).await?, None).await.map_err(|e| e.to_string())?;
                 let mut dst = connect(&resolve(&to).await?, None).await.map_err(|e| e.to_string())?;
@@ -69,7 +165,11 @@ fn main() {
                     }
                 }
             };
-            if let Err(e) = run.await {
+            let result = tokio::select! {
+                r = run => r,
+                _ = fill => unreachable!(),
+            };
+            if let Err(e) = result {
                 println!("{} reconnecting after: {e}", now());
                 since = now();
                 tokio::time::sleep(Duration::from_secs(3)).await;
