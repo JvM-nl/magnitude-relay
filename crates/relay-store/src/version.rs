@@ -124,6 +124,10 @@ pub fn prefix_end(p: &[u8]) -> Vec<u8> {
     vec![0xFF; p.len() + 1]
 }
 
+/// What a record damaged on disk reads as where one must be had: an empty
+/// event (id zero, created at 0, no content, no tags).
+static DAMAGED: [u8; relay_proto::record::HEADER_LEN + 2] = [0; relay_proto::record::HEADER_LEN + 2];
+
 pub struct Version {
     pub gen: u64,
     /// Seqs `< count` are published.
@@ -171,13 +175,14 @@ impl Version {
         seq < self.count && !self.dead.is_dead(seq)
     }
 
-    /// The record stored at `seq`, unless it is unpublished or dead.
+    /// The record stored at `seq`, unless it is unpublished or dead, or its
+    /// frame on disk is not what `locs` promises (see `log::record_of`).
     #[inline]
     pub fn record(&self, seq: u64) -> Option<Record<'_>> {
         if !self.is_live(seq) {
             return None;
         }
-        Some(self.record_unchecked(seq))
+        self.checked(seq)
     }
 
     /// Whether a live event's stored bytes still match their checksum.
@@ -205,10 +210,27 @@ impl Version {
         }
     }
 
+    /// The record at `seq` if its frame is `seq`'s and whole by its header:
+    /// query paths skip a damaged one instead of answering with another
+    /// event's bytes (or panicking on a zeroed frame).
+    #[inline]
+    fn checked(&self, seq: u64) -> Option<Record<'_>> {
+        log::record_of(&self.segs, self.seg_size, locs::get(&self.locs, seq), seq).map(Record)
+    }
+
+    /// The record at `seq` for the write path's rules and `repair`, which
+    /// must have one: a damaged one reads as `DAMAGED`, never as a panic.
     #[inline]
     pub(crate) fn record_unchecked(&self, seq: u64) -> Record<'_> {
-        let off = locs::get(&self.locs, seq);
-        Record(log::record_at(&self.segs, self.seg_size, off))
+        self.checked(seq).unwrap_or(Record(&DAMAGED))
+    }
+
+    /// Whether `seq`'s log frame is flagged dead. A kill's flag reaches the disk
+    /// before the record may be zeroed, so after a crash this tells a killed
+    /// (perhaps zeroed) record from a live one even when the dead set, loaded
+    /// from the last checkpoint, has not heard of the kill.
+    pub(crate) fn frame_dead(&self, seq: u64) -> bool {
+        log::frame_dead(&self.segs, self.seg_size, locs::get(&self.locs, seq))
     }
 
     pub fn dead_count(&self) -> u64 {
@@ -416,7 +438,7 @@ impl Version {
             Plan::Ids => {
                 for id in f.ids.as_deref().unwrap_or(&[]) {
                     let Some(seq) = self.lookup_id(id) else { continue };
-                    let rec = self.record_unchecked(seq);
+                    let Some(rec) = self.checked(seq) else { continue };
                     if !expired(rec, now) && f.matches(rec) {
                         hits.push(Hit { created_at: rec.created_at(), seq, id: *rec.id() });
                     }
@@ -433,7 +455,7 @@ impl Version {
                     if !self.is_live(seq) {
                         continue;
                     }
-                    let rec = self.record_unchecked(seq);
+                    let Some(rec) = self.checked(seq) else { continue };
                     if expired(rec, now) || (!exact && !f.matches(rec)) {
                         continue;
                     }
@@ -506,7 +528,7 @@ impl Version {
                     let mut found = Vec::new();
                     for id in f.ids.as_deref().unwrap_or(&[]) {
                         let Some(seq) = self.lookup_id(id) else { continue };
-                        let rec = self.record_unchecked(seq);
+                        let Some(rec) = self.checked(seq) else { continue };
                         if f.matches(rec) {
                             found.push((rec.created_at(), seq));
                         }
@@ -673,7 +695,7 @@ impl Source<'_> {
                 self.head = Some(Hit { created_at, seq, id: [0; 32] });
                 return;
             }
-            let rec = v.record_unchecked(seq);
+            let Some(rec) = v.checked(seq) else { continue };
             if expired(rec, now) || (!self.exact && !f.matches(rec)) {
                 continue;
             }

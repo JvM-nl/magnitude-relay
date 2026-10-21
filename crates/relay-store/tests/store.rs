@@ -275,9 +275,403 @@ fn deleted_content_is_zeroed_on_disk() {
     assert!(held.record(0).is_none());
     assert!(on_disk(secret));
     drop(held);
-    // ...and gone once the next batch finds no reader holding it.
+    // ...and gone once no reader holds it and its dead flag is durable: the
+    // flag is written once the deletion is (with the next batch), and synced
+    // with the batch after that.
     write(&mut w, &[ev(3, 1, 102, 14, "[]", "later")]);
+    write(&mut w, &[ev(4, 1, 103, 14, "[]", "later still")]);
     assert!(!on_disk(secret));
+}
+
+/// The same on a store that goes quiet: an idle store syncs the flag itself.
+#[test]
+fn deleted_content_leaves_an_idle_store_too() {
+    let dir = tmpdir("zero-idle");
+    let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+    let secret = "SECRET-CONTENT-YYYY";
+    write(&mut w, &[ev(1, 1, 100, 14, "[]", secret)]);
+    write(&mut w, &[ev(2, 1, 101, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "")]);
+    let seg = dir.join("log").join("00000000.log");
+    let on_disk = |s: &str| std::fs::read(&seg).unwrap().windows(s.len()).any(|w| w == s.as_bytes());
+    w.maintain().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    w.maintain().unwrap();
+    assert!(!on_disk(secret));
+}
+
+/// A crash after a killed record was zeroed but before the next checkpoint:
+/// the dead bit is lost (the checkpointed `dead.bits` predates it, and the
+/// record's frame is behind the replay point), so the kill must be re-derived
+/// at open from the tail, without trusting the zeroed bytes. Found by the
+/// crash torture: the deleted event came back as an all-zero record.
+#[test]
+fn zeroed_records_stay_dead_after_a_crash_before_the_checkpoint() {
+    // No flush (so no checkpoint) after the first one.
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let zero_id = [0u8; 32];
+
+    // A kind-5 deletion.
+    let dir = tmpdir("zcrash-del");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    write(&mut w, &[ev(1, 1, 100, 14, "[]", "SECRET-ONE")]);
+    w.flush_all().unwrap();
+    write(&mut w, &[ev(2, 1, 101, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "")]);
+    write(&mut w, &[ev(3, 1, 102, 14, "[]", "later")]);
+    let crashed = tmpdir("zcrash-del-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (store, _w) = Store::open(&crashed, o.clone()).unwrap();
+    let v = store.snapshot();
+    assert_eq!(v.lookup_id(&id_of(1)), None, "the deleted event is back");
+    assert!(v.query(&filter("{}"), 100, 1_000).iter().all(|h| h.id != zero_id), "a zeroed record is served");
+    assert_eq!(ids(&store, "{}", 100), vec![id_of(3), id_of(2)]);
+}
+
+/// The same crash window for a same-second replacement whose newcomer has the
+/// lower id: re-deciding the slot at open, the old profile's zeroed id (all
+/// zeros) won the tie and the acknowledged replacement was killed.
+#[test]
+fn zeroed_replaced_records_do_not_win_their_slot_back_after_a_crash() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let zero_id = [0u8; 32];
+    let dir = tmpdir("zcrash-repl");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    write(&mut w, &[ev(9, 1, 100, 0, "[]", "old profile")]);
+    w.flush_all().unwrap();
+    assert!(matches!(write(&mut w, &[ev(4, 1, 100, 0, "[]", "new profile")])[0], Outcome::Stored(_)));
+    write(&mut w, &[ev(5, 2, 102, 14, "[]", "later")]);
+    let crashed = tmpdir("zcrash-repl-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (store, _w) = Store::open(&crashed, o).unwrap();
+    assert_eq!(ids(&store, r#"{"kinds":[0]}"#, 10), vec![id_of(4)], "the acknowledged replacement must survive");
+    assert!(store.snapshot().query(&filter("{}"), 100, 1_000).iter().all(|h| h.id != zero_id), "a zeroed record is served");
+}
+
+/// Found by the crash torture: an event that replaced an older one and was
+/// then removed itself, both after the last checkpoint. Replaying the log, a
+/// dead frame contributed no index keys, so nothing re-decided the slot and
+/// the older event (its kill lost with the checkpoint that never came, its
+/// bytes already zeroed) came back.
+#[test]
+fn a_replaced_event_stays_dead_when_its_replacement_is_removed_before_a_crash() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let dir = tmpdir("dead-replacer");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    write(&mut w, &[ev(1, 1, 100, 0, "[]", "first profile")]);
+    w.flush_all().unwrap();
+    let Outcome::Stored(b) = write(&mut w, &[ev(2, 1, 101, 0, "[]", "second profile")])[0] else { panic!() };
+    assert_eq!(w.kill_live(&[b]).unwrap(), 1);
+    write(&mut w, &[ev(3, 2, 102, 14, "[]", "later")]);
+    // Its content left the disk at once (no reader holds it); the rest of it
+    // stays until a flush covers it, for the replay below.
+    let log = std::fs::read(dir.join("log").join("00000000.log")).unwrap();
+    assert!(!log.windows(14).any(|w| w == b"second profile"), "removed content still on disk");
+    let crashed = tmpdir("dead-replacer-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (store, _w) = Store::open(&crashed, o).unwrap();
+    assert!(ids(&store, r#"{"kinds":[0]}"#, 10).is_empty(), "the replaced profile is back");
+}
+
+/// Found by the crash torture: a kind-5 deletion removed by an operator (its
+/// tombstone stays: a re-publish of what it deleted is refused) lost that
+/// tombstone in a crash before the next checkpoint, because a dead frame of
+/// the replayed log added no keys.
+#[test]
+fn a_removed_deletion_still_blocks_a_republish_after_a_crash() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let dir = tmpdir("dead-deletion");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    let target = ev(1, 1, 100, 14, "[]", "regret");
+    write(&mut w, std::slice::from_ref(&target));
+    w.flush_all().unwrap();
+    let Outcome::Stored(d) = write(&mut w, &[ev(2, 1, 101, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "")])[0] else { panic!() };
+    assert_eq!(w.kill_live(&[d]).unwrap(), 1);
+    assert_eq!(write(&mut w, std::slice::from_ref(&target)), vec![Outcome::Deleted], "the tombstone outlives the deletion");
+    let crashed = tmpdir("dead-deletion-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (_store, mut w) = Store::open(&crashed, o).unwrap();
+    assert_eq!(write(&mut w, &[target]), vec![Outcome::Deleted], "the deleted event could be published again");
+}
+
+/// An operator removal is permanent only from the next checkpoint; a client
+/// re-publishing the removed event before then stores a second copy. Found
+/// by the crash torture: a crash in between left both copies live, so the
+/// event came back twice (in queries, counts and NIP-77 sets).
+#[test]
+fn a_crash_never_leaves_two_live_copies_of_one_event() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let dir = tmpdir("two-copies");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    let e = ev(1, 1, 100, 14, "[]", "twice");
+    write(&mut w, std::slice::from_ref(&e));
+    w.flush_all().unwrap();
+    assert_eq!(w.kill_live(&[0]).unwrap(), 1);
+    assert_eq!(write(&mut w, &[e]), vec![Outcome::Stored(1)]);
+    let crashed = tmpdir("two-copies-copy");
+    copy_dir(&dir, &crashed);
+    drop((store, w));
+    let (store, _w) = Store::open(&crashed, o).unwrap();
+    let v = store.snapshot();
+    assert!(!v.is_live(0) && v.is_live(1), "exactly the newer copy is live");
+    assert_eq!(v.count(&filter("{}"), 1_000), 1);
+}
+
+/// A kill re-derived at open from the replayed tail must outlast the tail
+/// event it was derived from. Found by the crash torture: the newer copy of a
+/// twice-stored event decided at open that the older copy dies; the newer one
+/// was then removed and, after a second crash, nothing remembered the older
+/// one's death.
+#[test]
+fn kills_re_derived_at_open_survive_the_next_crash() {
+    let o = Options { flush_bytes: 64 << 20, ..opts() };
+    let dir = tmpdir("rederived");
+    let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+    let e = ev(1, 1, 100, 14, "[]", "twice");
+    write(&mut w, std::slice::from_ref(&e));
+    w.flush_all().unwrap();
+    assert_eq!(w.kill_live(&[0]).unwrap(), 1);
+    assert_eq!(write(&mut w, &[e]), vec![Outcome::Stored(1)]);
+    let crash1 = tmpdir("rederived-1");
+    copy_dir(&dir, &crash1);
+    drop((store, w));
+    let (store, mut w) = Store::open(&crash1, o.clone()).unwrap();
+    assert!(!store.snapshot().is_live(0) && store.snapshot().is_live(1));
+    // The newer copy goes too (an operator removal, not yet checkpointed)...
+    assert_eq!(w.kill_live(&[1]).unwrap(), 1);
+    let crash2 = tmpdir("rederived-2");
+    copy_dir(&crash1, &crash2);
+    drop((store, w));
+    // ...which may be undone by the crash; the older copy's death may not.
+    let (store, _w) = Store::open(&crash2, o).unwrap();
+    assert!(!store.snapshot().is_live(0), "the older copy is back");
+}
+
+/// Sets the dead flag on the frame holding `seq` in a log segment file, as
+/// the writer does when it kills that copy of the event.
+fn flag_dead(path: &std::path::Path, seq: u64) -> bool {
+    let mut data = std::fs::read(path).unwrap();
+    let mut o = 0usize;
+    while o + 20 <= data.len() {
+        let len = u32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as usize;
+        if len == 0 {
+            return false;
+        }
+        if u64::from_le_bytes(data[o + 8..o + 16].try_into().unwrap()) == seq {
+            data[o + 4..o + 8].copy_from_slice(&1u32.to_le_bytes());
+            std::fs::write(path, data).unwrap();
+            return true;
+        }
+        o += 20 + len;
+    }
+    false
+}
+
+/// Found by the crash torture: an event removed while a log compaction was
+/// copying its segment (after its copy was taken), then a crash before the
+/// exchange finished. Its kill lived only in the old segment's dead flag; open
+/// finished the exchange from the copies and retired the old segment, and the
+/// event was back. Flags in the segments an exchange retires now carry over.
+#[test]
+fn a_kill_during_an_interrupted_log_compaction_survives() {
+    let dir = tmpdir("intent-kill");
+    let mut wl = Workload::new();
+    {
+        let (_s, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+        for _ in 0..60 {
+            let b = wl.batch(12);
+            write(&mut w, &b);
+        }
+        w.flush_all().unwrap();
+    }
+    let before = tmpdir("intent-kill-before");
+    copy_dir(&dir, &before);
+    let ck_before = relay_store::checkpoint::read(&dir).unwrap().unwrap();
+    {
+        let (_s, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+        w.compact_log_hot().unwrap();
+    }
+    let ck_after = relay_store::checkpoint::read(&dir).unwrap().unwrap();
+    let new_cold: Vec<u64> = ck_after.cold.iter().copied().filter(|n| !ck_before.cold.contains(n)).collect();
+    let retired: Vec<u64> = ck_after.retired.iter().copied().filter(|n| !ck_before.retired.contains(n)).collect();
+    assert!(!new_cold.is_empty() && !retired.is_empty());
+
+    // The crash: the intent recorded, `locs` not yet pointing at the copies,
+    // and one live event of a retiring segment killed after its copy was taken.
+    let crash = tmpdir("intent-kill-crash");
+    copy_dir(&before, &crash);
+    copy_dir(&dir.join("log").join("cold"), &crash.join("log").join("cold"));
+    let (victim, seg) = {
+        let (store, _w) = Store::open(&before, log_opts(0)).unwrap();
+        let v = store.snapshot();
+        let victim = (0..v.count).find(|&s| v.is_live(s)).unwrap();
+        (victim, retired[0])
+    };
+    let id = *Store::open(&before, log_opts(0)).unwrap().0.snapshot().record(victim).unwrap().id();
+    assert!(flag_dead(&crash.join("log").join(format!("{seg:08}.log")), victim), "victim not in the first retired segment");
+    let mut ck = ck_before.clone();
+    ck.next_cold = ck_after.next_cold;
+    ck.cold = ck_after.cold.clone();
+    ck.run_lens = ck_after.run_lens.clone();
+    ck.run_bytes = ck_after.run_bytes.clone();
+    ck.intent_cold = new_cold;
+    ck.intent_retire = retired;
+    relay_store::checkpoint::write(&crash, &ck).unwrap();
+    let (store, _w) = Store::open(&crash, log_opts(0)).unwrap();
+    let v = store.snapshot();
+    assert!(!v.is_live(victim), "the event killed during the compaction is back");
+    assert_eq!(v.lookup_id(&id), None);
+}
+
+/// Found by the adversarial suite's crash torture (checking every live
+/// record's frame): an operator's removal flagged its victims' frames dead at
+/// once, but a restart reads flags only in the log tail. A crash before the
+/// removal's checkpoint brought older victims back live with dead frames, and
+/// the next log compaction, which skips frames flagged dead, dropped their
+/// bytes: reading them then panicked.
+#[test]
+fn an_interrupted_removal_leaves_no_live_event_with_a_dead_frame() {
+    let dir = tmpdir("removal-crash");
+    let (store, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+    let recs: Vec<Vec<u8>> = (0..200).map(|n| ev(n, 1, 1000 + n, 1, "[]", &"x".repeat(900))).collect();
+    for c in recs.chunks(10) {
+        write(&mut w, c);
+    }
+    // Everything indexed and checkpointed: the victim is older than the tail.
+    w.flush_all().unwrap();
+    let victim = store.snapshot().lookup_id(&id_of(0)).unwrap();
+    assert_eq!(w.kill_live(&[victim]).unwrap(), 1);
+    // The crash, before the removal's checkpoint.
+    w.close();
+    drop(store);
+    let (store, mut w) = Store::open(&dir, log_opts(0)).unwrap();
+    // The kill was never made durable: the event is back, whole...
+    assert_eq!(store.snapshot().record(victim).map(|r| *r.id()), Some(id_of(0)));
+    // ...and stays so through a log compaction of its segment.
+    w.compact_log_hot().unwrap();
+    assert!(w.cold_runs() > 0);
+    assert_eq!(store.snapshot().record(victim).map(|r| *r.id()), Some(id_of(0)));
+    // Removed for good once checkpointed, whatever comes after.
+    assert_eq!(w.kill_live(&[victim]).unwrap(), 1);
+    w.write_checkpoint().unwrap();
+    w.close();
+    drop(store);
+    let (store, _w) = Store::open(&dir, log_opts(0)).unwrap();
+    assert_eq!(store.snapshot().lookup_id(&id_of(0)), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A log whose last frame filled its segment exactly, reopened: the first
+/// append goes to the start of a segment that does not exist yet.
+#[test]
+fn reopening_with_the_head_at_a_segment_boundary() {
+    let o = opts();
+    let seg = o.segment_size as usize;
+    let dir = tmpdir("boundary-reopen");
+    {
+        let (_store, mut w) = Store::open(&dir, o.clone()).unwrap();
+        let mut used = 0usize;
+        let mut n = 0u64;
+        while used < seg {
+            let left = seg - used;
+            let base = 20 + ev(n, 1, 100 + n, 14, "[]", "").len();
+            let rec = if left < base + 400 {
+                let mut c = left - base;
+                let mut r = ev(n, 1, 100 + n, 14, "[]", &"x".repeat(c));
+                while 20 + r.len() > left {
+                    c -= 1;
+                    r = ev(n, 1, 100 + n, 14, "[]", &"x".repeat(c));
+                }
+                r
+            } else {
+                ev(n, 1, 100 + n, 14, "[]", "filler")
+            };
+            used += 20 + rec.len();
+            write(&mut w, &[rec]);
+            n += 1;
+        }
+        assert_eq!(used, seg);
+    }
+    // Nothing (not even the idle pre-zeroing) has created the next segment.
+    let next = dir.join("log").join("00000001.log");
+    let _ = std::fs::remove_file(&next);
+    let (store, mut w) = Store::open(&dir, o).unwrap();
+    write(&mut w, &[ev(10_000, 1, 99_999, 14, "[]", "first after reopening")]);
+    let v = store.snapshot();
+    let s = v.lookup_id(&id_of(10_000)).expect("stored");
+    assert_eq!(v.record(s).unwrap().id(), &id_of(10_000));
+}
+
+/// Found by the crash torture: when a frame ended exactly at the end of its
+/// log segment, the next frame was buffered behind it and written past the
+/// segment's end (into the wrong file), while its address said "start of the
+/// next segment". Readers then found zeros there, and a restart lost the
+/// event and everything after it in that segment.
+#[test]
+fn a_frame_that_fills_its_segment_exactly() {
+    let o = opts();
+    let seg = o.segment_size as usize;
+    for second_batch in [false, true] {
+        let dir = tmpdir("exact-fill");
+        let (store, mut w) = Store::open(&dir, o.clone()).unwrap();
+        let mut used = 0usize;
+        let mut n = 0u64;
+        let mut expect = Vec::new();
+        // Fill the first segment to within a few hundred bytes, then exactly.
+        loop {
+            let left = seg - used;
+            let probe = ev(n, 1, 100 + n, 14, "[]", "");
+            let base = 20 + probe.len();
+            let rec = if left < base + 400 {
+                // A content length that makes this frame end at the segment's end.
+                let mut c = left - base;
+                let mut r = ev(n, 1, 100 + n, 14, "[]", &"x".repeat(c));
+                while 20 + r.len() > left {
+                    c -= 1;
+                    r = ev(n, 1, 100 + n, 14, "[]", &"x".repeat(c));
+                }
+                assert_eq!(20 + r.len(), left, "could not size the filler frame");
+                r
+            } else {
+                ev(n, 1, 100 + n, 14, "[]", "filler")
+            };
+            used += 20 + rec.len();
+            let last = used == seg;
+            if last && !second_batch {
+                // The boundary frame and the next one in one batch.
+                write(&mut w, &[rec, ev(n + 1, 1, 100 + n + 1, 14, "[]", "after the boundary")]);
+                expect.push(n);
+                expect.push(n + 1);
+                break;
+            }
+            write(&mut w, &[rec]);
+            expect.push(n);
+            n += 1;
+            if last {
+                write(&mut w, &[ev(n, 1, 100 + n, 14, "[]", "after the boundary")]);
+                expect.push(n);
+                break;
+            }
+        }
+        let check = |store: &Store, when: &str| {
+            let v = store.snapshot();
+            for &k in &expect {
+                let seq = v.lookup_id(&id_of(k)).unwrap_or_else(|| panic!("event {k} missing {when}"));
+                assert_eq!(v.record(seq).unwrap().id(), &id_of(k), "event {k} reads as something else {when}");
+            }
+        };
+        check(&store, "before the restart");
+        drop((store, w));
+        let (store, _w) = Store::open(&dir, o.clone()).unwrap();
+        check(&store, "after the restart");
+        for f in std::fs::read_dir(dir.join("log")).unwrap().flatten() {
+            if f.path().extension().is_some_and(|e| e == "log") {
+                assert_eq!(f.metadata().unwrap().len(), seg as u64, "{} grew past its segment size", f.path().display());
+            }
+        }
+    }
 }
 
 /// Deterministic xorshift for reproducible random tests.
@@ -378,6 +772,23 @@ fn segment_size_cannot_change() {
     let err = Store::open(&dir, other).err().expect("must refuse");
     assert!(err.to_string().contains("segment size"), "{err}");
     assert!(Store::open(&dir, opts()).is_ok());
+}
+
+/// Found by the crash torture: a kill while the very first open wrote `meta`
+/// left it empty, and every later start refused the folder as an
+/// "unsupported data format". The file is now written atomically, and an
+/// empty one (from an older version) means the store was never created.
+#[test]
+fn a_crash_while_creating_the_store_does_not_brick_it() {
+    let dir = tmpdir("meta-empty");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("meta"), "").unwrap();
+    let (store, mut w) = Store::open(&dir, opts()).expect("an empty meta file is a store not yet created");
+    write(&mut w, &[ev(1, 1, 100, 14, "[]", "x")]);
+    drop((store, w));
+    assert!(std::fs::read_to_string(dir.join("meta")).unwrap().contains("format"));
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(ids(&store, "{}", 10), vec![id_of(1)]);
 }
 
 #[test]
@@ -1395,4 +1806,140 @@ fn counts_take_each_event_once_whatever_its_keys() {
     }
     drop((store, w));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store of a few events, flushed and checkpointed, then closed: the
+/// starting point for the damage tests below.
+fn damaged_store(name: &str) -> PathBuf {
+    let dir = tmpdir(name);
+    let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+    let recs: Vec<Vec<u8>> = (0..20).map(|n| ev(n, (n % 3) as u8 + 1, 100 + n, 1, "[]", &format!("event {n}"))).collect();
+    write(&mut w, &recs);
+    write(&mut w, &[ev(20, 1, 200, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 3)), "")]);
+    w.flush_all().unwrap();
+    w.write_checkpoint().unwrap();
+    dir
+}
+
+fn patch(path: &std::path::Path, off: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    std::fs::OpenOptions::new().write(true).open(path).unwrap().write_all_at(bytes, off).unwrap();
+}
+
+fn read_at(path: &std::path::Path, off: u64, len: usize) -> Vec<u8> {
+    use std::os::unix::fs::FileExt;
+    let mut b = vec![0u8; len];
+    std::fs::File::open(path).unwrap().read_exact_at(&mut b, off).unwrap();
+    b
+}
+
+/// Found by the adversarial suite's damage tests: a damaged `locs` entry made
+/// one event read as another (its id looked up to the other's record, and
+/// queries returned it). A record whose frame is not its own is now missing.
+#[test]
+fn a_damaged_location_reads_as_missing_not_as_another_event() {
+    let dir = damaged_store("damaged-locs");
+    // Event 5's location now names event 6's frame.
+    let locs = dir.join("locs");
+    let six = read_at(&locs, 6 * 8, 8);
+    patch(&locs, 5 * 8, &six);
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    let v = store.snapshot();
+    assert!(v.record(5).is_none(), "seq 5 reads as another event");
+    assert_eq!(v.record(6).map(|r| *r.id()), Some(id_of(6)));
+    let got = ids(&store, r#"{"kinds":[1]}"#, 100);
+    assert!(!got.contains(&id_of(5)), "a damaged record was served");
+    assert_eq!(got.iter().filter(|&&i| i == id_of(6)).count(), 1, "another event served twice");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Found by the adversarial suite's damage tests: a record whose frame was
+/// zeroed (or whose segment was cut) panicked the reader that met it. It is
+/// now missing from answers.
+#[test]
+fn a_zeroed_frame_is_missing_not_a_panic() {
+    let dir = damaged_store("damaged-frame");
+    let off = u64::from_le_bytes(read_at(&dir.join("locs"), 7 * 8, 8).try_into().unwrap());
+    patch(&dir.join("log").join("00000000.log"), off, &[0u8; 64]);
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    let got = ids(&store, r#"{"kinds":[1]}"#, 100);
+    assert!(!got.contains(&id_of(7)));
+    assert_eq!(got.len(), 18, "the 20 events but the deleted one and the zeroed one");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Found by the adversarial suite's damage tests: a flipped bit in `dead.bits`
+/// brought a deleted event back (or hid a live one), silently. `dead.bits`
+/// now carries a checksum, and a damaged one is refused.
+#[test]
+fn a_damaged_dead_set_is_refused() {
+    let dir = damaged_store("damaged-dead");
+    let bits = dir.join("dead.bits");
+    assert_eq!(std::fs::metadata(&bits).unwrap().len() % 8, 4, "dead.bits has its checksum");
+    let b = read_at(&bits, 0, 1)[0];
+    patch(&bits, 0, &[b ^ 0b1000]);
+    match Store::open(&dir, opts()) {
+        Ok(_) => panic!("a damaged dead.bits was accepted"),
+        Err(e) => assert!(e.to_string().contains("dead.bits"), "{e}"),
+    }
+    // Garbage padded to whole words looks like the older form, without a
+    // checksum: it is longer than the log, and refused.
+    patch(&bits, 0, &[0x5Au8; 4096]);
+    assert!(Store::open(&dir, opts()).is_err(), "a garbled dead.bits was accepted");
+    // So does one cut to whole words: shorter than the log it covers.
+    std::fs::OpenOptions::new().write(true).open(&bits).unwrap().set_len(0).unwrap();
+    assert!(Store::open(&dir, opts()).is_err(), "a cut dead.bits was accepted");
+    // And one without it is refused too: every removal would be undone.
+    std::fs::remove_file(&bits).unwrap();
+    assert!(Store::open(&dir, opts()).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Found by the adversarial suite's power-cut torture: a batch spanning two
+/// log segments, cut by a power loss that kept its frames in the second
+/// segment and lost those in the first. The store refused to open ("corrupt
+/// frame inside sealed segment") when the lost page held a torn frame, and
+/// when it read as zeros replayed the second segment's frames: seqs whose
+/// frames were gone came back as live events that could not be read. The log
+/// now ends at the first torn or out-of-sequence frame, in any segment.
+#[test]
+fn a_batch_torn_across_two_segments_is_dropped_whole() {
+    let dir = tmpdir("torn-across");
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    let seg0 = dir.join("log").join("00000000.log");
+    let used = |p: &std::path::Path| std::fs::read(p).map_or(0, |b| b.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1));
+    // Fill the first segment to within a few frames of its end.
+    let mut n = 0;
+    while used(&seg0) < 60 * 1024 {
+        write(&mut w, &[ev(n, 1, 100 + n, 1, "[]", &"a".repeat(900))]);
+        n += 1;
+    }
+    let before = w.next_seq();
+    let used0 = used(&seg0);
+    let batch: Vec<Vec<u8>> = (1000..1020).map(|i| ev(i, 2, 300 + i, 1, "[]", &"b".repeat(900))).collect();
+    write(&mut w, &batch);
+    drop((store, w));
+    let seg1 = dir.join("log").join("00000001.log");
+    assert!(used(&seg1) > 0, "the batch reaches the second segment");
+    // The power cut: the batch's frames in the first segment are lost, those
+    // in the second kept.
+    let from = used0 as u64;
+    let len = std::fs::metadata(&seg0).unwrap().len();
+    patch(&seg0, from, &vec![0u8; (len - from) as usize]);
+    let (store, mut w) = Store::open(&dir, opts()).unwrap();
+    let next = w.next_seq();
+    assert!((before..before + 20).contains(&next), "next seq {next} after a batch from {before} was torn");
+    let v = store.snapshot();
+    for s in 0..next {
+        assert!(v.record(s).is_some(), "seq {s} is live but cannot be read");
+    }
+    drop(v);
+    // Writes go on from there, and a restart finds exactly them.
+    write(&mut w, &[ev(5000, 3, 900, 1, "[]", "after")]);
+    drop((store, w));
+    let (store, w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(w.next_seq(), next + 1);
+    assert!(ids(&store, r#"{"kinds":[1]}"#, 1000).contains(&id_of(5000)));
+    drop((store, w));
+    let _ = std::fs::remove_dir_all(dir);
 }

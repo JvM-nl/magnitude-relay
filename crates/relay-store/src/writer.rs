@@ -79,6 +79,7 @@ impl SyncTicket {
         for f in &self.files {
             f.sync()?;
         }
+        crash_point!("ticket.synced");
         self.durable.fetch_max(self.seq_end, Ordering::AcqRel);
         self.synced.fetch_max(self.epoch, Ordering::AcqRel);
         Ok(())
@@ -114,6 +115,19 @@ const MERGE_RATIO: u64 = 4;
 /// Events an operator removal kills per commit: enough to amortise the sync,
 /// few enough that the writer is never away from client batches for long.
 pub const DELETE_BATCH: usize = 4096;
+
+/// Marks an offset queued for zeroing as "content only" (offsets stay below
+/// 2^56, see `log::COLD_BASE`).
+const SCRUB: u64 = 1 << 63;
+
+/// How long a killed record the last checkpoint does not cover may keep its
+/// bytes before a checkpoint (or a flush) is started to cover it (see
+/// `zero_when_covered`).
+const ZERO_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a store must be idle before it syncs, itself, the dead flags that
+/// zeroing waits for (see `Writer::maintain`).
+const IDLE_SYNC: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A segment tier: segments within a factor of 4 in size share a level, and a
 /// level holding this many is merged into one.
@@ -170,6 +184,36 @@ pub struct Writer {
     /// files the backup lacks) until the backup ends.
     backup_hold: bool,
     held_done: Vec<Done>,
+    /// Killed records whose bytes must stay until a checkpoint covers them:
+    /// (seq, offset, when). Released once a checkpoint is written with `seq`
+    /// below its `covered`; one is forced after `ZERO_WAIT`.
+    ///
+    /// - Rule-bearing records (replaceable, addressable, deletions, vanish
+    ///   requests) in the log tail: after a crash before the next flush, the
+    ///   replayed log rebuilds what they decided (the slot a replacement took
+    ///   from an older event, a deletion's tombstones, a vanish) from their
+    ///   bytes. Their content is scrubbed as soon as no reader can see them
+    ///   (see `SCRUB`).
+    /// - Operator kills of records older than the tail: nothing replays their
+    ///   frames' dead flags, so until a checkpoint records the kill a crash
+    ///   brings them back. They are not flagged either: a live record with a
+    ///   dead flag would be dropped by the next log compaction.
+    /// - Kills whose dead flag could not be written.
+    ///
+    /// Other records are flagged dead and zeroed whole at once.
+    zero_when_covered: Vec<(u64, u64, std::time::Instant)>,
+    /// Dead flags not yet written: (seq, offset, the killing batch's epoch,
+    /// scrub). A batch's frames and the flags of what it kills are written in
+    /// the same unsynced stretch, and a power cut may keep any of those pages
+    /// and lose others: a flag that outlived its killer would kill an
+    /// acknowledged event at the next replay, or (on an older frame) make the
+    /// next log compaction drop a live one. So a flag is written only once its
+    /// batch is durable; until then the kill lives in memory (and, if the
+    /// process dies, is re-derived from the log by `repair`).
+    flags_due: Vec<(u64, u64, u64, bool)>,
+    /// When the last batch was published: a store idle for `IDLE_SYNC` syncs
+    /// what zeroing waits for itself, as no batch's sync will.
+    last_publish: std::time::Instant,
     scratch: Vec<u8>,
 }
 
@@ -186,6 +230,8 @@ struct Batch {
     new: Vec<Vec<u8>>,
     kills: Vec<u64>,
     killed: HashSet<u64>,
+    /// An operator's removal: its kills are durable only once checkpointed.
+    operator: bool,
 }
 
 impl Batch {
@@ -198,6 +244,7 @@ impl Batch {
             new: Vec::new(),
             kills: Vec::new(),
             killed: HashSet::new(),
+            operator: false,
         }
     }
 
@@ -385,8 +432,23 @@ impl Writer {
             intent: (Vec::new(), Vec::new()),
             backup_hold: false,
             held_done: Vec::new(),
+            zero_when_covered: Vec::new(),
+            flags_due: Vec::new(),
+            last_publish: std::time::Instant::now(),
             scratch: Vec::new(),
         })
+    }
+
+    /// Lets the background worker finish what it is doing, then stop, so the
+    /// directory is quiet when this returns (dropping the writer instead
+    /// stops the job in progress part way, which the next open finishes or
+    /// discards).
+    pub fn close(mut self) {
+        let (tx, _) = std::sync::mpsc::channel();
+        drop(std::mem::replace(&mut self.jobs, tx));
+        if let Some(h) = self.bg.take() {
+            let _ = h.join();
+        }
     }
 
     pub fn current(&self) -> Arc<Version> {
@@ -528,13 +590,23 @@ impl Writer {
     /// Writes a batch's new records to the log (not yet synced).
     fn append(&mut self, b: Batch) -> io::Result<Staged> {
         let base_count = self.next_seq;
+        let start = self.log.head();
         let mut offs = Vec::with_capacity(b.new.len());
-        for (i, rec) in b.new.iter().enumerate() {
-            offs.push(self.log.append(base_count + i as u64, rec)?);
-        }
-        self.log.flush()?;
-        for (i, &off) in offs.iter().enumerate() {
-            self.locs.set(base_count + i as u64, off)?;
+        let written = (|| {
+            for (i, rec) in b.new.iter().enumerate() {
+                offs.push(self.log.append(base_count + i as u64, rec)?);
+            }
+            self.log.flush()?;
+            crash_point!("writer.appended");
+            for (i, &off) in offs.iter().enumerate() {
+                self.locs.set(base_count + i as u64, off)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = written {
+            // Nothing of the batch happened: its seqs and log space go to the next.
+            self.log.abandon(start);
+            return Err(e);
         }
         self.next_seq += b.new.len() as u64;
         Ok(Staged { b, offs, base_count })
@@ -556,11 +628,29 @@ impl Writer {
         }
         self.epoch += 1;
         let mut zero = Vec::with_capacity(b.kills.len());
+        let mut later = Vec::new();
         for &seq in &b.kills {
             let off = if seq >= base_count { offs[(seq - base_count) as usize] } else { locs::get(&b.base.locs, seq) };
-            self.log.mark_dead(off)?;
-            zero.push(off);
+            let scrub = seq >= self.covered && keys::rule_bearing(b.record(seq), &self.vanish);
+            if scrub {
+                later.push((seq, off, std::time::Instant::now()));
+            }
+            if b.operator && seq < self.covered {
+                if !scrub {
+                    later.push((seq, off, std::time::Instant::now()));
+                }
+            } else if !b.new.is_empty() {
+                self.flags_due.push((seq, off, self.epoch, scrub));
+            } else if self.log.mark_dead(off).is_ok() {
+                zero.push(if scrub { off | SCRUB } else { off });
+            } else if !scrub {
+                // A kill whose flag cannot be written (a failing disk) happens
+                // all the same: a restart re-derives a rule's kill from the log,
+                // and the next checkpoint records any kill. Its bytes stay until then.
+                later.push((seq, off, std::time::Instant::now()));
+            }
         }
+        crash_point!("writer.marked_dead");
         let mut t = std::time::Instant::now();
         let files = if self.opts.sync { self.log.take_touched()? } else { self.log.flush().map(|_| Vec::new())? };
         lap(0, &mut t);
@@ -579,9 +669,16 @@ impl Writer {
             lap(2, &mut t);
         }
         drop(self.publish());
+        crash_point!("writer.published");
+        self.last_publish = std::time::Instant::now();
+        self.zero_when_covered.extend(later);
         self.defer_zero(zero);
-        self.reclaim()?;
-        self.maybe_flush()?;
+        // The batch is published and owes only its sync: housekeeping that
+        // fails now (a full disk) must not make it look failed. It is tried
+        // again after the next batch.
+        if let Err(e) = self.reclaim().and_then(|()| self.maybe_flush()) {
+            eprintln!("store: after a write: {e}");
+        }
         lap(3, &mut t);
         Ok(self.ticket(files))
     }
@@ -603,28 +700,38 @@ impl Writer {
         Ok(())
     }
 
-    /// Kills seqs outside of a client batch (repair, expiry sweeps).
+    /// Kills seqs outside of a client batch (repair, expiry sweeps: a restart
+    /// re-derives these).
     pub(crate) fn kill_seqs(&mut self, seqs: &[u64]) -> io::Result<()> {
+        self.kill_seqs_as(seqs, false)
+    }
+
+    fn kill_seqs_as(&mut self, seqs: &[u64], operator: bool) -> io::Result<()> {
         if seqs.is_empty() {
             return Ok(());
         }
         let mut b = Batch::new(self.current());
+        b.operator = operator;
         for &s in seqs {
             b.kill(s);
         }
-        self.commit(b)
+        self.commit(b)?;
+        crash_point!("writer.killed");
+        Ok(())
     }
 
     /// Kills whichever of `seqs` are still live, in one commit. Returns how many were.
-    /// The kills reach disk as dead flags in the log but not yet in a checkpoint:
-    /// call [`write_checkpoint`](Self::write_checkpoint) once the last batch is in.
+    /// The kills are not durable until a checkpoint records them (only kills in
+    /// the log tail reach disk before, as dead flags): call
+    /// [`write_checkpoint`](Self::write_checkpoint) once the last batch is in.
+    /// Until then their bytes stay, so a crash brings them back whole.
     pub fn kill_live(&mut self, seqs: &[u64]) -> io::Result<usize> {
         let v = self.current();
         let mut live: Vec<u64> = seqs.iter().copied().filter(|&s| v.is_live(s)).collect();
         drop(v);
         live.sort_unstable();
         live.dedup();
-        self.kill_seqs(&live)?;
+        self.kill_seqs_as(&live, true)?;
         Ok(live.len())
     }
 
@@ -755,10 +862,47 @@ impl Writer {
         }
     }
 
+    /// Writes the dead flags of kills whose batch is now durable (see
+    /// `flags_due`). They form an epoch of their own: what they let zero
+    /// waits until they are synced too.
+    fn write_due_flags(&mut self) {
+        let synced = self.synced.load(Ordering::Acquire);
+        let n = self.flags_due.iter().take_while(|f| f.2 <= synced).count();
+        if n == 0 {
+            return;
+        }
+        self.epoch += 1;
+        let mut zero = Vec::with_capacity(n);
+        for (seq, off, _, scrub) in self.flags_due.drain(..n).collect::<Vec<_>>() {
+            if self.log.mark_dead(off).is_ok() {
+                zero.push(if scrub { off | SCRUB } else { off });
+            } else if !scrub {
+                self.zero_when_covered.push((seq, off, std::time::Instant::now()));
+            }
+        }
+        crash_point!("writer.flagged");
+        self.defer_zero(zero);
+    }
+
     /// Takes in finished background work. Called before every batch and on idle ticks.
     pub fn maintain(&mut self) -> io::Result<()> {
+        self.write_due_flags();
         while let Ok(d) = self.done.try_recv() {
             self.finish_job(d)?;
+        }
+        // Deleted bytes waiting only for a sync that no batch is coming to do.
+        if self.last_publish.elapsed() >= IDLE_SYNC && self.pending_zero.front().is_some_and(|z| z.3 > self.synced.load(Ordering::Acquire) && z.1.strong_count() == 0) {
+            self.barrier()?;
+        }
+        // Deleted bytes waiting for a checkpoint do not wait for long.
+        if let Some(&(seq, _, at)) = self.zero_when_covered.first() {
+            if at.elapsed() >= ZERO_WAIT {
+                if seq < self.covered {
+                    self.write_checkpoint()?;
+                } else if !self.flushing {
+                    self.start_flush()?;
+                }
+            }
         }
         self.reclaim()?;
         self.step_log_compaction();
@@ -953,11 +1097,12 @@ impl Writer {
         }
         let epoch = self.epoch;
         match self.pending_zero.back_mut() {
-            Some(b) => {
+            // Joining a batch of a later epoch would hold the earlier ones back.
+            Some(b) if b.3 >= epoch || b.2.is_empty() => {
                 b.2.extend(offs);
                 b.3 = b.3.max(epoch);
             }
-            None => {
+            _ => {
                 let cur = self.current();
                 self.pending_zero.push_back((cur.gen, Arc::downgrade(&cur), offs, epoch));
             }
@@ -971,6 +1116,7 @@ impl Writer {
         }
         match d {
             Done::Flushed { seg, frozen, covered, replay_from } => {
+                crash_point!("flush.done");
                 self.mem.drain(..frozen);
                 // A fresh shared filter, of the runs still in memory: older
                 // versions keep the one that covers theirs.
@@ -981,11 +1127,13 @@ impl Writer {
                 self.covered = covered;
                 self.replay_from = replay_from;
                 drop(self.publish());
+                // Also releases the killed records now below `covered`.
                 self.write_checkpoint()?;
                 self.maybe_compact();
                 self.maybe_flush()?;
             }
             Done::Compacted { seg, replaced } => {
+                crash_point!("compact.done");
                 let (gone, keep): (Vec<_>, Vec<_>) = self.segments.drain(..).partition(|s| replaced.contains(&s.id));
                 self.segments = keep;
                 self.segments.push(seg);
@@ -994,6 +1142,7 @@ impl Writer {
                 // The checkpoint must stop naming the old segments before their
                 // files can be removed (they go when the last snapshot drops them).
                 self.write_checkpoint()?;
+                crash_point!("compact.checkpointed");
                 for s in gone {
                     s.mark_obsolete();
                 }
@@ -1015,10 +1164,12 @@ impl Writer {
                     }
                 }
                 drop(self.publish());
+                crash_point!("logcompact.registered");
                 let reg_gen = self.current().gen;
                 // 2. Record the intent: a crash from here on finishes the exchange at open.
                 self.intent = (intent_cold, retire.clone());
                 self.write_checkpoint()?;
+                crash_point!("logcompact.intent_recorded");
                 // 3. Relink once no reader can hold a version without them.
                 self.log_state = LogState::Waiting { reg_gen, moves, retire };
                 self.step_log_compaction();
@@ -1027,6 +1178,7 @@ impl Writer {
                 let LogState::Relinking { retire } = std::mem::replace(&mut self.log_state, LogState::Idle) else {
                     return Ok(());
                 };
+                crash_point!("relink.done");
                 // Events that died while their copy was being written: the cold
                 // copy dies too, and its bytes go like any other dead record's.
                 let mut zero = Vec::new();
@@ -1048,13 +1200,21 @@ impl Writer {
                 }
                 self.intent = (Vec::new(), Vec::new());
                 drop(self.publish());
+                crash_point!("relink.retired");
                 self.defer_zero(zero);
                 self.write_checkpoint()?;
+                crash_point!("relink.checkpointed");
             }
-            Done::Failed(msg) => {
+            // Each failure resets only its own job's state: a flush and a
+            // compaction can be in flight together, and a flush wrongly taken
+            // for done is drained from the memory runs twice.
+            Done::FlushFailed(msg) => {
                 eprintln!("store: background job failed: {msg}");
                 self.flushing = false;
                 self.frozen = 0;
+            }
+            Done::CompactFailed(msg) => {
+                eprintln!("store: background job failed: {msg}");
                 self.compacting = false;
             }
             Done::LogFailed(msg) => {
@@ -1115,11 +1275,25 @@ impl Writer {
     pub fn write_checkpoint(&mut self) -> io::Result<()> {
         // The dead set may hold kills by batches whose sync is still in flight.
         self.barrier()?;
+        // Their dead flags can go to disk now, and are synced with the rest
+        // (a log frame zeroed later must be flagged, or a replay stops there).
+        if !self.flags_due.is_empty() {
+            self.write_due_flags();
+            self.barrier()?;
+        }
         self.locs.sync()?;
         let dead_tmp = self.dir.join("dead.bits.tmp");
-        std::fs::write(&dead_tmp, self.dead.to_bytes(self.next_seq))?;
+        let mut bits = self.dead.to_bytes(self.next_seq);
+        // A checksum after the words (the length, 4 past a multiple of 8,
+        // tells this form from the older one without).
+        let crc = crate::crc32c::crc32c(&bits);
+        bits.extend_from_slice(&crc.to_le_bytes());
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault::check(&dead_tmp, bits.len())?;
+        std::fs::write(&dead_tmp, bits)?;
         std::fs::File::open(&dead_tmp)?.sync_all()?;
         std::fs::rename(&dead_tmp, self.dir.join("dead.bits"))?;
+        crash_point!("checkpoint.dead_bits");
         let ids: Vec<u64> = self.segments.iter().map(|s| s.id).collect();
         crate::checkpoint::write(
             &self.dir,
@@ -1136,7 +1310,15 @@ impl Writer {
                 intent_cold: self.intent.0.clone(),
                 intent_retire: self.intent.1.clone(),
             },
-        )
+        )?;
+        // Killed records it now covers may lose their bytes.
+        if !self.zero_when_covered.is_empty() {
+            let covered = self.covered;
+            let (ready, wait): (Vec<_>, Vec<_>) = self.zero_when_covered.drain(..).partition(|z| z.0 < covered);
+            self.zero_when_covered = wait;
+            self.defer_zero(ready.into_iter().map(|z| z.1).collect());
+        }
+        Ok(())
     }
 
     fn publish(&mut self) -> Arc<Version> {
@@ -1173,9 +1355,15 @@ impl Writer {
             if w.strong_count() > 0 || *epoch > synced {
                 break;
             }
-            let (_, _, offs, _) = self.pending_zero.pop_front().unwrap();
-            for off in offs {
-                self.log.zero_record(off)?;
+            let (gen, w, offs, epoch) = self.pending_zero.pop_front().unwrap();
+            for (i, &off) in offs.iter().enumerate() {
+                crash_point!("reclaim.zeroing");
+                let r = if off & SCRUB != 0 { self.log.scrub_content(off & !SCRUB) } else { self.log.zero_record(off) };
+                if let Err(e) = r {
+                    // The rest waits for the next call.
+                    self.pending_zero.push_front((gen, w, offs[i..].to_vec(), epoch));
+                    return Err(e);
+                }
             }
         }
         Ok(())
@@ -1185,61 +1373,112 @@ impl Writer {
     /// tail just replayed): a crash between syncs can leave a replaced event live,
     /// or a deletion unapplied. Old seqs killed by tail events are found this way
     /// too, since only the tail is replayed.
+    ///
+    /// Such an old seq may also have had its record zeroed before the crash
+    /// (its kill was synced, but the checkpoint that would have recorded it in
+    /// `dead.bits` never came): its frame's dead flag says so, and its bytes
+    /// must not take part in any decision.
     pub(crate) fn repair(&mut self, tail: &[Vec<u8>]) -> io::Result<usize> {
         let v = self.current();
         let mut kills: Vec<u64> = Vec::new();
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        for key in tail {
-            match key[0] {
-                T_ADDR => {
-                    let p = &key[..key.len() - 16];
-                    if !seen.insert(p.to_vec()) {
-                        continue;
-                    }
-                    let mut members = Vec::new();
-                    v.for_prefix(p, |k| {
-                        let s = seq_of(k);
-                        if v.is_live(s) {
-                            members.push((created_at_of(k), s));
+        // The deletions, vanishes and duplicate copies first: a slot's member
+        // they kill must not then win the slot from one stored after it.
+        let mut killed: HashSet<u64> = HashSet::new();
+        for pass in 0..2 {
+            if pass == 1 {
+                killed.extend(kills.iter().copied());
+            }
+            for key in tail {
+                if (key[0] == T_ADDR) != (pass == 1) {
+                    continue;
+                }
+                match key[0] {
+                    T_ADDR => {
+                        let p = &key[..key.len() - 16];
+                        if !seen.insert(p.to_vec()) {
+                            continue;
                         }
-                    });
-                    if members.len() > 1 {
-                        let best = *members
-                            .iter()
-                            .min_by(|a, b| b.0.cmp(&a.0).then_with(|| v.record_unchecked(a.1).id().cmp(v.record_unchecked(b.1).id())))
-                            .unwrap();
-                        kills.extend(members.iter().filter(|m| m.1 != best.1).map(|m| m.1));
-                    }
-                }
-                T_DELETED => {
-                    let target: [u8; 32] = key[1..33].try_into().unwrap();
-                    let deleter: [u8; 32] = key[33..65].try_into().unwrap();
-                    if let Some(t) = v.lookup_id(&target) {
-                        if deletable_by(v.record_unchecked(t), &deleter) {
-                            kills.push(t);
+                        // Every member the index still has, live or not: (created_at, seq, live).
+                        let mut all = Vec::new();
+                        v.for_prefix(p, |k| {
+                            let s = seq_of(k);
+                            all.push((created_at_of(k), s, v.is_live(s)));
+                        });
+                        // A dead member's record may be gone with its segment.
+                        let id = |s: u64| v.segs.file(locs::get(&v.locs, s) / v.seg_size).map(|_| *v.record_unchecked(s).id());
+                        let mut members = Vec::new();
+                        for &(ca, s, live) in &all {
+                            if !live || killed.contains(&s) {
+                                continue;
+                            }
+                            // A newer member stored after it replaced it, and that
+                            // holds even if the newer one has died since (deleted, its
+                            // flag on disk, while the replaced one's kill was lost).
+                            let replaced = all.iter().any(|&(ca2, s2, _)| s2 > s && (ca2 > ca || (ca2 == ca && id(s2).is_none_or(|i| Some(i) < id(s)))));
+                            if replaced || v.frame_dead(s) {
+                                kills.push(s);
+                            } else {
+                                members.push((ca, s));
+                            }
+                        }
+                        if members.len() > 1 {
+                            let best = *members
+                                .iter()
+                                .min_by(|a, b| b.0.cmp(&a.0).then_with(|| v.record_unchecked(a.1).id().cmp(v.record_unchecked(b.1).id())))
+                                .unwrap();
+                            kills.extend(members.iter().filter(|m| m.1 != best.1).map(|m| m.1));
                         }
                     }
-                }
-                T_ADDR_DELETED => {
-                    let upto = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
-                    let mut p = Vec::with_capacity(key.len());
-                    p.push(T_ADDR);
-                    p.extend_from_slice(&key[1..key.len() - 8]);
-                    v.for_prefix(&p, |ak| {
-                        let s = seq_of(ak);
-                        if created_at_of(ak) <= upto && v.is_live(s) {
-                            kills.push(s);
+                    T_ID => {
+                        // Two live copies of one event: the older was removed (by an
+                        // operator, whose kills last only from the next checkpoint)
+                        // before the newer was stored, and the crash forgot it.
+                        let p = &key[..33];
+                        if !seen.insert(p.to_vec()) {
+                            continue;
                         }
-                    });
+                        let mut copies = Vec::new();
+                        v.for_prefix(p, |k| {
+                            let s = seq_of(k);
+                            if v.is_live(s) {
+                                copies.push(s);
+                            }
+                        });
+                        if let Some(&newest) = copies.iter().max() {
+                            kills.extend(copies.iter().filter(|&&s| s != newest));
+                        }
+                    }
+                    T_DELETED => {
+                        let target: [u8; 32] = key[1..33].try_into().unwrap();
+                        let deleter: [u8; 32] = key[33..65].try_into().unwrap();
+                        if let Some(t) = v.lookup_id(&target) {
+                            if v.frame_dead(t) || deletable_by(v.record_unchecked(t), &deleter) {
+                                kills.push(t);
+                            }
+                        }
+                    }
+                    T_ADDR_DELETED => {
+                        let upto = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                        let mut p = Vec::with_capacity(key.len());
+                        p.push(T_ADDR);
+                        p.extend_from_slice(&key[1..key.len() - 8]);
+                        v.for_prefix(&p, |ak| {
+                            let s = seq_of(ak);
+                            if created_at_of(ak) <= upto && v.is_live(s) {
+                                kills.push(s);
+                            }
+                        });
+                    }
+                    T_VANISH => {
+                        let pk: [u8; 32] = key[1..33].try_into().unwrap();
+                        let upto = u64::from_be_bytes(key[33..41].try_into().unwrap());
+                        let mut b = Batch::new(v.clone());
+                        vanish_kills(&mut b, &pk, upto);
+                        kills.extend(b.kills);
+                    }
+                    _ => {}
                 }
-                T_VANISH => {
-                    let pk: [u8; 32] = key[1..33].try_into().unwrap();
-                    let upto = u64::from_be_bytes(key[33..41].try_into().unwrap());
-                    let mut b = Batch::new(v.clone());
-                    vanish_kills(&mut b, &pk, upto);
-                    kills.extend(b.kills);
-                }
-                _ => {}
             }
         }
         kills.sort_unstable();
@@ -1311,5 +1550,45 @@ fn vanish_kills(b: &mut Batch, pk: &[u8; 32], upto: u64) {
     }
     for s in kills {
         b.kill(s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fault_tests::{ev, id_of, opts, tmpdir, write};
+    use crate::Store;
+
+    /// Found by the adversarial suite's disk-fault torture: a failed index
+    /// compaction also reset the state of a flush in flight. A second flush
+    /// then started over the same memory runs, and when the two came back the
+    /// first drained runs the second had also written (keys indexed twice),
+    /// and the second drained runs that were no longer there: a panic in the
+    /// writer.
+    #[test]
+    fn a_failed_compaction_leaves_a_flush_in_flight_alone() {
+        let dir = tmpdir("compact-fails");
+        let (store, mut w) = Store::open(&dir, opts()).unwrap();
+        write(&mut w, &[ev(1, 1, 10)]).unwrap();
+        w.start_flush().unwrap();
+        // Word of a compaction that failed arrives while the flush runs.
+        w.compacting = true;
+        w.finish_job(Done::CompactFailed("compaction into segment 9: no space".into())).unwrap();
+        assert!(w.flushing && !w.compacting);
+        write(&mut w, &[ev(2, 1, 10)]).unwrap();
+        write(&mut w, &[ev(3, 1, 10)]).unwrap();
+        w.flush_all().unwrap();
+        w.flush_all().unwrap();
+        write(&mut w, &[ev(4, 1, 10)]).unwrap();
+        w.flush_all().unwrap();
+        let v = store.snapshot();
+        for n in 1..=4 {
+            assert!(v.lookup_id(&id_of(n)).is_some(), "event {n} is not in the index");
+        }
+        let f = relay_proto::Filter::parse(&mut relay_proto::json::Scanner::new(r#"{"kinds":[1]}"#)).unwrap();
+        assert_eq!(v.query(&f, 100, 10_000).len(), 4, "each event once");
+        drop(v);
+        drop((store, w));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

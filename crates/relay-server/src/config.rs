@@ -1473,7 +1473,9 @@ const TEMPLATE: &str = r##"# {name} settings
 # events_per_minute_per_ip = 1200
 
 # Memory one connection may use for messages waiting to be sent. A client that
-# reads too slowly to stay under this is disconnected. At least max_message_bytes.
+# reads too slowly to stay under this is disconnected, and a REQ whose stored
+# events add up to more ends with CLOSED (ask for fewer at a time). At least
+# max_message_bytes.
 # outbound_buffer_bytes = 33554432
 
 [store]

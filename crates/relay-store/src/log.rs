@@ -58,14 +58,22 @@ pub fn cold_path(dir: &Path, n: u64) -> PathBuf {
     dir.join("cold").join(format!("{n:08}.log"))
 }
 
-/// Reads the record at global offset `off`. The caller guarantees `off` is a
-/// published, live frame.
+/// The record at global offset `off`, if the frame there is `seq`'s and whole
+/// by its header. After damage on disk, what `locs` points at may be another
+/// frame, a zeroed or cut one, or a segment that is gone: such a record is
+/// missing, never another event's.
 #[inline]
-pub fn record_at(segs: &Segs, seg_size: u64, off: u64) -> &[u8] {
-    let seg = segs.file(off / seg_size).expect("the segment of a live record");
+pub fn record_of(segs: &Segs, seg_size: u64, off: u64, seq: u64) -> Option<&[u8]> {
+    let seg = segs.file(off / seg_size)?;
     let o = (off % seg_size) as usize;
+    if o + FRAME_HEADER > seg_size as usize {
+        return None;
+    }
     let len = seg.read_u32(o) as usize;
-    seg.slice(o + FRAME_HEADER, len)
+    if seg.read_u64(o + 8) != seq || len < relay_proto::record::HEADER_LEN || o + FRAME_HEADER + len > seg_size as usize {
+        return None;
+    }
+    Some(seg.slice(o + FRAME_HEADER, len))
 }
 
 /// Whether the frame at `off` still matches the checksum it was written with.
@@ -76,11 +84,19 @@ pub fn frame_intact(segs: &Segs, seg_size: u64, off: u64) -> bool {
     len <= MAX_RECORD && o + FRAME_HEADER + len <= seg_size as usize && crc32c(seg.slice(o + FRAME_HEADER, len)) == seg.read_u32(o + 16)
 }
 
+/// Whether the frame at global offset `off` is flagged dead (false when its
+/// segment is gone).
+pub fn frame_dead(segs: &Segs, seg_size: u64, off: u64) -> bool {
+    segs.file(off / seg_size).is_some_and(|seg| seg.read_u32((off % seg_size) as usize + 4) & FLAG_DEAD != 0)
+}
+
 /// One frame found while replaying.
 pub struct Frame<'a> {
     pub off: u64,
     pub seq: u64,
     pub dead: bool,
+    /// The record's bytes match its checksum (a dead record may be zeroed).
+    pub intact: bool,
     pub record: &'a [u8],
 }
 
@@ -104,13 +120,19 @@ pub struct LogWriter {
     buf_start: u64,
     /// Global segment indexes written since the last sync.
     touched: BTreeSet<u64>,
+    /// What an append that failed may have left on disk from the head on
+    /// (global offsets), still to be zeroed: see `abandon`.
+    junk: Option<(u64, u64)>,
 }
 
 /// Scans the frames of one segment from byte `o`, calling `f` for each good one.
 /// Returns where the good frames end and whether they ended cleanly. With
 /// `trust_len` (a segment written whole and synced before use), a crc mismatch
 /// is a record zeroed after its copy was taken: reported dead, not an end.
-fn scan(seg: &MappedFile, seg_size: u64, base: u64, mut o: usize, trust_len: bool, f: &mut impl FnMut(Frame<'_>)) -> (usize, bool) {
+///
+/// With `expect`, frames must carry consecutive seqs from it on: one that
+/// does not ends the scan as not clean.
+fn scan(seg: &MappedFile, seg_size: u64, base: u64, mut o: usize, trust_len: bool, mut expect: Option<&mut u64>, f: &mut impl FnMut(Frame<'_>)) -> (usize, bool) {
     loop {
         if o + FRAME_HEADER > seg_size as usize {
             return (o, true);
@@ -126,21 +148,48 @@ fn scan(seg: &MappedFile, seg_size: u64, base: u64, mut o: usize, trust_len: boo
             return (o, false);
         }
         let record = seg.slice(o + FRAME_HEADER, len);
+        let intact = crc32c(record) == crc;
         let mut dead = flags & FLAG_DEAD != 0;
-        if !dead && crc32c(record) != crc {
+        if !dead && !intact {
             if !trust_len {
                 return (o, false);
             }
             dead = true;
         }
-        f(Frame { off: base + o as u64, seq, dead, record });
+        if let Some(e) = expect.as_deref_mut() {
+            if seq != *e {
+                return (o, false);
+            }
+            *e += 1;
+        }
+        f(Frame { off: base + o as u64, seq, dead, intact, record });
         o += FRAME_HEADER + len;
     }
 }
 
+/// The seqs of every frame flagged dead in the segment file at `path`. For
+/// segments an interrupted exchange replaces: a kill made after their copy
+/// was taken is recorded only in their flags.
+pub fn flagged_dead(path: &Path, seg_size: u64) -> io::Result<Vec<u64>> {
+    let seg = MappedFile::open(path, seg_size as usize)?;
+    let mut out = Vec::new();
+    let mut o = 0usize;
+    while o + FRAME_HEADER <= seg_size as usize {
+        let len = seg.read_u32(o) as usize;
+        if len == 0 || len > MAX_RECORD || o + FRAME_HEADER + len > seg_size as usize {
+            break;
+        }
+        if seg.read_u32(o + 4) & FLAG_DEAD != 0 {
+            out.push(seg.read_u64(o + 8));
+        }
+        o += FRAME_HEADER + len;
+    }
+    Ok(out)
+}
+
 /// Every frame of a cold segment (used when finishing an interrupted compaction).
 pub fn scan_cold(seg: &MappedFile, seg_size: u64, n: u64, mut f: impl FnMut(Frame<'_>)) {
-    scan(seg, seg_size, (COLD_BASE + n) * seg_size, 0, true, &mut f);
+    scan(seg, seg_size, (COLD_BASE + n) * seg_size, 0, true, None, &mut f);
 }
 
 /// Every frame of a sealed hot segment, in order (log compaction's input).
@@ -148,7 +197,7 @@ pub fn scan_cold(seg: &MappedFile, seg_size: u64, n: u64, mut f: impl FnMut(Fram
 /// zeroed under the scan (reported dead). False if the frames did not end
 /// cleanly: the segment is damaged and must not be retired.
 pub fn scan_hot(seg: &MappedFile, seg_size: u64, n: u64, mut f: impl FnMut(Frame<'_>)) -> bool {
-    scan(seg, seg_size, n * seg_size, 0, true, &mut f).1
+    scan(seg, seg_size, n * seg_size, 0, true, None, &mut f).1
 }
 
 impl LogWriter {
@@ -158,7 +207,8 @@ impl LogWriter {
     /// `retired` hot segments may be missing (and are removed if present);
     /// `cold` lists the cold segments in use (unlisted ones are leftovers of a
     /// compaction that never finished, and are removed).
-    pub fn open(dir: &Path, seg_size: u64, from: u64, retired: &[u64], cold: &[u64], mut f: impl FnMut(Frame<'_>)) -> io::Result<LogWriter> {
+    /// Replays the log from `from`, whose first frame is seq `first_seq`.
+    pub fn open(dir: &Path, seg_size: u64, from: u64, first_seq: u64, retired: &[u64], cold: &[u64], mut f: impl FnMut(Frame<'_>)) -> io::Result<LogWriter> {
         std::fs::create_dir_all(dir.join("cold"))?;
         let mut names: Vec<u64> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
@@ -202,23 +252,38 @@ impl LogWriter {
         while last > from_seg && hot[last].as_ref().is_none_or(|s| s.read_u32(0) == 0) {
             last -= 1;
         }
+        // The log ends at the first frame that is torn or out of sequence,
+        // whatever segment it is in. A power cut can keep a later page and lose
+        // an earlier one, both unsynced: a batch spanning two segments may be
+        // torn in the first and whole in the second. Nothing from the first
+        // lost frame on was acknowledged (a batch is acknowledged only once it
+        // and every batch before it are synced), so it all goes; replaying the
+        // rest would give seqs whose frames are gone.
         let mut head = 0u64;
+        let mut expect = first_seq;
+        let mut ended = false;
         for (si, slot) in hot.iter().enumerate().take(last + 1).skip(from_seg) {
             let Some(seg) = slot.clone() else { continue };
-            seg.advise(Advice::Sequential);
             let base = si as u64 * seg_size;
+            if ended {
+                seg.zero_from(0)?;
+                continue;
+            }
+            seg.advise(Advice::Sequential);
             let start = if si == from_seg { (from % seg_size) as usize } else { 0 };
-            let (end, clean) = scan(&seg, seg_size, base, start, false, &mut f);
-            if si == last {
+            let (end, clean) = scan(&seg, seg_size, base, start, false, Some(&mut expect), &mut f);
+            seg.advise(Advice::Random);
+            if si == last || !clean {
                 head = base + end as u64;
                 // Whatever follows the last good frame was never acknowledged.
                 if !clean || end < seg_size as usize {
                     seg.zero_from(end as u64)?;
                 }
-            } else if !clean {
-                return Err(io::Error::other(format!("corrupt frame inside sealed segment {si:08}.log at byte {end}")));
+                if si != last {
+                    eprintln!("store: the log ends at byte {end} of {si:08}.log (a torn or out-of-sequence frame); what follows was never acknowledged and is dropped");
+                }
+                ended = true;
             }
-            seg.advise(Advice::Random);
         }
         Ok(LogWriter {
             dir: dir.to_path_buf(),
@@ -230,6 +295,7 @@ impl LogWriter {
             buf: Vec::new(),
             buf_start: head,
             touched: BTreeSet::new(),
+            junk: None,
         })
     }
 
@@ -269,6 +335,9 @@ impl LogWriter {
     /// Queues a frame; returns its global offset. Nothing is on disk until
     /// [`flush`](Self::flush) and [`sync`](Self::sync).
     pub fn append(&mut self, seq: u64, record: &[u8]) -> io::Result<u64> {
+        if self.junk.is_some() {
+            self.clear_junk()?;
+        }
         let frame = FRAME_HEADER + record.len();
         assert!(record.len() <= MAX_RECORD && frame as u64 <= self.seg_size, "record too large for a segment");
         if self.head % self.seg_size + frame as u64 > self.seg_size {
@@ -277,6 +346,12 @@ impl LogWriter {
             self.head = next * self.seg_size;
             self.buf_start = self.head;
             self.ensure_hot(next as usize)?;
+        } else if self.head % self.seg_size == 0 {
+            // The last frame filled its segment exactly (or the log reopened
+            // there): what is buffered belongs to that segment, this frame to
+            // the next one.
+            self.flush()?;
+            self.ensure_hot((self.head / self.seg_size) as usize)?;
         }
         let off = self.head;
         self.buf.extend_from_slice(&(record.len() as u32).to_le_bytes());
@@ -294,10 +369,54 @@ impl LogWriter {
             return Ok(());
         }
         let si = self.buf_start / self.seg_size;
+        crash_point!("log.flushing");
         self.file(si).expect("head segment").write_at(self.buf_start % self.seg_size, &self.buf)?;
         self.touched.insert(si);
         self.buf.clear();
         self.buf_start = self.head;
+        Ok(())
+    }
+
+    /// Forgets the frames queued or written from `start` on by an append that
+    /// failed: the next frame goes to `start` again, under the same seq. What
+    /// the failed append put on disk is zeroed first (now if it can be, else
+    /// before the next append), and synced with the next frames: a restart
+    /// must never replay a frame whose seq was given out again, which would
+    /// point one event's index entries at another's record.
+    pub fn abandon(&mut self, start: u64) {
+        let end = self.head.max(self.junk.map_or(0, |j| j.1));
+        let from = self.junk.map_or(start, |j| j.0.min(start));
+        self.buf.clear();
+        self.head = start;
+        self.buf_start = start;
+        if end > from {
+            self.junk = Some((from, end));
+            let _ = self.clear_junk();
+        }
+    }
+
+    /// Zeroes `junk` from its end back: if that is cut short, what is left is
+    /// still a run of frames straight after the head, which a restart may
+    /// replay as a prefix of the failed batch. Zeroed from the front instead,
+    /// a restart could find frames past a gap, under seqs never given out.
+    fn clear_junk(&mut self) -> io::Result<()> {
+        static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+        while let Some((from, end)) = self.junk {
+            if from >= end {
+                self.junk = None;
+                break;
+            }
+            let si = (end - 1) / self.seg_size;
+            let start = from.max(si * self.seg_size).max(end.saturating_sub(ZEROS.len() as u64));
+            if let Some(seg) = self.file(si).cloned() {
+                let o = start % self.seg_size;
+                if !seg.punch_hole(o, o + (end - start)) {
+                    seg.write_at(o, &ZEROS[..(end - start) as usize])?;
+                }
+                self.touched.insert(si);
+            }
+            self.junk = Some((from, start));
+        }
         Ok(())
     }
 
@@ -320,6 +439,10 @@ impl LogWriter {
         let Some(seg) = self.file(si).cloned() else { return Ok(()) };
         let o = off % self.seg_size;
         let len = seg.read_u32(o as usize) as usize;
+        if o as usize + FRAME_HEADER + len > self.seg_size as usize {
+            // A damaged header: there is no knowing what to zero.
+            return Ok(());
+        }
         self.touched.insert(si);
         // The header stays (its flag says dead). Whole blocks inside the record
         // are given back; the partial ones at its ends are overwritten. Most
@@ -330,11 +453,45 @@ impl LogWriter {
         const BLOCK: u64 = 4096;
         let (body, end) = (o + FRAME_HEADER as u64, o + FRAME_HEADER as u64 + len as u64);
         let (a, b) = (body.next_multiple_of(BLOCK), end / BLOCK * BLOCK);
+        crash_point!("log.zeroing");
         if b > a && seg.punch_hole(a, b) {
             write_zeros(&seg, body, a)?;
             return write_zeros(&seg, b, end);
         }
         write_zeros(&seg, body, end)
+    }
+
+    /// Zeroes a dead record's content but keeps the rest of it (its checksum
+    /// rewritten to match): for a record whose index keys a restart may still
+    /// have to rebuild from the log (see `Writer::zero_when_covered`), while
+    /// what it said leaves the disk at once. One write, checksum and record
+    /// together.
+    pub fn scrub_content(&mut self, off: u64) -> io::Result<()> {
+        let si = off / self.seg_size;
+        let Some(seg) = self.file(si).cloned() else { return Ok(()) };
+        let o = (off % self.seg_size) as usize;
+        let len = seg.read_u32(o) as usize;
+        if o + FRAME_HEADER + len > self.seg_size as usize {
+            return Ok(());
+        }
+        let mut rec = seg.slice(o + FRAME_HEADER, len).to_vec();
+        if crc32c(&rec) != seg.read_u32(o + 16) {
+            // Already zeroed (or damaged): nothing left to keep.
+            return Ok(());
+        }
+        let content = relay_proto::Record(&rec).stored_content();
+        let start = content.as_ptr() as usize - rec.as_ptr() as usize;
+        let end = start + content.len();
+        if start == end {
+            return Ok(());
+        }
+        rec[start..end].fill(0);
+        let mut buf = Vec::with_capacity(4 + len);
+        buf.extend_from_slice(&crc32c(&rec).to_le_bytes());
+        buf.extend_from_slice(&rec);
+        self.touched.insert(si);
+        crash_point!("log.scrubbing");
+        seg.write_at((o + 16) as u64, &buf)
     }
 
     /// Writes queued frames and hands over the segments written since the last
@@ -439,6 +596,7 @@ impl LogWriter {
         let seg = self.hot[si].clone().expect("just ensured");
         while from < to {
             let n = ((to - from) as usize).min(ZEROS.len());
+            crash_point!("log.preparing");
             seg.write_at(from % self.seg_size, &ZEROS[..n])?;
             from += n as u64;
         }

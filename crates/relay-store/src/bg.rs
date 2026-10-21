@@ -51,7 +51,10 @@ pub enum Done {
     /// (hot numbers, or `COLD_BASE + n` for cold ones).
     LogCompacted { runs: Vec<ColdRun>, moves: Vec<(u64, u64)>, retire: Vec<u64> },
     LogRelinked { moves: Vec<(u64, u64)> },
-    Failed(String),
+    /// A flush failed: its memory runs stay, to be flushed again.
+    FlushFailed(String),
+    /// A compaction failed: its input segments stay.
+    CompactFailed(String),
     /// A log compaction or relink failed.
     LogFailed(String),
 }
@@ -80,14 +83,14 @@ pub fn worker(dir: PathBuf, rx: Receiver<Job>, tx: Sender<Done>, stop: Stop) {
                 let srcs = runs.iter().map(|r| Src::Mem { run: r, i: 0 }).collect();
                 match write(&dir, id, srcs, &dead, stop) {
                     Ok(seg) => Done::Flushed { seg, frozen, covered, replay_from },
-                    Err(e) => Done::Failed(format!("flush to segment {id}: {e}")),
+                    Err(e) => Done::FlushFailed(format!("flush to segment {id}: {e}")),
                 }
             }
             Job::Compact { id, segs, dead } => {
                 let srcs = segs.iter().map(|s| Src::Seg(s.range(&[], &[0xFF; 2]))).collect();
                 match write(&dir, id, srcs, &dead, stop) {
                     Ok(seg) => Done::Compacted { seg, replaced: segs.iter().map(|s| s.id).collect() },
-                    Err(e) => Done::Failed(format!("compaction into segment {id}: {e}")),
+                    Err(e) => Done::CompactFailed(format!("compaction into segment {id}: {e}")),
                 }
             }
             Job::LogCompact { hot, first_cold, seg_size, log_dir, dead, version, chunk } => match compact_log(&hot, first_cold, seg_size, &log_dir, &dead, &version, chunk, stop) {
@@ -184,7 +187,9 @@ fn write(dir: &Path, id: u64, mut srcs: Vec<Src<'_>>, dead: &DeadSet, stop: &Ato
         have_last = true;
     }
     w.finish()?;
+    crash_point!("bg.segment_written");
     std::fs::rename(&tmp, &path)?;
+    crash_point!("bg.segment_renamed");
     sync_dir(dir)?;
     Ok(Arc::new(Segment::open(id, &path)?))
 }
@@ -292,6 +297,10 @@ impl<'a> ColdOut<'a> {
         if self.cur.as_ref().is_none_or(|c| c.2 + len > self.seg_size) {
             self.seal()?;
             let f = Arc::new(MappedFile::open(&log::cold_path(self.log_dir, self.next), self.seg_size as usize)?);
+            // A job that failed may have left a file of this number behind (its
+            // numbers are taken again): what it wrote must not show past the end
+            // of what this one writes.
+            f.zero_from(0)?;
             self.cur = Some((self.next, f, 0));
             self.next += 1;
         }
@@ -301,6 +310,7 @@ impl<'a> ColdOut<'a> {
         c.2 += len;
         self.run_bytes += len;
         if self.buf.len() >= 1 << 20 {
+            crash_point!("cold.writing");
             c.1.write_at(self.buf_at, &self.buf)?;
             self.buf_at += self.buf.len() as u64;
             self.buf.clear();
@@ -311,8 +321,10 @@ impl<'a> ColdOut<'a> {
     /// Writes out and syncs the segment being filled.
     fn seal(&mut self) -> io::Result<()> {
         if let Some((n, f, _)) = self.cur.take() {
+            crash_point!("cold.sealing");
             f.write_at(self.buf_at, &self.buf)?;
             f.sync()?;
+            crash_point!("cold.sealed");
             self.buf.clear();
             self.buf_at = 0;
             self.done.push((n, f));
@@ -525,6 +537,7 @@ fn relink(moves: &[(u64, u64)], dead: &DeadSet, locs: &MappedFile, stop: &Atomic
             i += 1;
         }
         locs.write_at(start * 8, &chunk)?;
+        crash_point!("relink.writing");
     }
     locs.sync()
 }

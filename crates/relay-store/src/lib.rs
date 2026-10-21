@@ -10,12 +10,23 @@
 //! runs flush to segment files in the background, and a checkpoint records which
 //! segments cover which part of the log, so a restart replays only the tail.
 
+/// A moment worth crashing at, for the crash tests (see [`fault`]). Expands to
+/// nothing in a normal build.
+macro_rules! crash_point {
+    ($name:literal) => {
+        #[cfg(any(test, feature = "fault-injection"))]
+        $crate::fault::crash_point($name);
+    };
+}
+
 pub mod backup;
 pub mod bloom;
 pub mod bg;
 pub mod checkpoint;
 pub mod crc32c;
 pub mod dead;
+#[cfg(any(test, feature = "fault-injection"))]
+pub mod fault;
 pub mod keys;
 pub mod locs;
 pub mod log;
@@ -24,6 +35,9 @@ pub mod mmap;
 pub mod segment;
 pub mod version;
 pub mod writer;
+
+#[cfg(test)]
+mod fault_tests;
 
 pub use version::{Hit, Matching, Plan, Version};
 pub use writer::{Outcome, Staged, SyncTicket, Writer};
@@ -140,7 +154,19 @@ const FORMAT: u32 = 3;
 fn check_meta(dir: &Path, opts: &Options) -> io::Result<()> {
     let path = dir.join("meta");
     let want = format!("format {FORMAT}\nsegment_size {}\n", opts.segment_size);
+    // Replaced whole or not at all: a crash while creating the store must not
+    // leave a file that refuses every later start.
+    let create = || -> io::Result<()> {
+        let tmp = dir.join("meta.tmp");
+        std::fs::write(&tmp, &want)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        bg::sync_dir(dir)
+    };
     match std::fs::read_to_string(&path) {
+        // Empty: written by an earlier version that crashed while creating the
+        // store. It is written before anything else, so the store is still new.
+        Ok(have) if have.is_empty() => create(),
         Ok(have) => {
             let get = |k: &str| have.lines().find_map(|l| l.strip_prefix(k)?.trim().parse::<u64>().ok());
             if get("format ") != Some(u64::from(FORMAT)) {
@@ -155,7 +181,7 @@ fn check_meta(dir: &Path, opts: &Options) -> io::Result<()> {
             }
             Ok(())
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::write(&path, want),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => create(),
         Err(e) => Err(e),
     }
 }
@@ -176,6 +202,8 @@ impl Store {
         check_meta(dir, &opts)?;
         let idx = dir.join("idx");
         std::fs::create_dir_all(&idx)?;
+        // Which step of opening failed, for an error an operator can act on.
+        let step = |what: &'static str| move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
         let ck = checkpoint::read(dir)?;
         let have_ck = ck.is_some();
         let ck = ck.unwrap_or_default();
@@ -185,24 +213,42 @@ impl Store {
             segments.push(Arc::new(Segment::open(id, &bg::seg_path(&idx, id))?));
         }
         // Leftovers of a flush or compaction that never reached a checkpoint.
-        for e in std::fs::read_dir(&idx)?.flatten() {
+        for e in std::fs::read_dir(&idx).map_err(step("listing the index"))?.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
             let listed = name.strip_suffix(".seg").and_then(|n| n.parse::<u64>().ok()).is_some_and(|id| ck.segments.contains(&id));
             if !listed && (name.ends_with(".seg") || name.ends_with(".tmp")) {
-                std::fs::remove_file(e.path())?;
+                std::fs::remove_file(e.path()).map_err(step("removing an unfinished index segment"))?;
             }
         }
 
         let mut dead = DeadSet::default();
+        // Words of a dead.bits without a checksum (written before it had one).
+        let mut unchecked_words = None;
         if have_ck {
-            if let Ok(img) = std::fs::read(dir.join("dead.bits")) {
-                dead.load(&img);
-            }
+            // Every checkpoint is written after its dead.bits: without it, or
+            // with it damaged, every removal since the store began would be
+            // undone. That is a refusal, not a guess.
+            let img = std::fs::read(dir.join("dead.bits")).map_err(step("reading dead.bits"))?;
+            let words = match img.len() % 8 {
+                0 => {
+                    unchecked_words = Some(img.len() / 8);
+                    &img[..]
+                }
+                4 => {
+                    let (words, crc) = img.split_at(img.len() - 4);
+                    if crate::crc32c::crc32c(words) != u32::from_le_bytes(crc.try_into().unwrap()) {
+                        return Err(io::Error::other("dead.bits is corrupt (its checksum does not match)"));
+                    }
+                    words
+                }
+                _ => return Err(io::Error::other("dead.bits is corrupt (its length is not whole words)")),
+            };
+            dead.load(words);
         }
 
         let vanish = VanishCfg::new(&opts.vanish_urls);
-        let mut locs = LocsWriter::open(&dir.join("locs"))?;
+        let mut locs = LocsWriter::open(&dir.join("locs")).map_err(step("opening locs"))?;
         let mut kb = KeyBuf::default();
         let mut scratch = Vec::new();
         let mut dead_seqs = Vec::new();
@@ -229,7 +275,16 @@ impl Store {
             run.1 = run.0.iter().filter_map(|&n| std::fs::metadata(log::cold_path(&dir.join("log"), n)).ok()).map(|m| m.blocks() * 512).sum();
         }
         let cold_keep: Vec<u64> = cold_runs.iter().flat_map(|r| r.0.iter().copied()).collect();
-        let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, &retired, &cold_keep, |fr: log::Frame<'_>| {
+        // The segments an unfinished exchange replaces go below, and a kill made
+        // after their copies were taken is recorded only in their frames' dead
+        // flags (the copies were written first): carry those kills over.
+        for &n in &ck.intent_retire {
+            let path = if n >= log::COLD_BASE { log::cold_path(&dir.join("log"), n - log::COLD_BASE) } else { log::hot_path(&dir.join("log"), n) };
+            if path.exists() {
+                dead_seqs.extend(log::flagged_dead(&path, opts.segment_size)?);
+            }
+        }
+        let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, ck.covered, &retired, &cold_keep, |fr: log::Frame<'_>| {
             if loc_err.is_none() {
                 if let Err(e) = locs.set(fr.seq, fr.off) {
                     loc_err = Some(e);
@@ -238,13 +293,22 @@ impl Store {
             next_seq = next_seq.max(fr.seq + 1);
             if fr.dead {
                 dead_seqs.push(fr.seq);
+                // An event of the tail that died still decided things before it
+                // did: the slot it took from an older event, its tombstones, a
+                // vanish. Its keys bring those back for `repair` (its bytes are
+                // kept until a segment covers it, see `zero_when_covered`).
+                if fr.seq >= ck.covered && fr.intact {
+                    keys::index_keys(Record(fr.record), fr.seq, &mut kb, &mut scratch, &vanish);
+                }
             } else if fr.seq >= ck.covered {
                 keys::index_keys(Record(fr.record), fr.seq, &mut kb, &mut scratch, &vanish);
             }
-        })?;
+        })
+        .map_err(step("replaying the log"))?;
         if let Some(e) = loc_err {
             return Err(e);
         }
+        crash_point!("open.replayed");
         if !ck.intent_cold.is_empty() {
             let segs = log.segments();
             for &n in &ck.intent_cold {
@@ -264,18 +328,26 @@ impl Store {
                     return Err(e);
                 }
             }
-            locs.sync()?;
+            locs.sync().map_err(step("finishing an interrupted log compaction"))?;
         }
 
+        // One without a checksum is at least as long as the checkpoint's
+        // indexed part of the log, and never longer than the log: one that is
+        // not was damaged (cut, or padded out to whole words).
+        if unchecked_words.is_some_and(|w| (w as u64) < ck.covered.div_ceil(64) || w as u64 > next_seq.div_ceil(64)) {
+            return Err(io::Error::other("dead.bits is corrupt (its length does not match the log)"));
+        }
         dead.grow_to(next_seq);
-        for s in dead_seqs {
+        // A dead frame naming a seq past the end names no record (a damaged
+        // frame whose checksum could not be checked): nothing to kill.
+        for s in dead_seqs.into_iter().filter(|&s| s < next_seq) {
             dead.set(s);
         }
         // The tail's rule-bearing keys: replaying them re-derives any kill a
         // crash between syncs could have lost.
         let tail: Vec<Vec<u8>> = (0..kb.len())
             .map(|i| kb.key(i))
-            .filter(|k| matches!(k[0], keys::T_ADDR | keys::T_DELETED | keys::T_ADDR_DELETED | keys::T_VANISH))
+            .filter(|k| matches!(k[0], keys::T_ID | keys::T_ADDR | keys::T_DELETED | keys::T_ADDR_DELETED | keys::T_VANISH))
             .map(|k| k.to_vec())
             .collect();
         let mem = if kb.is_empty() { Vec::new() } else { vec![Arc::new(MemRun::build(&kb))] };
@@ -314,13 +386,20 @@ impl Store {
             (ck.next_cold, cold_runs, retired),
         )?;
         if finish_intent {
-            w.write_checkpoint()?;
+            w.write_checkpoint().map_err(step("recording a finished log compaction"))?;
+            crash_point!("open.intent_finished");
         }
-        w.repair(&tail)?;
+        let repaired = w.repair(&tail).map_err(step("re-applying the replayed tail's rules"))?;
+        // Kills re-derived just now rest on tail events that may themselves die
+        // before the next checkpoint, taking the evidence with them: record them.
+        if repaired > 0 {
+            w.write_checkpoint().map_err(step("recording the re-applied rules"))?;
+        }
+        crash_point!("open.repaired");
         // Expiry kills are not re-derived from the tail like rule kills are:
         // one that was not checkpointed is redone before anything is served.
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        w.sweep_expired(now)?;
+        w.sweep_expired(now).map_err(step("removing expired events"))?;
         Ok((Store { shared }, w))
     }
 

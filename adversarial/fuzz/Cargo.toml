@@ -1,0 +1,170 @@
+[package]
+name = "relay-adversarial-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Coverage-guided fuzzing of the same targets the stable runner (`adv fuzz`)
+# uses, with libFuzzer: needs a nightly toolchain and cargo-fuzz, so it runs
+# on the box only (scripts/box-fuzz.sh). One binary per target.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+relay-adversarial = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical"
+path = "fuzz_targets/canonical.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event"
+path = "fuzz_targets/event.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter"
+path = "fuzz_targets/filter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_msg"
+path = "fuzz_targets/client_msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "varint"
+path = "fuzz_targets/varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hex"
+path = "fuzz_targets/hex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "negentropy"
+path = "fuzz_targets/negentropy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "negentropy_sync"
+path = "fuzz_targets/negentropy_sync.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_decode"
+path = "fuzz_targets/ws_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inflate"
+path = "fuzz_targets/inflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deflate_roundtrip"
+path = "fuzz_targets/deflate_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pmd_negotiate"
+path = "fuzz_targets/pmd_negotiate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "base64"
+path = "fuzz_targets/base64.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "der"
+path = "fuzz_targets/der.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pem"
+path = "fuzz_targets/pem.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_json"
+path = "fuzz_targets/tls_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url"
+path = "fuzz_targets/url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false

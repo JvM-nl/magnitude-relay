@@ -238,6 +238,11 @@ thread_local! {
 
 impl Outbox for WsOut<'_> {
     #[inline]
+    fn queued(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[inline]
     fn text(&mut self, f: &mut dyn FnMut(&mut Vec<u8>)) {
         match self.z.as_deref_mut() {
             None => {
@@ -600,6 +605,35 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
     shared.metrics.open.fetch_sub(1, Ordering::Relaxed);
 }
 
+/// The least time a write to a client may take before the client counts as
+/// gone; larger writes get more, at 64 KB/s.
+const WRITE_STALL: Duration = Duration::from_secs(60);
+
+/// Runs a write to the client, unless the client has stopped reading: then
+/// false, and the connection is dropped. That is when live events have piled
+/// up past its outbound limit behind the write, or when the write outlasts
+/// its time budget. Without this a client that never reads kept its
+/// connection, and everything buffered for it, forever: the overflow close
+/// was only looked at between writes, and the write never finished.
+/// A write that completes at once polls nothing else (no timer is armed).
+async fn finish_write(write: impl std::future::Future<Output = io::Result<()>>, out: &ConnOut, len: usize) -> io::Result<bool> {
+    let budget = WRITE_STALL.max(Duration::from_millis((len / 64) as u64));
+    let overflowed = async {
+        loop {
+            out.notify.notified().await;
+            if out.overflow.get() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        r = write => r.map(|()| true),
+        () = overflowed => Ok(false),
+        () = tokio::time::sleep(budget) => Ok(false),
+    }
+}
+
 /// Writes `buf` with each shared body inserted at its offset, in vectored writes.
 async fn write_spliced(s: &mut Sock, buf: &[u8], spliced: &[(usize, Rc<[u8]>)]) -> io::Result<()> {
     // Only unencrypted connections share bodies (`ConnOut::share`).
@@ -802,12 +836,25 @@ async fn serve(
             std::mem::swap(&mut wspliced, &mut *out.spliced.borrow_mut());
             let spliced = out.spliced_bytes.replace(0);
             metrics::add(&shared.metrics.of(st.borrow().idx).bytes_out, (wbuf.len() + spliced) as u64);
-            if wspliced.is_empty() {
-                s.write_all(&wbuf).await?;
-            } else {
-                write_spliced(s, &wbuf, &wspliced).await?;
-                wspliced.clear();
+            let len = wbuf.len() + spliced;
+            let write = async {
+                if wspliced.is_empty() {
+                    s.write_all(&wbuf).await
+                } else {
+                    write_spliced(s, &wbuf, &wspliced).await
+                }
+            };
+            if !finish_write(write, out, len).await? {
+                // The client stopped reading: nothing more can reach it.
+                metrics::inc(&shared.metrics.of(st.borrow().idx).slow_drops);
+                return Ok(());
             }
+            // The overflow watch may have taken the wakeup for what was queued
+            // during the write: give it back, or that waits for the next one.
+            if !out.buf.borrow().is_empty() {
+                out.notify.notify_one();
+            }
+            wspliced.clear();
             wbuf.clear();
             // Idle connections keep no output buffer; a busy one keeps a modest one.
             if wbuf.capacity() > 64 * 1024 {

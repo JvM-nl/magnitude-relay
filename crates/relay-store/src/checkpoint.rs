@@ -86,9 +86,13 @@ pub fn write(dir: &Path, c: &Checkpoint) -> io::Result<()> {
     let crc = crc32c(&b);
     b.extend_from_slice(&crc.to_le_bytes());
     let tmp = dir.join("checkpoint.tmp");
+    #[cfg(any(test, feature = "fault-injection"))]
+    crate::fault::check(&tmp, b.len())?;
     std::fs::write(&tmp, &b)?;
     std::fs::File::open(&tmp)?.sync_all()?;
+    crash_point!("checkpoint.tmp_written");
     std::fs::rename(&tmp, dir.join("checkpoint"))?;
+    crash_point!("checkpoint.renamed");
     crate::bg::sync_dir(dir)
 }
 

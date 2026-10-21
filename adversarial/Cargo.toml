@@ -1,0 +1,42 @@
+[package]
+name = "relay-adversarial"
+description = "Adversarial tests for the relay: parser fuzzing, a hostile-client harness, crash torture and stress"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Its own workspace, apart from the relay's: the store is built here with fault
+# injection (crash points, failing writes), and that feature must never be
+# unified into the relay's own builds.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "adv"
+path = "src/main.rs"
+
+[dependencies]
+relay-proto = { path = "../crates/relay-proto" }
+relay-net = { path = "../crates/relay-net" }
+relay-store = { path = "../crates/relay-store", features = ["fault-injection"] }
+relay-tls = { path = "../crates/relay-tls" }
+secp256k1 = { version = "0.33", default-features = false, features = ["std"] }
+sha2 = "0.10"
+libc = "0.2"
+# Reference implementations the relay's own code is checked against.
+serde_json = "1"
+serde = "1"
+negentropy = { version = "0.5", default-features = false, features = ["std"] }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+
+[profile.release]
+debug = 1
+# Arithmetic overflow and debug assertions are bugs worth finding: keep both on
+# in the code under test, and let a target's panic unwind so the runner can
+# report the input that caused it.
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"

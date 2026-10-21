@@ -24,11 +24,19 @@ impl Relay {
 
     /// `store` is extra lines for the `[store]` section.
     fn start_with(dir: PathBuf, port: u16, store: &str) -> Relay {
+        Self::start_limits(dir, port, "", store)
+    }
+
+    /// `limits` and `store` are extra lines for those sections.
+    fn start_limits(dir: PathBuf, port: u16, limits: &str, store: &str) -> Relay {
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("relay.toml");
         std::fs::write(
             &cfg,
-            format!("[relay]\nbind = \"127.0.0.1:{port}\"\nthreads = 2\n[limits]\nevents_per_minute_per_ip = 0\n[store]\ndata = \"{}\"\n{store}", dir.join("data").display()),
+            format!(
+                "[relay]\nbind = \"127.0.0.1:{port}\"\nthreads = 2\n[limits]\nevents_per_minute_per_ip = 0\n{limits}[store]\ndata = \"{}\"\n{store}",
+                dir.join("data").display()
+            ),
         )
         .unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_magnitude-relay"))
@@ -1184,6 +1192,103 @@ async fn gift_wraps_come_back_byte_for_byte() {
     assert!(log.windows(64).any(|w| w == &bytes(1400)[..64]), "it is stored as its bytes");
     assert!(log.windows(good.len() - 2).any(|w| w == good.trim_end_matches('=').as_bytes()), "the unpadded one is stored as text");
     drop(c);
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+async fn stats(relay: &Relay) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+    s.write_all(format!("GET /stats HTTP/1.1\r\nHost: {}\r\n\r\n", relay.addr).as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).await.unwrap();
+    serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+}
+
+/// Found by the adversarial suite's hostile clients: a subscriber that stops
+/// reading kept its connection, and everything buffered for it, for as long
+/// as it liked. The overflow that should close it was only looked at between
+/// writes, and the write to a client that never reads never finishes. It is
+/// now dropped once live events pile up past its limit, without it reading.
+#[tokio::test]
+async fn a_subscriber_that_never_reads_is_dropped() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-noread-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start_limits(dir.clone(), port, "outbound_buffer_bytes = 300000\n", "");
+    let host = format!("127.0.0.1:{port}");
+    let me = Signer::new(21);
+    let author = Signer::new(22);
+    // A small receive window, so the kernel cannot absorb what the relay
+    // sends: the relay's write to it blocks, as it does for a real client
+    // that stops reading once its buffers are full.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let tcp = sock.connect(relay.addr).await.unwrap();
+    let mut sink = relay_net::conn::client_handshake(tcp, &host, "/").await.unwrap();
+    send(&mut sink, json!(["REQ", "all", {"kinds": [1059], "#p": [me.pk()], "limit": 0}])).await;
+    assert_eq!(collect(&mut sink, "all").await.1[0], "EOSE");
+    // From here on the sink reads nothing. First events one at a time, each
+    // under its limit, until the kernel's buffers are full and the relay's
+    // write to it waits; then a burst past the limit behind that write.
+    let mut publisher = client_connect(relay.addr, &host, "/").await.unwrap();
+    let body = "w".repeat(30_000);
+    for n in 0..200u64 {
+        send(&mut publisher, json!(["EVENT", author.event(now() - n, 1059, json!([["p", me.pk()]]), &body)])).await;
+        assert!(ok_of(&mut publisher).await.0);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    for n in 200..240u64 {
+        send(&mut publisher, json!(["EVENT", author.event(now() - n, 1059, json!([["p", me.pk()]]), &body)])).await;
+    }
+    for _ in 200..240 {
+        assert!(ok_of(&mut publisher).await.0);
+    }
+    let t = Instant::now();
+    loop {
+        if stats(&relay).await["slow_drops"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "the non-reading subscriber is still held: {}", stats(&relay).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop((sink, publisher));
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Found by the adversarial suite's hostile clients: a REQ's stored results
+/// were all built in memory before any went out (50 filters of 5000 events
+/// can be hundreds of megabytes, held while the client does not read). They
+/// now stop at the connection's outbound limit, with a CLOSED that says why.
+#[tokio::test]
+async fn an_answer_past_the_outbound_limit_ends_in_closed() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-bigreq-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start_limits(dir.clone(), port, "outbound_buffer_bytes = 300000\n", "");
+    let host = format!("127.0.0.1:{port}");
+    let me = Signer::new(23);
+    let author = Signer::new(24);
+    let mut publisher = client_connect(relay.addr, &host, "/").await.unwrap();
+    let body = "v".repeat(30_000);
+    for n in 0..30u64 {
+        send(&mut publisher, json!(["EVENT", author.event(now() - n, 1059, json!([["p", me.pk()]]), &body)])).await;
+    }
+    for _ in 0..30 {
+        assert!(ok_of(&mut publisher).await.0);
+    }
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    send(&mut c, json!(["REQ", "big", {"kinds": [1059], "#p": [me.pk()], "limit": 100}])).await;
+    let (evs, end) = collect(&mut c, "big").await;
+    assert_eq!(end[0], "CLOSED", "{end}");
+    assert!(end[2].as_str().unwrap().contains("larger than"), "{end}");
+    assert!(evs.len() < 30 && evs.len() >= 9, "{} events before the cut", evs.len());
+    // A narrower request is answered whole, and the connection works on.
+    send(&mut c, json!(["REQ", "small", {"kinds": [1059], "#p": [me.pk()], "limit": 5}])).await;
+    let (evs, end) = collect(&mut c, "small").await;
+    assert_eq!((evs.len(), end[0].as_str().unwrap()), (5, "EOSE"));
+    drop((c, publisher));
     let dir = relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }

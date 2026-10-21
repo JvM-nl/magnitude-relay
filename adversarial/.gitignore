@@ -1,0 +1,5 @@
+/target
+/fuzz-out
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

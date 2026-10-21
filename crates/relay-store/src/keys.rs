@@ -263,14 +263,30 @@ pub fn index_keys(rec: Record<'_>, seq: u64, kb: &mut KeyBuf, scratch: &mut Vec<
         kb.put_u64(seq);
     }
 
+    tombstone_keys(rec, kb, scratch, vanish);
+}
+
+/// Whether an event takes part in a storage rule that kills other events: it
+/// takes a replaceable or addressable slot, deletes, or vanishes. Its index
+/// keys carry those decisions (`T_ADDR`, `T_DELETED`, `T_ADDR_DELETED`,
+/// `T_VANISH`).
+pub fn rule_bearing(rec: Record<'_>, vanish: &crate::VanishCfg) -> bool {
+    let k = rec.kind();
+    kind::is_replaceable(k) || kind::is_addressable(k) || k == kind::DELETION || (k == kind::VANISH && vanish.targets(rec))
+}
+
+/// The permanent tombstones an event leaves (none for most kinds). They carry
+/// no seq: they outlive the event, which may itself be removed later.
+fn tombstone_keys(rec: Record<'_>, kb: &mut KeyBuf, scratch: &mut Vec<u8>, vanish: &crate::VanishCfg) {
+    let k = rec.kind();
     if k == kind::DELETION {
         deletion_keys(rec, kb, scratch);
     }
 
     if k == kind::VANISH && vanish.targets(rec) {
         kb.begin(T_VANISH);
-        kb.put(pk);
-        kb.put_u64(ca);
+        kb.put(rec.pubkey());
+        kb.put_u64(rec.created_at());
     }
 }
 

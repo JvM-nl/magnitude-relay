@@ -18,6 +18,8 @@ use std::sync::Arc;
 /// Where replies go: one call per protocol message.
 pub trait Outbox {
     fn text(&mut self, f: &mut dyn FnMut(&mut Vec<u8>));
+    /// Bytes already waiting to be written to this connection.
+    fn queued(&self) -> usize;
 }
 
 /// The limits and policy a session enforces (built once from the config).
@@ -30,6 +32,9 @@ pub struct SessionCfg {
     pub max_event_bytes: usize,
     pub max_future_seconds: u64,
     pub max_tags: usize,
+    /// The bytes a connection may have waiting: live events past it close the
+    /// connection, and a REQ's stored results stop at it.
+    pub max_outbound: usize,
     pub kind_allowed: Box<dyn Fn(u64) -> bool + Send + Sync>,
 }
 
@@ -45,6 +50,7 @@ impl SessionCfg {
             max_event_bytes: cfg.policy.max_event_bytes,
             max_future_seconds: cfg.policy.max_future_seconds,
             max_tags: cfg.policy.max_tags,
+            max_outbound: cfg.limits.outbound_buffer_bytes,
             kind_allowed: Box::new(move |k| kinds.allows(k)),
         }
     }
@@ -351,6 +357,15 @@ impl Session {
         // filter (Vector's are never broad) every hit came from one that is not.
         let any_broad = !self.trusted && filters.iter().any(broad);
         for (i, h) in hits.iter().enumerate() {
+            // An answer bigger than the connection may have waiting is all built
+            // in memory before a byte of it goes out (50 filters of 5000 events
+            // each can be hundreds of megabytes, held as long as the client does
+            // not read). Stop there and say so, rather than truncate silently.
+            if out.queued() > cx.cfg.max_outbound {
+                cx.subs.remove(self.conn, sub_id);
+                let mb = cx.cfg.max_outbound >> 20;
+                return closed(out, sub_id, &format!("error: the answer is larger than {mb} MB; ask for fewer events at a time"));
+            }
             // A later event's bytes load while this one is written out.
             if let Some(next) = hits.get(i + 3) {
                 snap.prefetch_record(next.seq);
