@@ -12,7 +12,7 @@ use std::time::Duration;
 const USAGE: &str = "\
 relay-bench: load generator and validating tester for Nostr relays
 
-  relay-bench gen    --events N --out FILE [--seed S] [--rate R] [--end TS] [--recipients N] [--planes N] [--authors N] [--threads T]
+  relay-bench gen    --events N --out FILE [--seed S] [--rate R] [--end TS] [--recipients N] [--planes N] [--authors N] [--threads T] [--nip44]
   relay-bench load   --url ws://HOST:PORT --file FILE [--conns C] [--window W] [--batch-ack] [--duplicates] [--count N] [--skip N]
   relay-bench query  --url ws://HOST:PORT --file FILE [--workload W] [--conns C] [--queries Q] [--limit L] [--distinct D] [--strict-ties] [--warmup N]
   relay-bench neg    --url ws://HOST:PORT --file FILE [--recipient-mode heavy|light] [--have PCT] [--sessions S] [--conns C]
@@ -32,7 +32,8 @@ connection exits with status 2.
 
 gen:   events are 70% gift wraps (Zipf mailboxes), 15% plane traffic, 10% kinds 1/7/30023, 5% replaceables.
        --rate is events/s on the dataset timeline (default 2, max 20); --end is the newest created_at
-       (default 1792000000, or `now`). Same seed + flags = same bytes.
+       (default 1792000000, or `now`). --nip44 makes wrap content exact base64, as real NIP-44
+       payloads are (the default is base64-alphabet text of any length). Same seed + flags = same bytes.
 query: workloads: classic latest_1 latest_100 latest_500 author kind author_kind tag time_window exact_id
        exact_ids_100 miss multi_filter | vector dm_inbox dm_catchup concord_page concord_paging dm_ids |
        count. --workload takes names, a comma list, or classic|vector|all (default all).
@@ -52,7 +53,7 @@ fn run() -> Result<bool, String> {
         print!("{USAGE}");
         return Ok(false);
     }
-    let mut a = Args::parse(&argv, &["batch-ack", "duplicates", "strict-ties"])?;
+    let mut a = Args::parse(&argv, &["batch-ack", "duplicates", "strict-ties", "nip44"])?;
     let cmd = a.cmd.clone();
     if cmd == "gen" {
         return gen(a).map(|()| false);
@@ -191,6 +192,7 @@ fn gen(mut a: Args) -> Result<(), String> {
     p.planes = a.count("planes", p.planes as u64)? as usize;
     p.authors = a.count("authors", p.authors as u64)? as usize;
     p.threads = a.count("threads", p.threads as u64)? as usize;
+    p.nip44 = a.flag("nip44");
     a.finish()?;
     p.validate()?;
     eprintln!("gen: {} events, seed {}, {} threads -> {}", p.events, p.seed, p.threads, out.display());

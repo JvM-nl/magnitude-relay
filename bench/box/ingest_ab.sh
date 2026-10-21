@@ -5,9 +5,11 @@
 # A B A B for `rounds` rounds (default 4). Per run: events/s and latency from
 # relay-bench, and the relay's CPU time per thread group (writer, reactor-*,
 # syncer, store-bg, ...), in microseconds per event. CPU per thread is what a
-# noisy box disturbs least; the writer's is the ingest ceiling.
+# noisy box disturbs least; the writer's is the ingest ceiling. Also the size
+# of the store each run leaves.
 # A binary may be given as VAR=value@path: the relay then runs with VAR set,
-# for comparing one build at two settings.
+# for comparing one build at two settings. DATA=<file.jsonl> ingests that
+# file instead (its first `events` lines, taken as they are).
 set -uo pipefail
 export RELAY_CPUS=${RELAY_CPUS:-0,1,4,5}
 export LOADGEN_CPUS=${LOADGEN_CPUS:-2,3}
@@ -17,9 +19,10 @@ a=${1:?binary a} b=${2:?binary b}
 rounds=${3:-4}
 events=${4:-300000}
 full=$BENCH_ROOT/data/d1m.jsonl
-data=$BENCH_ROOT/data/d$((events / 1000))k.jsonl
+data=${DATA:-$BENCH_ROOT/data/d$((events / 1000))k.jsonl}
 assert_in_bench "$data"
 [ -s "$data" ] || head -n "$events" "$full" > "$data"
+[ "$(wc -l < "$data")" -ge "$events" ] || die "$data has fewer than $events lines"
 hz=$(getconf CLK_TCK)
 # "group utime stime" per thread, threads named reactor-0, reactor-1 ... as one group.
 threads() {
@@ -48,6 +51,8 @@ run() { # [VAR=value@]binary
           if (u + k >= 0.05) line = line sprintf("  %s %.1f (sys %.1f)", $1, u + k, k) }
         END { printf "%-24s cpu us/event: total %.1f (sys %.1f) |%s\n", tag, tot, sys, line }'
     ./stop.sh ours >/dev/null
+    printf '%-24s store after ingest: %s bytes on disk, log %s\n' "$tag" \
+        "$(du -sB1 "$(data_dir_of ours)" | cut -f1)" "$(du -sB1 "$(data_dir_of ours)/log" | cut -f1)"
     [ -n "$setting" ] && unset "${setting%%=*}"
 }
 

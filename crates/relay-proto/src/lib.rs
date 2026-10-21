@@ -4,6 +4,7 @@
 //! straight from wire bytes to the compact [`record`] form the store keeps, and
 //! back out to JSON with a copy and a hex encode.
 
+pub mod base64;
 pub mod event;
 pub mod filter;
 pub mod hex;

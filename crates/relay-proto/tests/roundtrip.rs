@@ -274,3 +274,113 @@ fn client_messages() {
     let long = format!(r#"["CLOSE","{}"]"#, "x".repeat(65));
     assert!(ClientMsg::parse(&long, &mut p, &mut rec).is_err());
 }
+
+/// A strfry export line (alphabetical keys) for a signed event.
+fn export_line(s: &Signer, created_at: u64, kind: u64, tags: Value, content: &str) -> String {
+    let pk = s.pubkey_hex();
+    let pre = serde_json::to_string(&json!([0, pk, created_at, kind, tags, content])).unwrap();
+    let (id, sig) = s.sign_preimage(&pre);
+    format!(
+        r#"{{"content":{},"created_at":{created_at},"id":"{id}","kind":{kind},"pubkey":"{pk}","sig":"{sig}","tags":{}}}"#,
+        serde_json::to_string(content).unwrap(),
+        serde_json::to_string(&tags).unwrap()
+    )
+}
+
+#[test]
+fn base64_content_is_stored_decoded() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use relay_proto::record::{compact_into, FLAG_BASE64, MIN_BASE64_CONTENT};
+    let s = Signer::new(17);
+    let tags = json!([["p", "c".repeat(64)], ["expiration", "1900000000"], ["k", "14"]]);
+    // Every padding case, both sides of the threshold, one- and two-byte
+    // varints, and lengths whose text needs a three-byte varint where its
+    // bytes need two.
+    let lens = (40..60).chain([97, 98, 99, 100, 1000, 1001, 1002, 12_288, 12_289, 30_000]);
+    for len in lens {
+        let bytes: Vec<u8> = (0..len as u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+        let content = STANDARD.encode(&bytes);
+        let line = export_line(&s, 1_700_000_300, 1059, tags.clone(), &content);
+        let rec = parse(&line).unwrap();
+        let mut stored = Vec::new();
+        compact_into(&rec, &mut stored);
+        let r = Record(&stored);
+        if content.len() < MIN_BASE64_CONTENT {
+            assert_eq!(stored, rec, "short content stays text, len {len}");
+            continue;
+        }
+        assert!(r.is_base64(), "len {len}");
+        assert_eq!(r.stored_content(), &bytes[..]);
+        let varint = |n: usize| (usize::BITS - n.leading_zeros()).div_ceil(7) as usize;
+        assert_eq!(stored.len() + content.len() - bytes.len() + varint(content.len()) - varint(len), rec.len(), "len {len}");
+        // Everything else reads as before.
+        let old = Record(&rec);
+        assert_eq!((r.id(), r.pubkey(), r.sig(), r.kind(), r.created_at()), (old.id(), old.pubkey(), old.sig(), 1059, 1_700_000_300));
+        assert_eq!(r.expiration(), Some(1_900_000_000));
+        assert_eq!(r.tags().count(), 3);
+        assert_eq!(r.flags(), old.flags() | FLAG_BASE64);
+        // Out exactly as it came in: the export line, its length, its id.
+        assert_eq!(r.to_json(), line, "len {len}");
+        assert_eq!(r.json_len(), line.len());
+        let mut content_json = Vec::new();
+        r.write_content(&mut content_json);
+        assert_eq!(content_json, content.as_bytes());
+        let mut scratch = Vec::new();
+        assert_eq!(&compute_id(r, &mut scratch), r.id());
+        assert!(relay_proto::event::verify_sig(r));
+        // Compacting again changes nothing.
+        let mut again = Vec::new();
+        compact_into(&stored, &mut again);
+        assert_eq!(again, stored);
+    }
+
+    // Content that looks like base64 but is not exactly the encoding of its
+    // bytes stays text, and comes back unchanged.
+    let good = STANDARD.encode([7u8; 100]);
+    assert!(good.ends_with("Bw=="));
+    let not_canonical = [
+        good.trim_end_matches('=').to_string(),
+        // "BB==": the second B sets bits the last byte does not use.
+        format!("{}BB==", &good[..good.len() - 4]),
+        format!("{}\n{}", &good[..64], &good[64..]),
+        format!("{} ", &good[..good.len() - 1]),
+        format!("{}AA=={}", &good[..64], &good[68..]),
+        format!("{}={}", &good[..50], &good[51..]),
+        good.replace('/', "_").replace('+', "-") + "_-_-",
+        "plain text, not an encoding of anything at all, long enough to try".to_string(),
+        r#"{"name":"vector","about":"a profile is JSON, never base64 at all"}"#.to_string(),
+    ];
+    for content in &not_canonical {
+        let line = export_line(&s, 1_700_000_301, 1059, json!([]), content);
+        let rec = parse(&line).unwrap();
+        let mut stored = Vec::new();
+        compact_into(&rec, &mut stored);
+        assert_eq!(stored, rec, "{content:?} stays as it was");
+        assert!(!Record(&stored).is_base64());
+        assert_eq!(Record(&stored).to_json(), line);
+    }
+
+    // Signed over "\/" (a serialiser that escapes the slash): stored raw,
+    // which is not base64, and so re-exported exactly as signed.
+    let text = STANDARD.encode([0xFFu8; 120]);
+    assert!(text.contains('/'));
+    let escaped = text.replace('/', "\\/");
+    let pk = s.pubkey_hex();
+    let pre = format!(r#"[0,"{pk}",1700000302,1059,[],"{escaped}"]"#);
+    let (id, sig) = s.sign_preimage(&pre);
+    let line = format!(r#"{{"content":"{escaped}","created_at":1700000302,"id":"{id}","kind":1059,"pubkey":"{pk}","sig":"{sig}","tags":[]}}"#);
+    let rec = parse(&line).unwrap();
+    let mut stored = Vec::new();
+    compact_into(&rec, &mut stored);
+    assert_eq!(stored, rec);
+    assert_eq!(Record(&stored).to_json(), line);
+    // The same payload signed canonically is decoded, whatever escaping it
+    // travelled in: what comes back is the canonical form the id commits to.
+    let canonical = export_line(&s, 1_700_000_303, 1059, json!([]), &text);
+    let rec = parse(&canonical.replace('/', "\\/")).unwrap();
+    let mut stored = Vec::new();
+    compact_into(&rec, &mut stored);
+    assert!(Record(&stored).is_base64());
+    assert_eq!(Record(&stored).to_json(), canonical);
+}

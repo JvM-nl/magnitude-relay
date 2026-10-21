@@ -545,6 +545,65 @@ fn torn_tail_with_precreated_next_segment() {
     assert_eq!(ids(&store, "{}", 10).len(), 3);
 }
 
+/// A record as the store keeps it (base64 content decoded).
+fn stored_form(rec: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    relay_proto::record::compact_into(rec, &mut out);
+    out
+}
+
+/// Padded standard base64, from the reference crate.
+fn base64_of(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[test]
+fn base64_content_is_stored_decoded_and_read_back_exactly() {
+    let dir = tmpdir("b64");
+    let me = pk(7);
+    let tags = format!(r#"[["p","{me}"]]"#);
+    let payload = |n: usize| -> Vec<u8> { (0..n).map(|i| (i * 7 + n) as u8).collect() };
+    let good = base64_of(&payload(301));
+    assert!(good.ends_with("=="));
+    let contents = [
+        base64_of(&payload(1398)),
+        base64_of(&payload(1399)),
+        base64_of(&payload(1400)),
+        good.trim_end_matches('=').to_string(),
+        format!("{}AA=={}", &good[..100], &good[104..]),
+        "c2hvcnQ=".to_string(),
+    ];
+    let recs: Vec<Vec<u8>> = contents.iter().enumerate().map(|(i, c)| ev_by(i as u64, &hex32(0xC1, i as u64), 500 + i as u64, 1059, &tags, c)).collect();
+    let check = |store: &Store, what: &str| {
+        let snap = store.snapshot();
+        let hits = snap.query(&filter(&format!(r##"{{"kinds":[1059],"#p":["{me}"]}}"##)), 100, 0);
+        assert_eq!(hits.len(), recs.len(), "{what}");
+        for (i, rec) in recs.iter().enumerate() {
+            let r = snap.record(snap.lookup_id(Record(rec).id()).unwrap()).unwrap();
+            assert_eq!(r.to_json(), Record(rec).to_json(), "{what}: event {i}");
+            assert_eq!(r.json_len(), Record(rec).json_len(), "{what}: event {i}");
+            // The first three are stored a quarter smaller; the rest as they came.
+            assert_eq!(r.is_base64(), i < 3, "{what}: event {i}");
+            assert_eq!(r.0, stored_form(rec), "{what}: event {i}");
+            assert_eq!(r.0.len() < rec.len(), i < 3, "{what}: event {i}");
+        }
+    };
+    {
+        let (store, mut w) = Store::open(&dir, log_opts(1)).unwrap();
+        assert!(write(&mut w, &recs).iter().all(|o| matches!(o, Outcome::Stored(_))));
+        check(&store, "written");
+        // Duplicates are found by id whatever the stored form.
+        assert!(write(&mut w, &recs).iter().all(|o| matches!(o, Outcome::Duplicate)));
+        // Cold segments carry them over as they are.
+        w.compact_log_all().unwrap();
+        check(&store, "after log compaction");
+    }
+    let (store, _w) = Store::open(&dir, log_opts(1)).unwrap();
+    check(&store, "reopened");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Like `ev`, with any pubkey (gift wraps are signed by one-off keys).
 fn ev_by(n: u64, pubkey: &str, created_at: u64, kind: u64, tags: &str, content: &str) -> Vec<u8> {
     let json = format!(
@@ -643,6 +702,8 @@ impl Workload {
                     if doom {
                         self.doomed.push((n, to));
                     }
+                    // The ones that live are real payloads, base64 (stored decoded).
+                    let body = if doom { body } else { base64_of(body.as_bytes()) };
                     ev_by(n, &hex32(0xC0, n), ca, 1059, &tags, &body)
                 }
                 2 => {
@@ -728,7 +789,9 @@ impl Workload {
             for h in snap.query(&f, 50, 0) {
                 let r = snap.record(h.seq).expect("live");
                 assert_eq!(r.id(), &h.id);
-                assert_eq!(r.0, self.live.values().find(|x| Record(x).id() == &h.id).unwrap().as_slice(), "{what}: bytes of {fj}");
+                let want = self.live.values().find(|x| Record(x).id() == &h.id).unwrap();
+                assert_eq!(r.0, stored_form(want), "{what}: bytes of {fj}");
+                assert_eq!(r.to_json(), Record(want).to_json(), "{what}: JSON of {fj}");
             }
         }
     }
