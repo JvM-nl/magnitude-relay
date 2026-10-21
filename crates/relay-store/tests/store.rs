@@ -1819,6 +1819,10 @@ fn a_damaged_dead_set_is_refused() {
         Ok(_) => panic!("a damaged dead.bits was accepted"),
         Err(e) => assert!(e.to_string().contains("dead.bits"), "{e}"),
     }
+    // Garbage padded to whole words looks like the older form, without a
+    // checksum: it is longer than the log, and refused.
+    patch(&bits, 0, &[0x5Au8; 4096]);
+    assert!(Store::open(&dir, opts()).is_err(), "a garbled dead.bits was accepted");
     // And one without it is refused too: every removal would be undone.
     std::fs::remove_file(&bits).unwrap();
     assert!(Store::open(&dir, opts()).is_err());

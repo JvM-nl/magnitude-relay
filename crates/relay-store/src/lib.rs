@@ -223,13 +223,18 @@ impl Store {
         }
 
         let mut dead = DeadSet::default();
+        // Words of a dead.bits without a checksum (written before it had one).
+        let mut unchecked_words = None;
         if have_ck {
             // Every checkpoint is written after its dead.bits: without it, or
             // with it damaged, every removal since the store began would be
             // undone. That is a refusal, not a guess.
             let img = std::fs::read(dir.join("dead.bits")).map_err(step("reading dead.bits"))?;
             let words = match img.len() % 8 {
-                0 => &img[..],
+                0 => {
+                    unchecked_words = Some(img.len() / 8);
+                    &img[..]
+                }
                 4 => {
                     let (words, crc) = img.split_at(img.len() - 4);
                     if crate::crc32c::crc32c(words) != u32::from_le_bytes(crc.try_into().unwrap()) {
@@ -326,6 +331,11 @@ impl Store {
             locs.sync().map_err(step("finishing an interrupted log compaction"))?;
         }
 
+        // One without a checksum is at least never longer than the log: one
+        // that is was damaged (padded out to whole words, say).
+        if unchecked_words.is_some_and(|w| w as u64 > next_seq.div_ceil(64)) {
+            return Err(io::Error::other("dead.bits is corrupt (longer than the log)"));
+        }
         dead.grow_to(next_seq);
         // A dead frame naming a seq past the end names no record (a damaged
         // frame whose checksum could not be checked): nothing to kill.
