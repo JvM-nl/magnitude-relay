@@ -8,6 +8,7 @@ mod health;
 mod import;
 mod inbound;
 mod ingest;
+mod landing;
 mod metrics;
 mod operator;
 mod reactor;

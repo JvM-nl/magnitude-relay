@@ -323,8 +323,8 @@
   <footer>
     <span id="foot-updated">—</span>
     <span>Polling this page is plain HTTP, not WebSocket traffic, so it adds nothing to the figures above.</span>
-    <a href="/stats">raw JSON</a>
-    <a href="/metrics">Prometheus</a>
+    <a href="stats">raw JSON</a>
+    <a href="metrics">Prometheus</a>
   </footer>
 </div>
 
@@ -863,7 +863,7 @@
     const ctl = new AbortController();
     const abort = setTimeout(() => ctl.abort(), TIMEOUT_MS);
     try {
-      const res = await fetch("/stats", { cache: "no-store", signal: ctl.signal });
+      const res = await fetch("stats", { cache: "no-store", signal: ctl.signal });
       if (!res.ok) throw new Error("HTTP " + res.status);
       d = await res.json();
       if (!d || typeof d !== "object" || typeof d.uptime_secs !== "number") throw new Error("unexpected response");

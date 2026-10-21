@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<base href="{{BASE}}">
+<title>{{NAME}}</title>
+<meta name="description" content="{{DESC}}">
+<meta name="theme-color" content="#030303">
+<style>
+/* One dark column in Vector's own colours (the Hub kit's tokens): the relay's
+   name and live status, four live numbers, how to connect on each network,
+   what it carries, who runs it. */
+@font-face { font-family: "Rubik"; src: url("rubik.woff2") format("woff2"); font-weight: 300 900; font-display: swap; }
+:root {
+  --bg: #030303; --card: #0c0c0c; --raise: #121212; --line: #1e1e1e; --edge: #2c2e2f;
+  --text: #ffffff; --text-2: #b2b2b2; --text-3: #8a8a8a; --text-4: #5b6060;
+  --green: #59fcb3; --green-2: #33db98; --green-3: #2b976c; --orange: #fca559;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --font: "Rubik", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+  font-family: var(--font); font-size: 16px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+  background-image: radial-gradient(1100px 520px at 50% -180px, rgba(89, 252, 179, 0.13), transparent 70%);
+  background-repeat: no-repeat;
+}
+/* A faint grid behind the masthead, fading out below it. */
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto 0; height: 560px; pointer-events: none; z-index: -1;
+  background-image: linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: 44px 44px; background-position: center top;
+  -webkit-mask-image: radial-gradient(700px 420px at 50% 0, #000 30%, transparent 75%); mask-image: radial-gradient(700px 420px at 50% 0, #000 30%, transparent 75%);
+}
+.wrap {
+  max-width: 980px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 56px;
+  padding: 56px max(16px, env(safe-area-inset-right)) 48px max(16px, env(safe-area-inset-left));
+}
+h1, h2, h3, p { margin: 0; }
+h2 { font-size: 1.35rem; font-weight: 600; letter-spacing: -0.005em; }
+.eyebrow { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-4); }
+.lead { color: var(--text-2); }
+.sec-head { display: grid; gap: 6px; margin-bottom: 20px; }
+.sec-head p { color: var(--text-3); max-width: 64ch; }
+
+/* Masthead */
+.mast { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 26px; align-items: center; }
+.mark { width: 124px; height: auto; filter: drop-shadow(0 0 34px rgba(89, 252, 179, 0.42)); animation: float 6s ease-in-out infinite; }
+@keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
+.word { width: 118px; height: auto; color: var(--text); display: block; opacity: 0.92; }
+.mast h1 {
+  font-size: clamp(2.1rem, 6.4vw, 3.5rem); font-weight: 600; line-height: 1.04; letter-spacing: -0.015em; margin-top: 10px;
+  background: linear-gradient(135deg, var(--green) 0%, var(--green-2) 60%, var(--green-3) 120%);
+  -webkit-background-clip: text; background-clip: text; color: transparent; overflow-wrap: anywhere;
+}
+.mast .lead { margin-top: 12px; font-size: 1.08rem; max-width: 60ch; }
+.status { display: inline-flex; align-items: center; gap: 9px; margin-top: 18px; padding: 6px 13px 6px 11px; border: 1px solid rgba(89, 252, 179, 0.28); background: rgba(89, 252, 179, 0.06); border-radius: 999px; font-size: 0.86rem; color: var(--text-2); }
+.status b { color: var(--green); font-weight: 500; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 0 rgba(89, 252, 179, 0.6); animation: pulse 2.4s var(--ease) infinite; }
+.status.off { border-color: rgba(252, 165, 89, 0.35); background: rgba(252, 165, 89, 0.06); }
+.status.off b { color: var(--orange); }
+.status.off .dot { background: var(--orange); animation: none; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(89, 252, 179, 0.55); } 70% { box-shadow: 0 0 0 9px rgba(89, 252, 179, 0); } 100% { box-shadow: 0 0 0 0 rgba(89, 252, 179, 0); } }
+
+/* Live numbers */
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.tile { background: linear-gradient(180deg, var(--raise), var(--card)); border: 1px solid var(--line); border-radius: 16px; padding: 18px 18px 16px; display: grid; gap: 6px; position: relative; overflow: hidden; }
+.tile::after { content: ""; position: absolute; inset: 0 0 auto 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(89, 252, 179, 0.35), transparent); }
+.tile .v { font-size: clamp(1.45rem, 3.6vw, 2.1rem); font-weight: 600; line-height: 1.1; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; transition: color 0.6s var(--ease); }
+.tile .v small { font-size: 0.55em; font-weight: 400; color: var(--text-3); margin-left: 3px; }
+.tile .k { font-size: 0.84rem; color: var(--text-3); }
+.tile .v.bump { color: var(--green); transition: none; }
+
+/* Connect */
+.nets { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.net { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 20px; display: grid; gap: 14px; align-content: start; transition: border-color 0.3s var(--ease), transform 0.3s var(--ease); }
+.net:hover { border-color: var(--edge); transform: translateY(-2px); }
+.net header { display: flex; align-items: center; gap: 12px; }
+.net .ic { width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center; background: rgba(89, 252, 179, 0.08); border: 1px solid rgba(89, 252, 179, 0.22); color: var(--green); flex: none; }
+.net .ic svg { width: 20px; height: 20px; }
+.net h3 { font-size: 1.05rem; font-weight: 600; }
+.net .tag { font-size: 0.78rem; color: var(--text-4); }
+.net p { color: var(--text-3); font-size: 0.9rem; }
+.addr { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; background: #080808; border: 1px solid var(--line); border-radius: 10px; padding: 8px 8px 8px 12px; }
+.addr code { font-family: var(--mono); font-size: 0.8rem; color: var(--text); overflow-wrap: anywhere; line-height: 1.35; }
+.copy { font: inherit; font-size: 0.78rem; font-weight: 500; color: var(--bg); background: var(--green); border: 0; border-radius: 7px; padding: 6px 10px; cursor: pointer; min-height: 30px; transition: background 0.2s var(--ease), transform 0.15s var(--ease); }
+.copy:hover { background: #7dfdc6; }
+.copy:active { transform: scale(0.96); }
+.copy.done { background: var(--green-3); color: var(--text); }
+.addrs { display: grid; gap: 8px; }
+.none { color: var(--text-4); font-size: 0.88rem; font-style: italic; }
+
+/* What it carries */
+.carry { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 12px; }
+.panel { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 20px; }
+.panel h3 { font-size: 0.95rem; font-weight: 600; margin-bottom: 14px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { display: inline-flex; align-items: baseline; gap: 7px; padding: 6px 11px; border-radius: 999px; background: #141414; border: 1px solid var(--line); font-size: 0.85rem; color: var(--text-2); }
+.chip i { font-style: normal; font-family: var(--mono); font-size: 0.72rem; color: var(--green-2); }
+.policy { margin-top: 16px; color: var(--text-3); font-size: 0.88rem; }
+.limits { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.limits li { display: flex; justify-content: space-between; gap: 12px; font-size: 0.9rem; color: var(--text-3); border-bottom: 1px dashed var(--line); padding-bottom: 9px; }
+.limits li:last-child { border-bottom: 0; padding-bottom: 0; }
+.limits b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* Operator and footer */
+.op { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 16px; align-items: center; }
+.op img { width: 52px; height: 52px; border-radius: 50%; object-fit: cover; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px rgba(89, 252, 179, 0.45); }
+.op .who { display: grid; gap: 4px; min-width: 0; }
+.op .who .addr { max-width: 640px; }
+.op .who a { color: var(--green); text-decoration: none; font-size: 0.9rem; }
+.op .who a:hover { text-decoration: underline; }
+footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; padding-top: 22px; border-top: 1px solid var(--line); color: var(--text-4); font-size: 0.84rem; }
+footer a { color: var(--text-3); text-decoration: none; }
+footer a:hover { color: var(--green); }
+
+@media (max-width: 820px) {
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .nets, .carry { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 520px) {
+  .wrap { padding-top: 36px; gap: 44px; }
+  .mast { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .mark { width: 64px; }
+}
+@media (prefers-reduced-motion: reduce) { .dot, .mark { animation: none; } .net, .copy, .tile .v { transition: none; } }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <header class="mast">
+    {{MARK_SVG}}
+    <div>
+      {{WORD_SVG}}
+      <h1>{{NAME}}</h1>
+      <p class="lead">{{DESC}}</p>
+      <div class="status" id="status"><span class="dot"></span><b id="state">Online</b><span id="since">up {{UPTIME}}</span></div>
+    </div>
+  </header>
+
+  <section aria-label="Live numbers">
+    <div class="tiles">
+      <div class="tile"><span class="v" id="t-events">{{EVENTS}}</span><span class="k">events stored</span></div>
+      <div class="tile"><span class="v" id="t-open">{{OPEN}}</span><span class="k">connected now</span></div>
+      <div class="tile"><span class="v" id="t-answer">{{ANSWER}}</span><span class="k">average answer</span></div>
+      <div class="tile"><span class="v" id="t-served">{{SERVED}}</span><span class="k">events sent out</span></div>
+    </div>
+  </section>
+
+  <section aria-labelledby="connect-h">
+    <div class="sec-head">
+      <span class="eyebrow">Connect</span>
+      <h2 id="connect-h">Add it to your Nostr client</h2>
+      <p>Paste an address into your client&rsquo;s relay settings. The Tor and I2P addresses lead to this same relay; Vector finds them on its own from the relay&rsquo;s information.</p>
+    </div>
+    <div class="nets">
+      <article class="net">
+        <header><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.8 3.9 5.8 3.9 9s-1.3 6.2-3.9 9c-2.6-2.8-3.9-5.8-3.9-9S9.4 5.8 12 3z"/></svg></span><div><h3>Clearnet</h3><span class="tag">Any Nostr client</span></div></header>
+        <div class="addrs" id="clearnet">{{CLEARNET}}</div>
+        <p>The everyday route, over TLS.</p>
+      </article>
+      <article class="net">
+        <header><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 21c-4.4 0-7-2.9-7-6.6 0-3.5 2.8-6.3 4.6-8.1C10.7 5.2 11.6 4 12 3c.4 1 1.3 2.2 2.4 3.3 1.8 1.8 4.6 4.6 4.6 8.1C19 18.1 16.4 21 12 21z"/><path d="M12 21c-2.3 0-3.7-2.3-3.7-5.4 0-2.6 1.9-4.8 3.7-6.6 1.8 1.8 3.7 4 3.7 6.6 0 3.1-1.4 5.4-3.7 5.4z"/><path d="M12 21c-.9 0-1.4-1.6-1.4-3.7 0-1.6.6-3.2 1.4-4.4.8 1.2 1.4 2.8 1.4 4.4 0 2.1-.5 3.7-1.4 3.7z"/></svg></span><div><h3>Tor</h3><span class="tag">Onion service</span></div></header>
+        <div class="addrs">{{TOR}}</div>
+        <p>Never leaves the Tor network. Needs Tor, such as Orbot or Tor Browser&rsquo;s.</p>
+      </article>
+      <article class="net">
+        <header><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="5" r="2.2"/><circle cx="5" cy="18" r="2.2"/><circle cx="19" cy="18" r="2.2"/><circle cx="12" cy="13" r="1.6"/><path d="M12 7.2v4.2M10.7 14l-4 2.6M13.3 14l4 2.6M7.2 18h9.6"/></svg></span><div><h3>I2P</h3><span class="tag">Garlic-routed</span></div></header>
+        <div class="addrs">{{I2P}}</div>
+        <p>Reached through an I2P router, such as i2pd.</p>
+      </article>
+    </div>
+  </section>
+
+  <section aria-labelledby="carry-h">
+    <div class="sec-head">
+      <span class="eyebrow">What it carries</span>
+      <h2 id="carry-h">Supported features</h2>
+    </div>
+    <div class="carry">
+      <div class="panel">
+        <h3>NIPs</h3>
+        <div class="chips">{{NIPS}}</div>
+        <p class="policy">{{POLICY}}</p>
+      </div>
+      <div class="panel">
+        <h3>Limits</h3>
+        <ul class="limits">{{LIMITS}}</ul>
+      </div>
+    </div>
+  </section>
+
+  {{OPERATOR}}
+
+  <footer>
+    <span>Runs {{SOFTWARE}} {{VERSION}}</span>
+    <span><a href="dashboard">Live dashboard</a></span>
+  </footer>
+</main>
+<script>
+// Copy buttons, and the four numbers kept live from `live` (relative to <base>,
+// so it works at / and behind a web server at /nostr alike).
+(() => {
+  for (const b of document.querySelectorAll(".copy")) {
+    b.addEventListener("click", async () => {
+      const text = b.dataset.copy;
+      try { await navigator.clipboard.writeText(text); } catch {
+        const t = document.createElement("textarea"); t.value = text; document.body.append(t); t.select(); document.execCommand("copy"); t.remove();
+      }
+      b.textContent = "Copied"; b.classList.add("done");
+      setTimeout(() => { b.textContent = "Copy"; b.classList.remove("done"); }, 1600);
+    });
+  }
+  const box = document.getElementById("clearnet");
+  if (!box.querySelector("code")) {
+    // No addresses set in the settings: this page's own.
+    const proto = location.protocol === "https:" ? "wss://" : "ws://";
+    const url = proto + location.host + location.pathname.replace(/\/$/, "");
+    box.innerHTML = '<div class="addr"><code></code><button class="copy" type="button">Copy</button></div>';
+    box.querySelector("code").textContent = url;
+    const b = box.querySelector(".copy"); b.dataset.copy = url;
+    b.addEventListener("click", async () => { try { await navigator.clipboard.writeText(url); b.textContent = "Copied"; } catch {} });
+  }
+  const fmt = (n) => n.toLocaleString("en-US");
+  const short = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e4 ? Math.round(n / 1e3) + "K" : fmt(n);
+  const up = (s) => {
+    const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+    return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+  };
+  const set = (id, html) => {
+    const el = document.getElementById(id);
+    if (el.innerHTML === html) return;
+    el.innerHTML = html; el.classList.add("bump");
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove("bump")));
+  };
+  const status = document.getElementById("status");
+  async function tick() {
+    if (document.hidden) return;
+    try {
+      const r = await fetch("live", { cache: "no-store" });
+      const d = await r.json();
+      set("t-events", fmt(d.events));
+      set("t-open", fmt(d.connections));
+      set("t-answer", d.answer_ms.toFixed(2) + "<small>ms</small>");
+      set("t-served", short(d.events_out));
+      document.getElementById("since").textContent = "up " + up(d.uptime_secs);
+      document.getElementById("state").textContent = "Online";
+      status.classList.remove("off");
+    } catch {
+      document.getElementById("state").textContent = "Reconnecting";
+      status.classList.add("off");
+    }
+  }
+  setInterval(tick, 4000);
+  document.addEventListener("visibilitychange", tick);
+})();
+</script>
+</body>
+</html>

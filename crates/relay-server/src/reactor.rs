@@ -1027,20 +1027,26 @@ async fn plain_http(s: &mut Sock, req: &OwnedRequest, shared: &Shared) -> io::Re
         ("Access-Control-Allow-Methods", "GET, OPTIONS"),
     ];
     let path = req.path.split('?').next().unwrap_or("");
+    // Pages are known by their last segment, so they work wherever a web
+    // server mounts the relay: /stats, and /nostr/stats behind nginx's /nostr.
+    let page = path.rsplit('/').next().unwrap_or("");
     if req.method == "OPTIONS" {
         write_response(&mut out, 204, "No Content", "text/plain", &cors, b"", true);
-    } else if path == "/dashboard" {
-        // Same-origin with /stats, which is all it reads.
+    } else if page == "dashboard" {
+        // Reads `stats` beside it, relative to where it is served.
         write_response(&mut out, 200, "OK", "text/html; charset=utf-8", &[], include_str!("dashboard.html").as_bytes(), true);
-    } else if path == "/stats" {
+    } else if page == "stats" {
         write_response(&mut out, 200, "OK", "application/json", &cors, crate::stats::json(shared).as_bytes(), true);
-    } else if path == "/metrics" {
+    } else if page == "metrics" {
         write_response(&mut out, 200, "OK", "text/plain; version=0.0.4", &[], crate::stats::prometheus(shared).as_bytes(), true);
+    } else if page == "live" {
+        write_response(&mut out, 200, "OK", "application/json", &cors, crate::landing::live_json(shared).as_bytes(), true);
+    } else if page == "rubik.woff2" {
+        write_response(&mut out, 200, "OK", "font/woff2", &[("Cache-Control", "public, max-age=604800")], crate::landing::FONT, true);
     } else if req.accepts("application/nostr+json") {
         write_response(&mut out, 200, "OK", "application/nostr+json", &cors, shared.nip11.as_bytes(), true);
     } else {
-        let body = format!("{}\n\nThis is a Nostr relay. Connect to it with a Nostr client such as Vector.\n", shared.cfg.info.name);
-        write_response(&mut out, 200, "OK", "text/plain; charset=utf-8", &cors, body.as_bytes(), true);
+        write_response(&mut out, 200, "OK", "text/html; charset=utf-8", &[], crate::landing::page(shared, path).as_bytes(), true);
     }
     s.write_all(&out).await?;
     s.shutdown().await
