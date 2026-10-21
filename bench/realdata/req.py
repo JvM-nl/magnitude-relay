@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""req.py HOST:PORT 'FILTER_JSON' [...]  One REQ, every answer printed as a line.
+"""req.py HOST:PORT [--count] 'FILTER_JSON' [...]  One REQ (or COUNT), every answer printed as a line.
 
 Standard library only (the box has no WebSocket client): a plain ws:// handshake,
 masked text frames out, unfragmented frames in. Prints each EVENT's JSON, then the
@@ -11,6 +11,7 @@ import os
 import socket
 import struct
 import sys
+import time
 
 
 def frame(text):
@@ -41,7 +42,8 @@ def read_exact(s, n, buf):
 
 def main():
     host, port = sys.argv[1].rsplit(":", 1)
-    filters = [json.loads(f) for f in sys.argv[2:]]
+    verb = "COUNT" if "--count" in sys.argv[2:] else "REQ"
+    filters = [json.loads(f) for f in sys.argv[2:] if f != "--count"]
     s = socket.create_connection((host, int(port)))
     key = base64.b64encode(os.urandom(16)).decode()
     s.sendall(f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -53,7 +55,8 @@ def main():
     if b" 101 " not in head.split(b"\r\n")[0]:
         sys.exit(f"no upgrade: {head[:200]!r}")
     buf = bytearray(rest)
-    s.sendall(frame(json.dumps(["REQ", "q"] + filters)))
+    started = time.monotonic()
+    s.sendall(frame(json.dumps([verb, "q"] + filters)))
     while True:
         b0, b1 = read_exact(s, 2, buf)
         n = b1 & 0x7F
@@ -68,8 +71,8 @@ def main():
         if msg[0] == "EVENT":
             print(json.dumps(msg[2], separators=(",", ":")))
         else:
-            print(json.dumps(msg))
-            if msg[0] in ("EOSE", "CLOSED"):
+            print(json.dumps(msg), f"({(time.monotonic() - started) * 1000:.1f} ms)", file=sys.stderr if verb == "REQ" else sys.stdout)
+            if msg[0] in ("EOSE", "CLOSED", "COUNT"):
                 return
 
 
