@@ -689,8 +689,11 @@ pub fn noread(env: &mut Env) -> Outcome {
         ));
     }
     let per = rss1.saturating_sub(rss0) / sinks.len().max(1) as u64;
-    if per > 16 * 1024 {
+    if held > 0 && per > 16 * 1024 {
         out.finding(format!("{} MB of relay memory per subscriber that never reads", per / 1024));
+    } else if per > 16 * 1024 {
+        // They are gone: what stays is the allocator keeping freed memory.
+        out.note(format!("the subscribers are dropped; {} MB per subscriber not yet given back to the system", per / 1024));
     }
     out
 }
@@ -892,11 +895,25 @@ pub fn churn(env: &mut Env) -> Outcome {
     if fds1 > fds0 + 32 {
         out.finding(format!("descriptors grew from {fds0} to {fds1} after churn: connections leak"));
     }
+    // After that much churn this machine may be out of local ports for a
+    // while (TIME_WAIT): wait for one rather than blame the relay.
+    let connect = |ip: &str| {
+        let mut tries = 0;
+        loop {
+            match Conn::connect(addr, &Opts { ip: Some(ip), ..Opts::default() }) {
+                Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable && tries < 120 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                r => return r,
+            }
+        }
+    };
     // Per-IP: 64 connections are allowed from one address (the default).
     let mut held = Vec::new();
     let mut refused = None;
     for k in 0..70 {
-        match Conn::connect(addr, &Opts { ip: Some("10.250.0.1"), ..Opts::default() }) {
+        match connect("10.250.0.1") {
             Ok(mut c) => {
                 c.s.set_read_timeout(Some(Duration::from_millis(100))).ok();
                 if let Ok(Msg::Close(code)) = c.recv() {
@@ -919,7 +936,7 @@ pub fn churn(env: &mut Env) -> Outcome {
     drop(held);
     std::thread::sleep(Duration::from_millis(500));
     // The slots come back.
-    if Conn::connect(addr, &Opts { ip: Some("10.250.0.1"), ..Opts::default() }).is_err() {
+    if connect("10.250.0.1").is_err() {
         out.finding("the address's connection slots did not come back after its connections closed");
     }
     // EVENT rate: 1200 a minute per address by default.
