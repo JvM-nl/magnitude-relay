@@ -151,13 +151,21 @@ struct SyncJob {
     gen: u64,
     /// Told whether the sync failed, after it: how an ingested batch is answered.
     done: Option<Box<dyn FnOnce(bool) + Send>>,
+    /// When the writer took the batch's first event (RELAY_DEBUG_WRITER timings).
+    taken: Instant,
 }
 
 /// Syncs published batches in order, coalescing whatever has queued into one
 /// sync, then sends their OKs. Runs beside the writer, so staging the next batch
 /// never waits for the disk.
 fn syncer(rx: Receiver<SyncJob>, sinks: Vec<Sink>) {
-    while let Ok(first) = rx.recv() {
+    let debug = debug();
+    let (mut d_syncs, mut d_jobs, mut d_sync, mut d_sync_max, mut d_age, mut d_age_max, mut d_idle) = (0u64, 0u64, 0f64, 0f64, 0f64, 0f64, 0f64);
+    let mut d_last = Instant::now();
+    loop {
+        let t_wait = Instant::now();
+        let Ok(first) = rx.recv() else { break };
+        d_idle += t_wait.elapsed().as_secs_f64();
         let mut jobs = vec![first];
         while let Ok(j) = rx.try_recv() {
             jobs.push(j);
@@ -171,6 +179,7 @@ fn syncer(rx: Receiver<SyncJob>, sinks: Vec<Sink>) {
                 }
             }
         }
+        let t_sync = Instant::now();
         let failed = match ticket.map_or(Ok(()), |t| t.sync()) {
             Ok(()) => false,
             Err(e) => {
@@ -178,6 +187,26 @@ fn syncer(rx: Receiver<SyncJob>, sinks: Vec<Sink>) {
                 true
             }
         };
+        if debug {
+            let took = t_sync.elapsed().as_secs_f64();
+            let age = jobs[0].taken.elapsed().as_secs_f64();
+            (d_syncs, d_jobs, d_sync, d_sync_max) = (d_syncs + 1, d_jobs + jobs.len() as u64, d_sync + took, d_sync_max.max(took));
+            (d_age, d_age_max) = (d_age + age, d_age_max.max(age));
+            if d_last.elapsed().as_secs() >= 1 {
+                let n = d_syncs.max(1) as f64;
+                eprintln!(
+                    "syncer: {d_syncs} syncs, {:.1} batches/sync, sync {:.2} ms (max {:.2}), taken-to-OK {:.2} ms (max {:.2}), idle {:.0}%",
+                    d_jobs as f64 / n,
+                    d_sync * 1e3 / n,
+                    d_sync_max * 1e3,
+                    d_age * 1e3 / n,
+                    d_age_max * 1e3,
+                    d_idle * 100.0 / d_last.elapsed().as_secs_f64()
+                );
+                (d_syncs, d_jobs, d_sync, d_sync_max, d_age, d_age_max, d_idle) = (0, 0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                d_last = Instant::now();
+            }
+        }
         for mut j in jobs {
             if failed {
                 for r in j.replies.iter_mut().flatten() {
@@ -254,7 +283,7 @@ fn ingest(w: &mut Writer, store: &Store, recs: Vec<Vec<u8>>, reply: IngestReply,
     // were relayed live has been published.
     let replies = (0..sinks.len()).map(|_| Vec::new()).collect();
     let done = Box::new(move |failed: bool| reply((!failed).then_some(outcomes)));
-    if let Err(e) = sync_tx.send(SyncJob { ticket: Some(ticket), replies, gen: store.generation(), done: Some(done) }) {
+    if let Err(e) = sync_tx.send(SyncJob { ticket: Some(ticket), replies, gen: store.generation(), done: Some(done), taken: Instant::now() }) {
         if let Some(done) = e.0.done {
             done(true);
         }
@@ -304,6 +333,7 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, ctl: Receiver<Co
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        let taken = Instant::now();
         reqs.clear();
         let mut bytes = first.rec.len();
         let received = first.at;
@@ -333,7 +363,7 @@ pub fn run(mut w: Writer, store: Store, rx: Receiver<WriteReq>, ctl: Receiver<Co
         }
         // OKs, duplicates included, wait for the sync of this batch (and so of
         // every batch before it).
-        let _ = sync_tx.send(SyncJob { ticket, replies, gen: store.generation(), done: None });
+        let _ = sync_tx.send(SyncJob { ticket, replies, gen: store.generation(), done: None, taken });
         if debug {
             d_batches += 1;
             d_events += outcomes_len;
