@@ -970,3 +970,114 @@ async fn a_web_server_can_reach_the_relay_over_a_unix_socket() {
     assert!(!sock.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The same event with its signature broken (one hex digit changed).
+fn bad_sig(mut ev: Value) -> Value {
+    let mut sig = ev["sig"].as_str().unwrap().as_bytes().to_vec();
+    sig[10] = if sig[10] == b'0' { b'1' } else { b'0' };
+    ev["sig"] = Value::String(String::from_utf8(sig).unwrap());
+    ev
+}
+
+/// Many EVENTs (and a REQ) in one write, so they reach the relay in one read
+/// and their signatures are checked as a batch: every event still gets its
+/// own verdict, in order, including bad signatures among good ones, a
+/// duplicate, an ephemeral event and a REQ between them.
+#[tokio::test]
+async fn bursts_of_events_are_verified_together() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-burst-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = Relay::start(dir, port);
+    let host = format!("127.0.0.1:{port}");
+    let me = Signer::new(31);
+    let others: Vec<Signer> = (40..44).map(Signer::new).collect();
+
+    // B listens for the ephemeral kind.
+    let mut b = client_connect(relay.addr, &host, "/").await.unwrap();
+    send(&mut b, json!(["REQ", "eph", {"kinds": [21059], "authors": [me.pk()]}])).await;
+    collect(&mut b, "eph").await;
+
+    for round in 0..3u64 {
+        let mut a = client_connect(relay.addr, &host, "/").await.unwrap();
+        // (event, expected OK, expected message prefix)
+        let mut burst: Vec<(Value, bool, &str)> = Vec::new();
+        for i in 0..40u64 {
+            // Mostly one author (merged in the batch), some others.
+            let s = if i % 5 == 0 { &others[(i / 5) as usize % others.len()] } else { &me };
+            let ev = s.event(now() - i - round * 100, 1059, json!([["p", hex::encode_string(&[i as u8; 32])]]), &format!("burst {round} {i}"));
+            if round > 0 && i % 13 == 7 {
+                burst.push((bad_sig(ev), false, "invalid: bad signature"));
+            } else {
+                burst.push((ev, true, ""));
+            }
+        }
+        // A duplicate of the first event and an ephemeral one, mid-burst.
+        let dup = burst[0].0.clone();
+        burst.insert(20, (dup, true, "duplicate:"));
+        burst.insert(25, (me.event(now(), 21059, json!([]), &format!("typing {round}")), true, ""));
+        for (ev, _, _) in &burst[..30] {
+            a.queue_text(&json!(["EVENT", ev]).to_string());
+        }
+        a.queue_text(&json!(["REQ", "mid", {"ids": ["00".repeat(32)]}]).to_string());
+        for (ev, _, _) in &burst[30..] {
+            a.queue_text(&json!(["EVENT", ev]).to_string());
+        }
+        a.flush().await.unwrap();
+
+        // Refusals are written at once, the REQ's EOSE after everything sent
+        // before it; stored events are answered after the sync.
+        let mut oks: std::collections::HashMap<String, Vec<(bool, String)>> = std::collections::HashMap::new();
+        let mut eose_after_refusals = None;
+        let mut refusals_seen = 0;
+        while oks.values().map(Vec::len).sum::<usize>() < burst.len() || eose_after_refusals.is_none() {
+            let m = recv(&mut a).await;
+            match m[0].as_str().unwrap() {
+                "OK" => {
+                    let accepted = m[2].as_bool().unwrap();
+                    if !accepted {
+                        refusals_seen += 1;
+                    }
+                    oks.entry(m[1].as_str().unwrap().to_string()).or_default().push((accepted, m[3].as_str().unwrap().to_string()));
+                }
+                "EOSE" => eose_after_refusals = Some(refusals_seen),
+                _ => {}
+            }
+        }
+        let refused_before_req = burst[..30].iter().filter(|(_, ok, _)| !ok).count();
+        assert_eq!(eose_after_refusals, Some(refused_before_req), "round {round}: refusals before the REQ come before its EOSE");
+        for (ev, want_ok, want_msg) in &burst {
+            let id = ev["id"].as_str().unwrap();
+            let got = oks.get(id).unwrap_or_else(|| panic!("round {round}: no OK for {id}"));
+            if got.len() == 2 {
+                // The duplicated event: the first copy and the duplicate each get an OK true.
+                assert!(got.iter().all(|(ok, _)| *ok), "round {round}: {got:?}");
+                assert!(got.iter().any(|(_, msg)| msg.starts_with("duplicate:")), "round {round}: {got:?}");
+                continue;
+            }
+            assert_eq!(got.len(), 1, "round {round}: one OK for {id}");
+            assert_eq!(got[0].0, *want_ok, "round {round}: verdict for {id}: {:?}", got[0]);
+            assert!(got[0].1.starts_with(want_msg), "round {round}: message for {id}: {:?}", got[0]);
+        }
+        // The ephemeral event reached the listener.
+        let live = recv(&mut b).await;
+        assert_eq!(live[0], "EVENT");
+        assert_eq!(live[2]["content"], format!("typing {round}"));
+    }
+    // Exactly the good stored events are there.
+    let authors: Vec<String> = std::iter::once(me.pk()).chain(others.iter().map(Signer::pk)).collect();
+    let stored = ids_over_req(&relay, json!({"kinds": [1059], "authors": authors, "limit": 1000})).await;
+    assert_eq!(stored.len(), 40 + 2 * (40 - 3));
+    // The clean round went through the batch check; the two with bad
+    // signatures each failed a batch and fell back.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+    s.write_all(format!("GET /stats HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).await.unwrap();
+    let stats: Value = serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert!(stats["sigs_batched"].as_u64().unwrap() >= 30, "{stats}");
+    assert!(stats["sig_batches_failed"].as_u64().unwrap() >= 2, "{stats}");
+    let dir = relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
