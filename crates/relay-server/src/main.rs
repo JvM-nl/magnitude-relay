@@ -3,6 +3,7 @@
 mod admin;
 mod brand;
 mod config;
+mod ephemeral;
 mod export;
 mod health;
 mod import;

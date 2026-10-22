@@ -449,3 +449,67 @@ async fn a_trusted_peer_gets_everything_and_vouches_for_first_hand_events() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Ephemeral events cross a sync both ways, as Asia's strfry router carried
+/// typing and voice presence: delivered live on the other relay, once each,
+/// never stored and never circling back, even when a client sends the same one
+/// to both relays (as Vector publishes to several).
+#[tokio::test]
+async fn ephemeral_events_cross_a_sync_once_and_are_never_kept() {
+    let (da, db) = (tmp("eph-a"), tmp("eph-b"));
+    let pa = free_port();
+    let mut a = Relay::configure(&da, pa, "", "");
+    let mut b = Relay::configure(&db, free_port(), "", &format!("[[sync]]\nurl = \"ws://127.0.0.1:{pa}\"\ndirection = \"both\"\nreconcile_seconds = 3600\n"));
+    a.start();
+    b.start();
+    let t = Instant::now();
+    while stats(&b).await["sync"][0]["connected"] != 1 {
+        assert!(t.elapsed() < Duration::from_secs(30), "B never connected to A");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A listener on each relay, as a member of a community would be.
+    async fn listen(r: &Relay) -> relay_net::conn::ClientConn {
+        let mut c = client_connect(r.addr(), &format!("127.0.0.1:{}", r.port), "/").await.unwrap();
+        c.send_text(&json!(["REQ", "eph", {"kinds": [21059], "limit": 0}]).to_string()).await.unwrap();
+        raw_events(&mut c, "eph").await;
+        c
+    }
+    async fn heard(c: &mut relay_net::conn::ClientConn, for_: Duration) -> Vec<String> {
+        let mut ids = Vec::new();
+        let until = Instant::now() + for_;
+        while let Ok(m) = tokio::time::timeout(until.saturating_duration_since(Instant::now()), c.recv()).await {
+            if let Message::Text(t) = m.unwrap() {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v[0] == "EVENT" {
+                    ids.push(v[2]["id"].as_str().unwrap().to_string());
+                }
+            }
+        }
+        ids
+    }
+    let (mut la, mut lb) = (listen(&a).await, listen(&b).await);
+
+    let s = Signer::new(90);
+    let on_a = s.event(now(), 21059, json!([]), "typing on a");
+    let on_b = s.event(now(), 21059, json!([]), "typing on b");
+    let on_both = s.event(now(), 21059, json!([]), "typing on both");
+    publish(&a, std::slice::from_ref(&on_a)).await;
+    publish(&b, std::slice::from_ref(&on_b)).await;
+    publish(&a, std::slice::from_ref(&on_both)).await;
+    publish(&b, std::slice::from_ref(&on_both)).await;
+    let (got_a, got_b) = (heard(&mut la, Duration::from_secs(3)).await, heard(&mut lb, Duration::from_secs(1)).await);
+    for (relay, got) in [("A", &got_a), ("B", &got_b)] {
+        for (ev, what) in [(&on_a, "the one sent to A"), (&on_b, "the one sent to B"), (&on_both, "the one sent to both")] {
+            let n = got.iter().filter(|id| id.as_str() == ev["id"].as_str().unwrap()).count();
+            assert_eq!(n, 1, "{relay}'s listener heard {what} {n} times: {got:?}");
+        }
+    }
+    let kept = json!({"kinds": [21059]}).to_string();
+    assert_eq!((a.count(&kept), b.count(&kept)), (0, 0), "ephemeral events are never stored");
+
+    a.stop();
+    b.stop();
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}

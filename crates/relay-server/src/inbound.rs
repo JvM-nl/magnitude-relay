@@ -110,6 +110,29 @@ fn bad_signature() -> Verdict {
     Verdict::Invalid("invalid: bad signature".into())
 }
 
+/// An ephemeral event a peer relayed live, checked as a client's would be
+/// (policy, id, signature) so it can be delivered here; it is never stored.
+/// Its record, or why not.
+pub fn check_ephemeral(text: &str, at: usize, cfg: &SessionCfg, now: u64) -> Result<Vec<u8>, Verdict> {
+    let mut parser = EventParser::new();
+    let mut rec = Vec::new();
+    let info = parser.parse_unchecked(&mut Scanner::new_at(text, at), &mut rec).map_err(|e| Verdict::Invalid(format!("invalid: {e}")))?;
+    if !kind::is_ephemeral(info.kind) {
+        return Err(Verdict::Invalid("invalid: not an ephemeral event".into()));
+    }
+    if let Some(msg) = cfg.refusal(&info, Record(&rec), now) {
+        return Err(Verdict::Refused(msg));
+    }
+    if parser.confirm_id(Scanner::new_at(text, at), &mut rec, info).is_err() {
+        return Err(Verdict::Invalid("invalid: bad event id".into()));
+    }
+    let r = Record(&rec);
+    if !relay_proto::secp::verify_one(&SigRef { pubkey: r.pubkey(), msg: r.id(), sig: r.sig() }) {
+        return Err(bad_signature());
+    }
+    Ok(rec)
+}
+
 /// Checks a batch of events, spread over up to `threads` threads (signature
 /// checks are the cost). Per event: its record to store, or what settled it.
 /// Each thread checks its share's signatures together (`secp::Verifier`),
@@ -368,5 +391,45 @@ mod tests {
         }
         drop((v, w, store));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_peers_ephemeral_event_is_checked_like_a_clients() {
+        use secp256k1::{schnorr, Keypair};
+        use sha2::{Digest, Sha256};
+        let k = Keypair::from_secret_bytes([9; 32]).unwrap();
+        let now = 1_700_000_000;
+        let event = |kind: u64| -> String {
+            let pk = relay_proto::hex::encode_string(&k.x_only_public_key().0.to_byte_array());
+            let pre = format!("[0,\"{pk}\",{now},{kind},[],\"typing\"]");
+            let id: [u8; 32] = Sha256::digest(pre.as_bytes()).into();
+            let sig = relay_proto::hex::encode_string(&schnorr::sign_no_aux_rand(&id, &k).to_byte_array());
+            let id = relay_proto::hex::encode_string(&id);
+            format!("{{\"id\":\"{id}\",\"pubkey\":\"{pk}\",\"created_at\":{now},\"kind\":{kind},\"tags\":[],\"content\":\"typing\",\"sig\":\"{sig}\"}}")
+        };
+        let cfg = SessionCfg {
+            max_subscriptions: 10,
+            max_filters: 10,
+            max_filter_values: 10,
+            default_limit: 10,
+            max_limit: 10,
+            max_event_bytes: 65_536,
+            max_future_seconds: 900,
+            max_tags: 100,
+            max_outbound: 1 << 20,
+            kind_allowed: Box::new(|k| k == 1 || kind::is_ephemeral(k)),
+        };
+        let good = event(21059);
+        let rec = check_ephemeral(&good, 0, &cfg, now).expect("a valid ephemeral event");
+        assert_eq!(Record(&rec).kind(), 21059);
+        // A signature digit changed.
+        let at = good.find("\"sig\":\"").unwrap() + 9;
+        let mut forged = good.clone();
+        forged.replace_range(at..at + 1, if &good[at..at + 1] == "0" { "1" } else { "0" });
+        assert_eq!(check_ephemeral(&forged, 0, &cfg, now), Err(bad_signature()));
+        // The content changed: a bad id.
+        assert!(matches!(check_ephemeral(&good.replace("\"typing\"", "\"typinG\""), 0, &cfg, now), Err(Verdict::Invalid(m)) if m.contains("id")));
+        // A stored kind is not this path's business.
+        assert!(matches!(check_ephemeral(&event(1), 0, &cfg, now), Err(Verdict::Invalid(_))));
     }
 }

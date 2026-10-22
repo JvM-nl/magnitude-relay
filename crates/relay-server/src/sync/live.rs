@@ -8,6 +8,11 @@
 //! - **live**: between passes, a REQ for new events only (`limit: 0`) streams
 //!   theirs in (down), and our new events are published as they become durable
 //!   (up), found by walking the store's seqs from where the last walk stopped.
+//!   Ephemeral events are never stored, so they travel apart: one of theirs is
+//!   checked and delivered here at once, and our clients' are passed on as
+//!   they come (`Shared::ephemeral_out`). One a peer relayed is never passed
+//!   on again, and `Shared::ephemeral_seen` delivers each id once, so the copy
+//!   a client also sent here, or one coming back, goes nowhere.
 //!
 //! Nothing here can stall the relay. Events go to the writer the way an
 //! operator's delete does (`Control`, one batch between client batches), and
@@ -23,13 +28,14 @@ use super::local::{carries, Inbound, InServer, Local, Refused};
 use super::remote::Remote;
 use super::{filter_text, slow_down, sync_filter, verdict_of_ok, Backoff, Opts, Report, PUSH_WINDOW};
 use crate::config::SyncCfg;
-use crate::inbound::{Tally, Verdict};
+use crate::inbound::{self, Tally, Verdict};
 use crate::ingest::{self, Control};
 use crate::session::{self, SessionCfg};
 use relay_net::connector::{Connector, RelayUrl};
 use relay_proto::json::Scanner;
 use relay_proto::message::RelayMsg;
-use relay_proto::{EventParser, Filter, Record};
+use crate::reactor::Shared;
+use relay_proto::{kind, EventParser, Filter, Record};
 use relay_store::Store;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -177,6 +183,8 @@ struct Entry {
     ctl: Sender<Control>,
     policy: Arc<SessionCfg>,
     stats: Arc<Stats>,
+    /// Where ephemeral events are delivered from and handed out by.
+    shared: Arc<Shared>,
     mine: RefCell<Mine>,
     /// What this entry turned away, so later passes do not fetch it again.
     refused: Rc<RefCell<Refused>>,
@@ -199,7 +207,7 @@ impl Entry {
 }
 
 /// Starts the sync thread for `entries` (nothing when there are none).
-pub fn start(entries: Vec<SyncCfg>, stats: Vec<Arc<Stats>>, store: Store, ctl: Sender<Control>, policy: Arc<SessionCfg>) -> io::Result<()> {
+pub fn start(entries: Vec<SyncCfg>, stats: Vec<Arc<Stats>>, store: Store, ctl: Sender<Control>, policy: Arc<SessionCfg>, shared: Arc<Shared>) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -219,6 +227,7 @@ pub fn start(entries: Vec<SyncCfg>, stats: Vec<Arc<Stats>>, store: Store, ctl: S
                     ctl: ctl.clone(),
                     policy: policy.clone(),
                     stats,
+                    shared: shared.clone(),
                     mine: RefCell::new(Mine::default()),
                     refused: Rc::new(RefCell::new(Refused::new(Refused::CAP))),
                     wake: Notify::new(),
@@ -340,17 +349,39 @@ async fn live_once(e: &Rc<Entry>, cursor: &mut u64, reconnected: bool) -> Result
     let mut out = Outbox::default();
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Our clients' ephemeral events, passed on as they come.
+    let mut ephemeral = dir.up().then(|| e.shared.ephemeral_out.subscribe());
     loop {
         let ticked = tokio::select! {
             text = remote.next() => {
                 let text = text?;
                 match RelayMsg::parse(&text) {
-                    Ok(RelayMsg::Event { sub_id: "live", at, first_hand }) if !already_here(&mut parser, &mut rec, &e.store, &text, at) => {
-                        batch.push(Inbound { text, at, vouched: e.cfg.trusted && first_hand })
-                    }
+                    Ok(RelayMsg::Event { sub_id: "live", at, first_hand }) => match live_kind(&mut parser, &mut rec, &text, at) {
+                        Some(k) if kind::is_ephemeral(k) => ephemeral_in(e, &text, at),
+                        // One we hold already (we published it, or a reconcile fetched it) is skipped
+                        // before any checking; one that does not even parse is left for the check to count.
+                        Some(_) if e.store.snapshot().lookup_id(Record(&rec).id()).is_some() => {}
+                        _ => batch.push(Inbound { text, at, vouched: e.cfg.trusted && first_hand }),
+                    },
                     Ok(RelayMsg::Ok { id, accepted, message }) => answered(e, &mut out, id, accepted, &message),
                     Ok(RelayMsg::Closed { sub_id: "live", message }) => return Err(format!("{} ended the live subscription: {message}", e.url)),
                     _ => {}
+                }
+                false
+            }
+            got = async {
+                match ephemeral.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match got {
+                    Ok(ev) if carries(&e.cfg.filters, Record(&ev), hide_wraps) => {
+                        remote.send(&format!("[\"EVENT\",{}]", Record(&ev).to_json())).await?;
+                    }
+                    // Fell behind: those are stale now; carry on with the newest.
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => ephemeral = None,
                 }
                 false
             }
@@ -369,11 +400,20 @@ async fn live_once(e: &Rc<Entry>, cursor: &mut u64, reconnected: bool) -> Result
     }
 }
 
-/// A live event we hold already (we published it, or a reconcile fetched it)
-/// is skipped before any checking. One that does not even parse is left for
-/// the check to count.
-fn already_here(parser: &mut EventParser, rec: &mut Vec<u8>, store: &Store, text: &str, at: usize) -> bool {
-    parser.parse_unchecked(&mut Scanner::new_at(text, at), rec).is_ok() && store.snapshot().lookup_id(Record(rec).id()).is_some()
+/// A live event's kind, its record left in `rec`; None when it does not parse.
+fn live_kind(parser: &mut EventParser, rec: &mut Vec<u8>, text: &str, at: usize) -> Option<u64> {
+    parser.parse_unchecked(&mut Scanner::new_at(text, at), rec).ok().map(|info| info.kind)
+}
+
+/// An ephemeral event the other relay passed us: checked as a client's would
+/// be and delivered here at once, once per id; never stored or passed on.
+fn ephemeral_in(e: &Entry, text: &str, at: usize) {
+    let mut t = Tally::default();
+    match inbound::check_ephemeral(text, at, &e.policy, ingest::now()) {
+        Ok(rec) => t.add(if e.shared.peer_ephemeral(Arc::from(rec)) { &Verdict::Ephemeral } else { &Verdict::Duplicate }),
+        Err(v) => t.add(&v),
+    }
+    e.stats.count_in(&t);
 }
 
 /// One OK for something we published live.

@@ -128,7 +128,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     std::thread::Builder::new().name("acceptor".into()).spawn(move || reactor::accept_loop(l, conn_txs, None)).map_err(|e| e.to_string())?;
     // Other relays to keep in step with, on a thread of their own.
-    crate::sync::live::start(syncs, shared.sync.clone(), admin_store, ctl_tx, scfg).map_err(|e| format!("cannot start syncing: {e}"))?;
+    crate::sync::live::start(syncs, shared.sync.clone(), admin_store, ctl_tx, scfg, shared.clone()).map_err(|e| format!("cannot start syncing: {e}"))?;
     eprintln!(
         "{} {} listening on {bind}: {threads} reactors, {events} events, ready in {:.2}s",
         crate::brand::NAME,

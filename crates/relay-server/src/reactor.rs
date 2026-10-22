@@ -57,6 +57,10 @@ pub struct Shared {
     pub sync: Vec<Arc<crate::sync::live::Stats>>,
     /// Checks reads' signatures in batches across connections.
     pub verify: crate::verify::Pool,
+    /// Ephemeral ids of the last two minutes: each is delivered once.
+    pub ephemeral_seen: crate::ephemeral::Seen,
+    /// Clients' ephemeral events, for the sync thread to pass to its peers.
+    pub ephemeral_out: tokio::sync::broadcast::Sender<Arc<[u8]>>,
 }
 
 struct IpState {
@@ -83,7 +87,28 @@ impl Shared {
             metrics: Metrics::new(reactors),
             sync,
             verify: crate::verify::Pool::new(reactors),
+            ephemeral_seen: crate::ephemeral::Seen::default(),
+            ephemeral_out: tokio::sync::broadcast::channel(EPHEMERAL_OUT).0,
         }
+    }
+
+    /// An ephemeral event a client sent here: delivered on every reactor and
+    /// handed to the sync peers, once per id (a peer may have sent it first).
+    pub fn client_ephemeral(&self, e: Arc<[u8]>) {
+        if self.ephemeral_seen.first(Record(&e).id(), Instant::now()) {
+            let _ = self.ephemeral_out.send(e.clone());
+            self.broadcast(ReactorMsg::Ephemeral(e));
+        }
+    }
+
+    /// One a sync peer relayed: delivered here, once per id, and never passed
+    /// on, so it cannot circle between relays. False when it was a repeat.
+    pub fn peer_ephemeral(&self, e: Arc<[u8]>) -> bool {
+        let first = self.ephemeral_seen.first(Record(&e).id(), Instant::now());
+        if first {
+            self.broadcast(ReactorMsg::Ephemeral(e));
+        }
+        first
     }
 
     /// Counts a connection from `ip`, unless that IP is at its limit.
@@ -445,6 +470,10 @@ pub fn count_workers(shared: &Arc<Shared>, workers: usize) {
 /// Large COUNTs waiting for a worker before new ones are refused.
 const COUNT_QUEUE: usize = 64;
 
+/// Clients' ephemeral events the sync thread may be behind on before the
+/// oldest are skipped (they are live or worthless).
+const EPHEMERAL_OUT: usize = 4096;
+
 /// Delivers OK replies and live events from each committed batch.
 async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reactor>>, shared: Arc<Shared>) {
     let mut targets = Vec::new();
@@ -775,7 +804,10 @@ struct Pass {
 
 /// Runs `f` with this reactor's context for a session, its replies going to `out`.
 fn with_cx(st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr, conn: ConnId, out: &ConnOut, f: impl FnOnce(&mut Ctx<'_>, &mut WsOut<'_>)) {
-    let broadcast = |m: ReactorMsg| shared.broadcast(m);
+    let broadcast = |m: ReactorMsg| match m {
+        ReactorMsg::Ephemeral(e) => shared.client_ephemeral(e),
+        m => shared.broadcast(m),
+    };
     let allow_event = || shared.take_event(ip);
     let offload = |job: crate::ingest::Job| shared.counts.get().is_some_and(|q| q.try_send(job).is_ok());
     let mut guard = st.borrow_mut();
