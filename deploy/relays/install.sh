@@ -101,7 +101,11 @@ warn=$(curl -s -m3 "$URL/stats" | python3 -c 'import json,sys; print("; ".join(w
 [ -z "$warn" ] || rollback "critical warning after the soak: $warn"
 say "healthy for ${SOAK}s: keeping $REV"
 
+# Kept. Tidying up can no longer change that: nothing below may fail the run
+# (with pipefail, a grep that finds nothing to prune would).
+set +e
 # Keep the five newest releases (the one in service and the previous always).
 keep=$(printf '%s\n%s\n' "$(dirname "$(readlink -f "$BIN")")" "$(dirname "${prev:-/x/x}")")
 ls -1dt "$LIB"/releases/*/ 2>/dev/null | sed 's#/$##' | tail -n +6 | grep -vxF "$keep" | xargs -r rm -rf --
 rm -f "$incoming"
+exit 0
