@@ -1404,16 +1404,25 @@ fn deleted_large_records_give_their_blocks_back() {
     let dir = tmpdir("punch");
     let big = Options { segment_size: 4 << 20, ..opts() };
     let (_store, mut w) = Store::open(&dir, big.clone()).unwrap();
-    let content = "y".repeat(1 << 20);
+    // Not base64 (that would be stored decoded, three quarters the size).
+    let content = "y ".repeat(1 << 19);
     write(&mut w, &[ev(1, 1, 100, 14, "[]", &content)]);
     w.sync().unwrap();
     let seg = dir.join("log").join("00000000.log");
     let before = std::fs::metadata(&seg).unwrap().blocks();
+    assert!(std::fs::read(&seg).unwrap().windows(64).any(|w| w == content[..64].as_bytes()));
     write(&mut w, &[ev(2, 1, 101, 5, &format!(r#"[["e","{}"]]"#, hex32(0xEE, 1)), "")]);
-    // The next batch finds no reader of the old version and zeroes the record.
-    write(&mut w, &[ev(3, 1, 102, 14, "[]", "later")]);
-    w.sync().unwrap();
-    let after = std::fs::metadata(&seg).unwrap().blocks();
+    // The record is zeroed once its deletion is durable and no reader holds
+    // the old version: within a few more batches.
+    let mut after = before;
+    for i in 0..10 {
+        write(&mut w, &[ev(3 + i, 1, 102 + i as u64, 14, "[]", "later")]);
+        w.sync().unwrap();
+        after = std::fs::metadata(&seg).unwrap().blocks();
+        if before - after >= 1900 {
+            break;
+        }
+    }
     assert!(before - after >= 1900, "1 MiB deleted, only {} KiB given back", (before - after) / 2);
     assert!(!std::fs::read(&seg).unwrap().windows(64).any(|w| w == content[..64].as_bytes()));
 }

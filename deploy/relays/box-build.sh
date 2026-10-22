@@ -11,7 +11,9 @@
 #   3. Debug info stripped (symbols kept, so a panic still names its frames).
 #
 # Capped like every other job on this box (it also runs a live relay): CPUs
-# 0-5, nice 10, four jobs; its own CARGO_TARGET_DIR, so builds are incremental.
+# 0-5, nice 10, four jobs, and the idle I/O class (without it the first run's
+# compile and tests raised the live relay's disk-pressure warning to 11%); its
+# own CARGO_TARGET_DIR, so builds are incremental.
 # Prints ARTIFACT=<path> and SHA256=<hex> last.
 set -euo pipefail
 REV=${1:?usage: box-build.sh REV}
@@ -25,7 +27,7 @@ export RUSTUP_TOOLCHAIN=stable-x86_64-unknown-linux-gnu
 export CARGO_BUILD_JOBS=4
 export CARGO_TARGET_DIR=$ROOT/target
 export RELAY_BUILD_REV=$REV
-capped() { systemd-run --scope --quiet -p AllowedCPUs=0-5 nice -n 10 "$@"; }
+capped() { systemd-run --scope --quiet -p AllowedCPUs=0-5 nice -n 10 ionice -c 3 "$@"; }
 cd "$SRC"
 t0=$(date +%s)
 echo "test   : workspace, release" >&2
