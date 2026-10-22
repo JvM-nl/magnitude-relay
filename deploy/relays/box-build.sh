@@ -42,7 +42,9 @@ capped cargo build --release -p relay-server > "$ROOT/build-$REV.log" 2>&1 || { 
 mkdir -p "$OUT"
 objcopy --strip-debug "$CARGO_TARGET_DIR/release/magnitude-relay" "$OUT/magnitude-relay-$REV.new"
 mv -f "$OUT/magnitude-relay-$REV.new" "$OUT/magnitude-relay-$REV"
-strings "$OUT/magnitude-relay-$REV" | grep -q "$REV" || { echo "the binary does not carry $REV" >&2; exit 1; }
+# grep reads everything (-q would stop at the first match, strings would die of
+# SIGPIPE, and pipefail would call that a failure).
+strings "$OUT/magnitude-relay-$REV" | grep -F "$REV" > /dev/null || { echo "the binary does not carry $REV" >&2; exit 1; }
 echo "build  : $(( $(date +%s) - t1 ))s, $(du -h "$OUT/magnitude-relay-$REV" | cut -f1)" >&2
 # Keep the last ten artifacts and sources.
 ls -1t "$OUT"/magnitude-relay-* 2>/dev/null | tail -n +11 | xargs -r rm -f --
