@@ -539,7 +539,16 @@ impl KindPolicy {
         let mut bits = Box::new([0u64; 1024]);
         let mut big = Vec::new();
         let base_list: &[u64] = match base {
-            KindBase::Vector => VECTOR_KINDS,
+            KindBase::Vector => {
+                // Every ephemeral kind too (owner's call, 2026-10-22): relayed
+                // live and never stored, so they cost no disk, and clients'
+                // live protocols (Nostr Connect signers, device transfer and
+                // the like) work here whatever their kind number.
+                for k in 20_000..30_000u64 {
+                    bits[(k >> 6) as usize] |= 1 << (k & 63);
+                }
+                VECTOR_KINDS
+            }
             KindBase::List(l) => l,
             KindBase::All => {
                 bits.fill(u64::MAX);
@@ -2150,8 +2159,12 @@ segment_mb = 64
         for k in VECTOR_KINDS {
             assert!(p.allows(*k));
         }
+        // Every ephemeral kind is relayed, Vector's or not; nothing around it is.
+        for k in [20_000, 20_013, 22_242, 24_133, 29_999] {
+            assert!(p.allows(k), "ephemeral {k}");
+        }
         // Public notes, reactions, contact lists and the like are refused.
-        for k in [1, 3, 4, 6, 7, 9, 13, 14, 1111, 30023, 20013, 65535, 65536, u64::MAX] {
+        for k in [1, 3, 4, 6, 7, 9, 13, 14, 1111, 19_999, 30_000, 30023, 65535, 65536, u64::MAX] {
             assert!(!p.allows(k), "kind {k}");
         }
     }
@@ -2160,7 +2173,7 @@ segment_mb = 64
     fn reference(base: &KindBase, allow: &[u64], deny: &[u64], kind: u64) -> bool {
         let in_base = match base {
             KindBase::All => true,
-            KindBase::Vector => VECTOR_KINDS.contains(&kind),
+            KindBase::Vector => VECTOR_KINDS.contains(&kind) || (20_000..30_000).contains(&kind),
             KindBase::List(l) => l.contains(&kind),
         };
         (in_base || allow.contains(&kind)) && !deny.contains(&kind)
@@ -2168,7 +2181,7 @@ segment_mb = 64
 
     #[test]
     fn kind_policy_matches_a_set_reference() {
-        let edge = [0u64, 1, 63, 64, 65, 1058, 1059, 1060, 65534, 65535, 65536, 65537, 70_000, 1 << 40, u64::MAX];
+        let edge = [0u64, 1, 63, 64, 65, 1058, 1059, 1060, 19_999, 20_000, 24_133, 29_999, 30_000, 65534, 65535, 65536, 65537, 70_000, 1 << 40, u64::MAX];
         let bases = [KindBase::Vector, KindBase::All, KindBase::List(vec![]), KindBase::List(vec![1, 7, 65535, 65536, 99_999])];
         let allows: [&[u64]; 3] = [&[], &[1, 30023, 65536, 80_000], &[0, 5, 65535]];
         let denies: [&[u64]; 4] = [&[], &[1059, 1], &[65536, 80_000, 99_999], &[65535, 0, 7, u64::MAX]];

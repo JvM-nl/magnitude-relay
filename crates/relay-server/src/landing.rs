@@ -98,7 +98,7 @@ pub fn page(shared: &Shared, path: &str) -> String {
     }
     let policy = match cfg.policy.kinds {
         KindBase::Vector if cfg.policy.restricts_writes() => {
-            "Built for Vector: it keeps the kinds of events Vector uses (messages, Concord communities, profiles, badges, emoji) and turns other kinds away."
+            "Built for Vector: it keeps the kinds of events Vector uses (messages, Concord communities, profiles, badges, emoji), relays any ephemeral event live, and turns other kinds away."
         }
         _ if cfg.policy.restricts_writes() => "Accepts a chosen set of event kinds.",
         _ => "Open to every kind of event.",
