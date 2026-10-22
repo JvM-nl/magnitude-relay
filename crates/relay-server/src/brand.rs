@@ -11,3 +11,9 @@ pub const SLUG: &str = "magnitude-relay";
 pub const SOFTWARE_URL: &str = "https://github.com/VectorPrivacy";
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The commit this binary was built from, as deploy/relays/deploy.sh stamps it
+/// (`RELAY_BUILD_REV`); "dev" for a build of a working tree.
+pub const BUILD: &str = match option_env!("RELAY_BUILD_REV") {
+    Some(rev) => rev,
+    None => "dev",
+};

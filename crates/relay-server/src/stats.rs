@@ -33,9 +33,10 @@ pub fn json(shared: &Shared) -> String {
     let mut o = String::with_capacity(1024);
     let _ = write!(
         o,
-        "{{\"software\":\"{}\",\"version\":\"{}\",\"uptime_secs\":{},\"connections_open\":{},\"neg_items_held\":{}",
+        "{{\"software\":\"{}\",\"version\":\"{}\",\"build\":\"{}\",\"uptime_secs\":{},\"connections_open\":{},\"neg_items_held\":{}",
         crate::brand::NAME,
         crate::brand::VERSION,
+        crate::brand::BUILD,
         shared.metrics.uptime_secs(),
         shared.metrics.open.load(Ordering::Relaxed),
         crate::session::NEG_ITEMS.load(Ordering::Relaxed)

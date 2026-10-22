@@ -164,7 +164,7 @@ pub fn page(shared: &Shared, path: &str) -> String {
         .replace("{{LIMITS}}", &limits)
         .replace("{{OPERATOR}}", &operator)
         .replace("{{SOFTWARE}}", crate::brand::NAME)
-        .replace("{{VERSION}}", crate::brand::VERSION)
+        .replace("{{VERSION}}", &format!("{} &middot; {}", crate::brand::VERSION, crate::brand::BUILD))
 }
 
 /// One copyable line per address; `none` when there are none (empty: left for

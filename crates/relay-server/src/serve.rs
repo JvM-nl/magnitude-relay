@@ -130,9 +130,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Other relays to keep in step with, on a thread of their own.
     crate::sync::live::start(syncs, shared.sync.clone(), admin_store, ctl_tx, scfg, shared.clone()).map_err(|e| format!("cannot start syncing: {e}"))?;
     eprintln!(
-        "{} {} listening on {bind}: {threads} reactors, {events} events, ready in {:.2}s",
+        "{} {} ({}) listening on {bind}: {threads} reactors, {events} events, ready in {:.2}s",
         crate::brand::NAME,
         crate::brand::VERSION,
+        crate::brand::BUILD,
         t.elapsed().as_secs_f64()
     );
     if let Some(a) = https_bind {
