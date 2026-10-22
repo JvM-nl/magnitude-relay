@@ -61,6 +61,10 @@ pub const VECTOR_KINDS: &[u64] = &[
     13303,
     // Ephemeral Concord wrap (typing, voice presence).
     21059,
+    // NIP-46 remote signing (Nostr Connect), for bunker accounts: Vector's
+    // nostrconnect:// session runs over its trusted relays, this one first,
+    // and the signer app answers there. Ephemeral: relayed, never stored.
+    24133,
     // Push request.
     24590,
     // Device transfer.
@@ -84,13 +88,14 @@ pub const VECTOR_KINDS: &[u64] = &[
 
 /// NIPs the relay speaks, as published in NIP-11: the protocol ones (1, 9, 11,
 /// 40, 45, 62, 70, 77) and one for each kind of VECTOR_KINDS a NIP defines:
-/// 17 (DM inbox relays, 10050) and 59 (gift wraps), 24 (profile fields), 30
+/// 17 (DM inbox relays, 10050) and 59 (gift wraps), 24 (profile fields), 46
+/// (remote signing, 24133), 30
 /// (emoji lists and sets, 10030/30030), 38 (user status), 58 (badges: 8,
 /// 10008, 30008, 30009), 65 (relay lists), 78 (app data). Not 51: of its list kinds only the
 /// emoji ones are taken. Not 42: this relay never authenticates anyone
 /// (PLAN.md, Decisions). Blossom server lists (10063) are NIP-B7, which a list
 /// of numbers cannot name.
-pub const SUPPORTED_NIPS: &[u32] = &[1, 9, 11, 17, 24, 30, 38, 40, 45, 58, 59, 62, 65, 70, 77, 78];
+pub const SUPPORTED_NIPS: &[u32] = &[1, 9, 11, 17, 24, 30, 38, 40, 45, 46, 58, 59, 62, 65, 70, 77, 78];
 
 /// Every section and its keys. The single source for "did you mean" hints and
 /// for the test that keeps the documented default file complete.
@@ -2138,7 +2143,7 @@ segment_mb = 64
     fn vector_kinds_are_sorted_unique_and_cover_the_plan() {
         assert!(VECTOR_KINDS.windows(2).all(|w| w[0] < w[1]));
         // PLAN.md's table of what Vector produces and reads.
-        for k in [0, 5, 8, 1059, 10002, 10008, 10030, 10050, 10063, 10304, 13303, 21059, 24590, 24681, 30008, 30009, 30030, 30078, 30315, 33301, 33302] {
+        for k in [0, 5, 8, 1059, 10002, 10008, 10030, 10050, 10063, 10304, 13303, 21059, 24133, 24590, 24681, 30008, 30009, 30030, 30078, 30315, 33301, 33302] {
             assert!(VECTOR_KINDS.contains(&k), "kind {k}");
         }
         let p = PolicyCfg::default().kind_policy();
@@ -2218,7 +2223,7 @@ segment_mb = 64
         assert_eq!(j["description"], "A relay for Vector.");
         assert_eq!(j["software"], brand::SOFTWARE_URL);
         assert_eq!(j["version"], brand::VERSION);
-        assert_eq!(j["supported_nips"], serde_json::json!([1, 9, 11, 17, 24, 30, 38, 40, 45, 58, 59, 62, 65, 70, 77, 78]));
+        assert_eq!(j["supported_nips"], serde_json::json!([1, 9, 11, 17, 24, 30, 38, 40, 45, 46, 58, 59, 62, 65, 70, 77, 78]));
         assert!(!j["supported_nips"].as_array().unwrap().contains(&serde_json::json!(42)));
         let l = &j["limitation"];
         assert_eq!(l["max_message_length"], 262_144);

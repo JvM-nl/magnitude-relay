@@ -27,6 +27,7 @@ fn nip_name(n: u32) -> &'static str {
         38 => "User statuses",
         40 => "Expiring events",
         45 => "Event counts",
+        46 => "Remote signing",
         58 => "Badges",
         59 => "Gift wraps",
         62 => "Request to vanish",
