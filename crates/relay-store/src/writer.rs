@@ -135,6 +135,8 @@ const COMPACT_FANIN: usize = 4;
 const LEVEL_BASE: u64 = 4 << 20;
 
 pub struct Writer {
+    /// How long opening the store took, step by step.
+    pub open_phases: crate::OpenPhases,
     pub(crate) shared: Arc<Shared>,
     pub(crate) log: LogWriter,
     pub(crate) locs: LocsWriter,
@@ -400,6 +402,7 @@ impl Writer {
         let shape = log.shape();
         let vanish = VanishCfg::new(&opts.vanish_urls);
         Ok(Writer {
+            open_phases: crate::OpenPhases::default(),
             shared,
             log,
             locs,

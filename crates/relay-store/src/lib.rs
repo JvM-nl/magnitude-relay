@@ -199,6 +199,26 @@ pub struct Store {
     shared: Arc<Shared>,
 }
 
+/// How long each step of `Store::open` took, so a slow start can say why.
+#[derive(Clone, Debug, Default)]
+pub struct OpenPhases {
+    pub steps: Vec<(&'static str, std::time::Duration)>,
+    at: Option<std::time::Instant>,
+}
+
+impl OpenPhases {
+    fn start() -> OpenPhases {
+        OpenPhases { steps: Vec::new(), at: Some(std::time::Instant::now()) }
+    }
+
+    /// Ends the step `name` here; the next starts.
+    fn mark(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        let at = self.at.replace(now).unwrap_or(now);
+        self.steps.push((name, now - at));
+    }
+}
+
 impl Store {
     /// Opens (or creates) a store in `dir`: maps the checkpointed segments and
     /// replays only the log after the checkpoint. Returns the reader handle and
@@ -212,6 +232,7 @@ impl Store {
         std::fs::create_dir_all(&idx)?;
         // Which step of opening failed, for an error an operator can act on.
         let step = |what: &'static str| move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
+        let mut phases = OpenPhases::start();
         let ck = checkpoint::read(dir)?;
         let have_ck = ck.is_some();
         let ck = ck.unwrap_or_default();
@@ -220,6 +241,7 @@ impl Store {
         for &id in &ck.segments {
             segments.push(Arc::new(Segment::open(id, &bg::seg_path(&idx, id))?));
         }
+        phases.mark("index segments opened");
         // Every block's checksum, now: a damaged block met by a query later
         // could only stop the relay (and the same query would stop it again
         // after a restart). Each segment's blocks are split across threads,
@@ -245,6 +267,7 @@ impl Store {
                 )));
             }
         }
+        phases.mark("index checked");
         // Leftovers of a flush or compaction that never reached a checkpoint.
         for e in std::fs::read_dir(&idx).map_err(step("listing the index"))?.flatten() {
             let name = e.file_name();
@@ -317,6 +340,7 @@ impl Store {
                 dead_seqs.extend(log::flagged_dead(&path, opts.segment_size)?);
             }
         }
+        phases.mark("dead set and locations loaded");
         let log = LogWriter::open(&dir.join("log"), opts.segment_size, ck.replay_from, ck.covered, &retired, &cold_keep, |fr: log::Frame<'_>| {
             if loc_err.is_none() {
                 if let Err(e) = locs.set(fr.seq, fr.off) {
@@ -342,6 +366,7 @@ impl Store {
             return Err(e);
         }
         crash_point!("open.replayed");
+        phases.mark("log tail replayed");
         if !ck.intent_cold.is_empty() {
             let segs = log.segments();
             for &n in &ck.intent_cold {
@@ -424,6 +449,7 @@ impl Store {
             w.write_checkpoint().map_err(step("recording a finished log compaction"))?;
             crash_point!("open.intent_finished");
         }
+        phases.mark("in-memory index built");
         let repaired = w.repair(&tail).map_err(step("re-applying the replayed tail's rules"))?;
         // Kills re-derived just now rest on tail events that may themselves die
         // before the next checkpoint, taking the evidence with them: record them.
@@ -431,6 +457,7 @@ impl Store {
             w.write_checkpoint().map_err(step("recording the re-applied rules"))?;
         }
         crash_point!("open.repaired");
+        phases.mark("tail rules re-applied");
         // Expiry kills are not re-derived from the tail like rule kills are:
         // one that was not checkpointed is redone before anything is served.
         // (Not when opened without trusting the index: the sweep reads it, and
@@ -438,7 +465,9 @@ impl Store {
         if verify_index {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
             w.sweep_expired(now).map_err(step("removing expired events"))?;
+            phases.mark("expired events removed");
         }
+        w.open_phases = phases;
         Ok((Store { shared }, w))
     }
 

@@ -9,7 +9,7 @@ use relay_store::Store;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tmpsc;
 
 /// Events waiting for the writer before EVENTs are answered "busy". At group
@@ -20,6 +20,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let t = Instant::now();
     let (store, w) = Store::open(&cfg.store.data, store_options(&cfg)).map_err(|e| format!("{}: {e}", cfg.store.data.display()))?;
     let events = w.next_seq();
+    let opened = w.open_phases.clone();
     let threads = if cfg.relay.threads == 0 { std::thread::available_parallelism().map_or(4, |n| n.get()) } else { cfg.relay.threads };
     let bind = cfg.relay.bind;
     let (unix_path, unix_mode) = (std::path::PathBuf::from(&cfg.relay.unix_socket), cfg.relay.unix_socket_mode);
@@ -136,6 +137,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
         crate::brand::BUILD,
         t.elapsed().as_secs_f64()
     );
+    // A slow start says where its time went.
+    if t.elapsed() >= Duration::from_millis(500) {
+        let steps: Vec<String> = opened.steps.iter().filter(|s| s.1 >= Duration::from_millis(10)).map(|(name, d)| format!("{name} {:.2}s", d.as_secs_f64())).collect();
+        let store: Duration = opened.steps.iter().map(|s| s.1).sum();
+        eprintln!("startup: opening the store took {:.2}s ({}), the rest {:.2}s", store.as_secs_f64(), steps.join(", "), (t.elapsed() - store).as_secs_f64());
+    }
     if let Some(a) = https_bind {
         let plain = http_bind.map_or(String::new(), |h| format!(", plain http on {h} (certificate checks and a redirect to https)"));
         eprintln!("tls: https on {a}{plain}");
