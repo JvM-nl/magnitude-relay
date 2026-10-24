@@ -484,14 +484,16 @@ impl Segment {
         let word = &self.verified[i / 64];
         let bit = 1u64 << (i % 64);
         if word.load(Ordering::Relaxed) & bit == 0 {
-            // Opening checked every block; this one was damaged since, on disk
-            // under the page cache. Nothing it says can be trusted.
-            assert_eq!(
-                crc32c(body),
-                u32::from_le_bytes(crc.try_into().unwrap()),
-                "index segment {} block {i} was damaged after the store opened: restarting refuses it and says how to rebuild",
-                self.path.display()
-            );
+            // Not checked yet (the open's check runs in the background), or
+            // damaged since, on disk under the page cache. Nothing a damaged
+            // block says can be trusted: stop, leaving word for the next open
+            // to check every block before it serves, and refuse.
+            if crc32c(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
+                if let Some(data) = self.path.parent().and_then(Path::parent) {
+                    let _ = std::fs::write(data.join(crate::INDEX_DAMAGED), format!("index segment {} block {i}\n", self.path.display()));
+                }
+                panic!("index segment {} block {i} is damaged: restarting refuses it and says how to rebuild", self.path.display());
+            }
             word.fetch_or(bit, Ordering::Relaxed);
         }
         let n = u16::from_le_bytes([body[body.len() - 2], body[body.len() - 1]]) as usize;

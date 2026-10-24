@@ -53,9 +53,9 @@ use crate::version::Run;
 use relay_proto::record::Field;
 use relay_proto::Record;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -79,11 +79,18 @@ pub struct Options {
     /// index (see `Store::open`). Off only for reading events without the
     /// index, which is how a damaged one is rebuilt (export, then import).
     pub verify_index: bool,
+    /// With `verify_index`: open at once and check the blocks on a thread of
+    /// their own (see `Store::index_check`), instead of before returning. A
+    /// cold 1.5 GB index on a slow disk took 12 s to check, all of it time the
+    /// relay could not serve. Reads stay safe meanwhile: every block is checked
+    /// the first time a query uses it. A damage found leaves `index-damaged`
+    /// in the data directory, and the next open checks before returning.
+    pub check_index_in_background: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { segment_size: 1 << 30, sync: true, flush_bytes: 64 << 20, vanish_urls: Vec::new(), log_compact_segments: 2, log_chunk_bytes: 0, verify_index: true }
+        Options { segment_size: 1 << 30, sync: true, flush_bytes: 64 << 20, vanish_urls: Vec::new(), log_compact_segments: 2, log_chunk_bytes: 0, verify_index: true, check_index_in_background: false }
     }
 }
 
@@ -125,8 +132,54 @@ pub(crate) struct Shared {
     pub(crate) durable: Arc<AtomicU64>,
     /// Records whose checksum has been checked (see `verified`).
     pub(crate) verified: Arc<verified::Verified>,
+    /// The background index check, when one was asked for.
+    index_check: Arc<(Mutex<IndexCheck>, Condvar)>,
     /// Held for as long as the store is open: one process per directory.
     _lock: std::fs::File,
+}
+
+/// Where the check of every index block stands (`Options::check_index_in_background`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexCheck {
+    /// Done before the store opened, or not asked for.
+    BeforeOpen,
+    /// Still reading blocks.
+    Running,
+    /// Every block's checksum matched.
+    Passed { blocks: usize, took: std::time::Duration },
+    /// A block did not: the message says which, and how to rebuild.
+    Damaged(String),
+}
+
+/// Left in the data directory when a damaged index block is found (by the
+/// background check, or by a read meeting it first), so the next open checks
+/// every block before it returns, and refuses, as it always did.
+pub(crate) const INDEX_DAMAGED: &str = "index-damaged";
+
+/// Checks every block of `segments` on `threads` threads; the first damaged
+/// one (its segment's path and block number), if any. Each segment's blocks
+/// are split across the threads, each reading its share in large pieces
+/// (see `Segment::verify_blocks`).
+fn check_blocks(segments: &[Arc<Segment>], threads: usize) -> Option<(PathBuf, usize)> {
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for seg in segments {
+            let n = seg.blocks();
+            let per = n.div_ceil(threads).max(1);
+            for lo in (0..n).step_by(per) {
+                let range = lo..(lo + per).min(n);
+                handles.push(s.spawn(move || seg.verify_blocks(range).err().map(|b| (seg.path().to_path_buf(), b))));
+            }
+        }
+        handles.into_iter().find_map(|h| h.join().expect("index check"))
+    })
+}
+
+fn damaged_index(path: &Path, block: usize) -> String {
+    format!(
+        "index segment {} block {block} is damaged on disk, and a damaged index cannot answer correctly. Every event is still in the log: rebuild with `export` (it reads events without the index) and `import` into an empty data directory, or restore a backup",
+        path.display()
+    )
 }
 
 /// Takes the directory's lock, or says which process holds it. Two writers on
@@ -242,32 +295,23 @@ impl Store {
             segments.push(Arc::new(Segment::open(id, &bg::seg_path(&idx, id))?));
         }
         phases.mark("index segments opened");
-        // Every block's checksum, now: a damaged block met by a query later
-        // could only stop the relay (and the same query would stop it again
-        // after a restart). Each segment's blocks are split across threads,
-        // each reading its share in large pieces (see `Segment::verify_blocks`).
-        if opts.verify_index {
+        // Every block's checksum: a damaged block met by a query later could
+        // only stop the relay (and the same query would stop it again after a
+        // restart). Before returning, unless asked to do it in the background
+        // and no earlier background check found damage.
+        let marker = dir.join(INDEX_DAMAGED);
+        let in_background = opts.verify_index && opts.check_index_in_background && !marker.exists();
+        if opts.verify_index && !in_background {
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8);
-            let damaged = std::thread::scope(|s| {
-                let mut handles = Vec::new();
-                for seg in &segments {
-                    let n = seg.blocks();
-                    let per = n.div_ceil(threads).max(1);
-                    for lo in (0..n).step_by(per) {
-                        let range = lo..(lo + per).min(n);
-                        handles.push(s.spawn(move || seg.verify_blocks(range).err().map(|b| (seg.path().to_path_buf(), b))));
-                    }
-                }
-                handles.into_iter().find_map(|h| h.join().expect("index check"))
-            });
-            if let Some((path, block)) = damaged {
-                return Err(io::Error::other(format!(
-                    "index segment {} block {block} is damaged on disk, and a damaged index cannot answer correctly. Every event is still in the log: rebuild with `export` (it reads events without the index) and `import` into an empty data directory, or restore a backup",
-                    path.display()
-                )));
+            if let Some((path, block)) = check_blocks(&segments, threads) {
+                return Err(io::Error::other(damaged_index(&path, block)));
             }
+            if marker.exists() {
+                std::fs::remove_file(&marker).map_err(step("clearing the damaged-index marker"))?;
+            }
+            phases.mark("index checked");
         }
-        phases.mark("index checked");
+        let check_segments = in_background.then(|| segments.clone());
         // Leftovers of a flush or compaction that never reached a checkpoint.
         for e in std::fs::read_dir(&idx).map_err(step("listing the index"))?.flatten() {
             let name = e.file_name();
@@ -427,7 +471,15 @@ impl Store {
             mem_bloom: mem_bloom.clone(),
             verified: verified.clone(),
         });
-        let shared = Arc::new(Shared { current: RwLock::new(v), gen: AtomicU64::new(0), durable: Arc::new(AtomicU64::new(next_seq)), verified, _lock: lock });
+        let index_check = Arc::new((Mutex::new(if in_background { IndexCheck::Running } else { IndexCheck::BeforeOpen }), Condvar::new()));
+        let shared = Arc::new(Shared {
+            current: RwLock::new(v),
+            gen: AtomicU64::new(0),
+            durable: Arc::new(AtomicU64::new(next_seq)),
+            verified,
+            index_check: index_check.clone(),
+            _lock: lock,
+        });
         let finish_intent = !ck.intent_cold.is_empty();
         let mut w = Writer::new(
             shared.clone(),
@@ -468,7 +520,43 @@ impl Store {
             phases.mark("expired events removed");
         }
         w.open_phases = phases;
+        if let Some(segments) = check_segments {
+            // Two threads: the relay is serving, and this is a background job.
+            std::thread::Builder::new()
+                .name("index-check".into())
+                .spawn(move || {
+                    let t = std::time::Instant::now();
+                    let state = match check_blocks(&segments, 2) {
+                        None => IndexCheck::Passed { blocks: segments.iter().map(|s| s.blocks()).sum(), took: t.elapsed() },
+                        Some((path, block)) => {
+                            let msg = damaged_index(&path, block);
+                            // Best effort: without it the next open checks in the background again.
+                            let _ = std::fs::write(&marker, &msg);
+                            IndexCheck::Damaged(msg)
+                        }
+                    };
+                    let (lock, ready) = &*index_check;
+                    *lock.lock().unwrap() = state;
+                    ready.notify_all();
+                })
+                .map_err(step("starting the index check"))?;
+        }
         Ok((Store { shared }, w))
+    }
+
+    /// Where the check of every index block stands.
+    pub fn index_check(&self) -> IndexCheck {
+        self.shared.index_check.0.lock().unwrap().clone()
+    }
+
+    /// Waits for a background index check to finish, and says how it ended.
+    pub fn wait_index_check(&self) -> IndexCheck {
+        let (lock, ready) = &*self.shared.index_check;
+        let mut g = lock.lock().unwrap();
+        while *g == IndexCheck::Running {
+            g = ready.wait(g).unwrap();
+        }
+        g.clone()
     }
 
     /// The latest published version.

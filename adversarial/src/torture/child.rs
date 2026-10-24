@@ -42,6 +42,7 @@ impl Shape {
             log_compact_segments: self.log_compact_segments,
             log_chunk_bytes: self.log_chunk_bytes,
             verify_index: true,
+            check_index_in_background: false,
         }
     }
 

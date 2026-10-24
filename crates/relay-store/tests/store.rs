@@ -1921,6 +1921,89 @@ fn a_damaged_index_block_is_refused_at_open_and_export_still_reads() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A relay opened with the index check in the background serves at once and
+/// says when every block has passed; nothing is left in the data directory.
+#[test]
+fn a_background_index_check_passes_while_serving() {
+    let dir = damaged_store("bg-check-ok");
+    let (store, _w) = Store::open(&dir, Options { check_index_in_background: true, ..opts() }).unwrap();
+    // Served before (or while) the check runs: every block is checked on first use anyway.
+    assert_eq!(ids(&store, r#"{"kinds":[1]}"#, 100).len(), 19);
+    match store.wait_index_check() {
+        relay_store::IndexCheck::Passed { blocks, .. } => assert!(blocks > 0),
+        other => panic!("{other:?}"),
+    }
+    assert!(!dir.join("index-damaged").exists());
+    drop((store, _w));
+    // Without the option the check is done before open returns, as before.
+    let (store, _w) = Store::open(&dir, opts()).unwrap();
+    assert_eq!(store.index_check(), relay_store::IndexCheck::BeforeOpen);
+    drop((store, _w));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A damaged block that opening itself reads (re-applying the log tail's
+/// rules, sweeping expiries) stops the relay there, before it serves, and
+/// leaves the marker: the next open checks up front and refuses with the
+/// rebuild advice, instead of stopping the same way on every restart.
+#[test]
+fn a_damaged_index_block_met_while_opening_is_refused_at_the_next_open() {
+    let dir = damaged_store("bg-check-open");
+    let seg = std::fs::read_dir(dir.join("idx")).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "seg")).expect("a flushed index segment");
+    let b = read_at(&seg, 40, 1);
+    patch(&seg, 40, &[b[0] ^ 0x10]);
+    let bg = Options { check_index_in_background: true, ..opts() };
+    let d = dir.clone();
+    let opened = std::panic::catch_unwind(|| Store::open(&d, bg.clone()).map(drop));
+    assert!(opened.is_err() || dir.join("index-damaged").exists(), "the damage went unnoticed");
+    assert!(dir.join("index-damaged").exists(), "the next open must check up front");
+    let err = Store::open(&dir, bg.clone()).err().expect("refused before serving");
+    let msg = err.to_string();
+    assert!(msg.contains("damaged") && msg.contains("export"), "{msg}");
+    // Repaired (here: the block put back), an up-front check clears the marker
+    // and later opens go back to checking in the background.
+    patch(&seg, 40, &b);
+    let (store, w) = Store::open(&dir, bg.clone()).unwrap();
+    assert_eq!(store.index_check(), relay_store::IndexCheck::BeforeOpen);
+    assert!(!dir.join("index-damaged").exists());
+    drop((store, w));
+    let (store, _w) = Store::open(&dir, bg).unwrap();
+    assert!(matches!(store.wait_index_check(), relay_store::IndexCheck::Passed { .. }));
+    drop((store, _w));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A damaged block that only the background check reaches is reported with
+/// the same rebuild advice as a refused open, and leaves the marker, so a
+/// damaged index never serves past the next restart.
+#[test]
+fn a_damaged_index_found_in_the_background_is_refused_at_the_next_open() {
+    let dir = tmpdir("bg-check-damaged");
+    {
+        let (_store, mut w) = Store::open(&dir, opts()).unwrap();
+        let recs: Vec<Vec<u8>> = (0..3000u64).map(|n| ev(n, (n % 7) as u8 + 1, 1000 + n, 1, "[]", &format!("event {n} {}", "x".repeat(40)))).collect();
+        for chunk in recs.chunks(500) {
+            write(&mut w, chunk);
+        }
+        w.flush_all().unwrap();
+        w.write_checkpoint().unwrap();
+    }
+    let seg = std::fs::read_dir(dir.join("idx")).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "seg")).expect("a flushed index segment");
+    // A third of the way in: well inside the block area, among keys opening never reads.
+    let at = std::fs::metadata(&seg).unwrap().len() / 3;
+    let b = read_at(&seg, at, 1);
+    patch(&seg, at, &[b[0] ^ 0x10]);
+    let bg = Options { check_index_in_background: true, ..opts() };
+    let (store, w) = Store::open(&dir, bg.clone()).expect("opens at once; the check runs after");
+    let relay_store::IndexCheck::Damaged(msg) = store.wait_index_check() else { panic!("the damage was not found") };
+    assert!(msg.contains("damaged") && msg.contains("export"), "{msg}");
+    assert!(dir.join("index-damaged").exists(), "the next open must check up front");
+    drop((store, w));
+    let err = Store::open(&dir, bg).err().expect("refused before serving");
+    assert!(err.to_string().contains("damaged"), "{err}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Found by the adversarial suite's damage tests: a flipped bit in `dead.bits`
 /// brought a deleted event back (or hid a live one), silently. `dead.bits`
 /// now carries a checksum, and a damaged one is refused.

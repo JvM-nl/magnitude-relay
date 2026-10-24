@@ -18,7 +18,11 @@ const WRITE_QUEUE: usize = 65_536;
 
 pub fn run(cfg: Config) -> Result<(), String> {
     let t = Instant::now();
-    let (store, w) = Store::open(&cfg.store.data, store_options(&cfg)).map_err(|e| format!("{}: {e}", cfg.store.data.display()))?;
+    // Serve at once; every index block is checked on a thread of its own (a
+    // damaged one stops the relay, and the next start refuses it up front).
+    let opts = relay_store::Options { check_index_in_background: true, ..store_options(&cfg) };
+    let (store, w) = Store::open(&cfg.store.data, opts).map_err(|e| format!("{}: {e}", cfg.store.data.display()))?;
+    let checked = store.clone();
     let events = w.next_seq();
     let opened = w.open_phases.clone();
     let threads = if cfg.relay.threads == 0 { std::thread::available_parallelism().map_or(4, |n| n.get()) } else { cfg.relay.threads };
@@ -147,6 +151,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let plain = http_bind.map_or(String::new(), |h| format!(", plain http on {h} (certificate checks and a redirect to https)"));
         eprintln!("tls: https on {a}{plain}");
     }
+    watch_index_check(checked);
 
     wait_for_signal();
     eprintln!("shutting down: finishing the batch in flight");
@@ -158,8 +163,36 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let _ = std::fs::remove_file(&unix_path);
     }
     let _ = writer.join();
+    if INDEX_DAMAGED.load(Ordering::Acquire) {
+        eprintln!("stopped: the index is damaged (see above)");
+        std::process::exit(1);
+    }
     eprintln!("stopped cleanly");
     std::process::exit(0);
+}
+
+/// Set when the background index check found a damaged block.
+static INDEX_DAMAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reports the background index check. A damaged block stops the relay the
+/// way SIGTERM does, then exits 1: a damaged index cannot answer correctly,
+/// and the next start refuses it before serving (see `Options::check_index_in_background`).
+fn watch_index_check(store: Store) {
+    let spawned = std::thread::Builder::new().name("index-watch".into()).spawn(move || match store.wait_index_check() {
+        relay_store::IndexCheck::Passed { blocks, took } => {
+            eprintln!("index check: all {blocks} blocks sound ({:.2}s, while serving)", took.as_secs_f64());
+        }
+        relay_store::IndexCheck::Damaged(msg) => {
+            eprintln!("{msg}");
+            INDEX_DAMAGED.store(true, Ordering::Release);
+            // SAFETY: signalling our own process; the handler in wait_for_signal shuts down cleanly.
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        }
+        relay_store::IndexCheck::BeforeOpen | relay_store::IndexCheck::Running => {}
+    });
+    if let Err(e) = spawned {
+        eprintln!("index check: cannot watch it ({e}); a damaged block will still be refused when a query reads it");
+    }
 }
 
 /// Starts the HTTPS side: binds the plain-HTTP port, loads or begins obtaining a
