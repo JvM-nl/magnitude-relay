@@ -1,5 +1,5 @@
 #!/bin/bash
-# campaign.sh [name]  (run on the box)  The four-relay comparison: three suite.sh
+# campaign.sh [name]  (run on the box)  The relay comparison: three suite.sh
 # passes per relay, the order rotated each pass so no relay always runs first or
 # last, every result appended to /root/bench/results/<name>.jsonl. Then the
 # best-of table (on a shared box other load only slows a run down, so the best
@@ -13,7 +13,9 @@ assert_in_bench "$out"
 [ -e "$out" ] && die "$out exists"
 export SUITE_OUT=$out
 echo "=== campaign $name: $(date -Is), ours = $(cat "$BENCH_ROOT/src/ours/.git-rev" 2>/dev/null)"
-for order in "strfry ditto fastr ours" "ours fastr ditto strfry" "ditto ours strfry fastr"; do
+# ORDERS overrides the rotation, e.g. ORDERS="ours nostella|nostella ours|ours nostella".
+IFS='|' read -r -a orders <<< "${ORDERS:-strfry ditto fastr ours|ours fastr ditto strfry|ditto ours strfry fastr}"
+for order in "${orders[@]}"; do
     for r in $order; do
         ./suite.sh "$r"
     done

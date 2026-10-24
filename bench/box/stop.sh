@@ -8,7 +8,7 @@ set -euo pipefail
 . "$(dirname "$(readlink -f "$0")")/env.sh"
 
 arg=${1:-}
-[ -n "$arg" ] || die "usage: stop.sh <ours|strfry|fastr|ditto|all>"
+[ -n "$arg" ] || die "usage: stop.sh <ours|strfry|fastr|ditto|nostella|all>"
 if [ "$arg" = all ]; then targets=$NAMES; else valid_name "$arg" || die "unknown relay $arg"; targets=$arg; fi
 
 rc=0

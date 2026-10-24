@@ -1,5 +1,5 @@
 #!/bin/bash
-# suite.sh <ours|strfry|fastr|ditto> [dataset]
+# suite.sh <ours|strfry|fastr|ditto|nostella> [dataset]
 # One full, identical benchmark pass against one relay: wipe its data, start it
 # (pinned, capped, niced, as start.sh does), run every workload with relay-bench
 # on the load-generator CPUs, then stop it. Every run appends one JSON line to
@@ -14,7 +14,7 @@ export LOADGEN_CPUS=${LOADGEN_CPUS:-2,3}
 cd "$BOX_DIR"
 
 name=${1:-}
-valid_name "$name" || die "usage: suite.sh <ours|strfry|fastr|ditto> [dataset]"
+valid_name "$name" || die "usage: suite.sh <ours|strfry|fastr|ditto|nostella> [dataset]"
 data=${2:-$BENCH_ROOT/data/d1m.jsonl}
 assert_in_bench "$data"
 [ -f "$data" ] || die "missing dataset $data"

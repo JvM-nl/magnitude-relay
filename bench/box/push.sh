@@ -7,7 +7,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 host=${BENCH_HOST:-jskitty}
 cd "$here"
 ssh "$host" 'mkdir -p /root/bench/box'
-scp -q env.sh start.sh stop.sh wipe.sh smoke.py build-fastr.sh build-cargo.sh README.md "$host":/root/bench/box/
-scp -q strfry-bench.conf ours.toml ditto.toml fastr.env "$host":/root/bench/
+scp -q env.sh start.sh stop.sh wipe.sh smoke.py build-fastr.sh build-cargo.sh suite.sh compare.py campaign.sh README.md "$host":/root/bench/box/
+scp -q strfry-bench.conf ours.toml ditto.toml fastr.env nostella.toml "$host":/root/bench/
 ssh "$host" 'chmod +x /root/bench/box/*.sh /root/bench/box/smoke.py'
 echo "pushed to $host:/root/bench/box and $host:/root/bench"

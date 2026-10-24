@@ -1,5 +1,5 @@
 #!/bin/bash
-# start.sh <ours|strfry|fastr|ditto>
+# start.sh <ours|strfry|fastr|ditto|nostella>
 # Starts one relay in the background: capped to the owner's 6-of-8-thread limit, pinned to
 # RELAY_CPUS, niced, logging to /root/bench/logs/<name>.log, pid in /root/bench/run/<name>.pid.
 # Returns once the port answers; fails (and stops the relay) if it does not, or if the relay
@@ -8,7 +8,7 @@ set -euo pipefail
 . "$(dirname "$(readlink -f "$0")")/env.sh"
 
 name=${1:-}
-valid_name "$name" || die "usage: start.sh <ours|strfry|fastr|ditto>"
+valid_name "$name" || die "usage: start.sh <ours|strfry|fastr|ditto|nostella>"
 
 port=$(port_of "$name")
 data=$(data_dir_of "$name")
@@ -65,6 +65,12 @@ case "$name" in
             || die "$BIN_OURS has no 'serve' command (stale source; rebuild from a tree that has serve.rs)"
         cmd=("$BIN_OURS" --config "$conf" serve)
         ;;
+    nostella)
+        [ -x "$BIN_NOSTELLA" ] || die "missing $BIN_NOSTELLA"
+        mkdir -p "$data"
+        # --standalone: no mesh, no bootstrap, no relay-to-relay traffic.
+        cmd=("$BIN_NOSTELLA" --data-dir "$data" --config "$conf" --bind 127.0.0.1 --port "$port" --standalone run)
+        ;;
 esac
 
 echo "[$name] starting on 127.0.0.1:$port, cpus $RELAY_CPUS (cap $CAP_CPUS), nice $NICE_LEVEL"
@@ -72,8 +78,10 @@ echo "[$name] $(date -Is) start: ${cmd[*]}" >> "$logfile"
 
 # systemd-run --scope execs the command inside a transient cgroup scope (no unit file is
 # installed, the scope disappears with the process), so $! is the relay's own pid.
+# Loopback only, for every relay alike: nothing under test can reach the network,
+# whatever it was built to do (Nostella federates by default).
 nohup systemd-run --scope --quiet --unit="${unit%.scope}" \
-    -p "AllowedCPUs=$RELAY_CPUS" \
+    -p "AllowedCPUs=$RELAY_CPUS" -p IPAddressDeny=any -p IPAddressAllow=localhost \
     nice -n "$NICE_LEVEL" "${cmd[@]}" >> "$logfile" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$pidfile"

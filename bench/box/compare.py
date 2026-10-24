@@ -14,7 +14,7 @@ import statistics
 import sys
 from collections import defaultdict
 
-ORDER = ["ours", "strfry", "ditto", "fastr"]
+ORDER = ["ours", "nostella", "strfry", "ditto", "fastr"]
 
 # (command, workload) -> how to read it: list of (column title, key path, higher_is_better, unit)
 LOAD = [("ev/s", ("ops_per_s",), True, ""), ("p50", ("lat_us", "p50"), False, "ms"), ("p99", ("lat_us", "p99"), False, "ms")]

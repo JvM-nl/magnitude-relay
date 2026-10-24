@@ -1,5 +1,5 @@
 #!/bin/bash
-# wipe.sh <ours|strfry|fastr|ditto>
+# wipe.sh <ours|strfry|fastr|ditto|nostella>
 # Deletes that relay's data directory (and only that), then leaves it ready for a fresh start.
 # Refuses if the relay is running, and refuses any path that does not resolve to a directory
 # directly under /root/bench whose name is the one env.sh assigns to the relay.
@@ -7,7 +7,7 @@ set -euo pipefail
 . "$(dirname "$(readlink -f "$0")")/env.sh"
 
 name=${1:-}
-valid_name "$name" || die "usage: wipe.sh <ours|strfry|fastr|ditto>"
+valid_name "$name" || die "usage: wipe.sh <ours|strfry|fastr|ditto|nostella>"
 
 dir=$(data_dir_of "$name")
 assert_in_bench "$dir"
@@ -20,7 +20,7 @@ esac
 [ "$real" = "$dir" ] || die "refusing: $dir is not a plain path ($real)"
 [ ! -L "$dir" ] || die "refusing: $dir is a symlink"
 case "$(basename "$real")" in
-    ours-data|strfry-db|fastr-data|ditto-data) ;;
+    ours-data|strfry-db|fastr-data|ditto-data|nostella-data) ;;
     *) die "refusing: unexpected directory name $(basename "$real")" ;;
 esac
 

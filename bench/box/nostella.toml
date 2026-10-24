@@ -1,0 +1,20 @@
+# Nostella in the benchmark (started with --standalone by start.sh: no mesh, no
+# bootstrap, no relay-to-relay traffic; the scope also allows loopback only).
+# Its per-connection rate limits (10 events/s, 20 REQs/s, 512 KiB/s by default)
+# are lifted: the load generator is one local client, and Magnitude Relay
+# exempts loopback the same way. Its cold-EOSE grace (2.5 s by default: an
+# empty answer waits that long for the mesh, which standalone does not have)
+# is 0. Everything else is Nostella's default, including buffered writes
+# (flushed to disk every 5 s).
+standalone = true
+
+[relay]
+bind = "127.0.0.1"
+port = 7805
+events_per_sec = 1000000000.0
+reqs_per_sec = 1000000000.0
+bytes_per_sec = 1000000000000.0
+cold_eose_grace_ms = 0
+
+[storage]
+data_dir = "/root/bench/nostella-data"

@@ -17,6 +17,7 @@ PORT_FASTR=7801
 PORT_DITTO=7802
 PORT_STRFRY=7803
 PORT_OURS=7804
+PORT_NOSTELLA=7805
 
 # --- CPU pinning --------------------------------------------------------------
 # Box: i7-6700, 4 cores x 2 threads. Hyperthread siblings: (0,4) (1,5) (2,6) (3,7).
@@ -39,9 +40,10 @@ BIN_DITTO=$BIN_DIR/ditto-relay
 # Overridable for profiling (profile.sh runs the frame-pointer build in its place).
 BIN_OURS=${BIN_OURS:-$BIN_DIR/magnitude-relay}
 BIN_STRFRY=/root/strfry/strfry   # production binary, read-only use, never modified
+BIN_NOSTELLA=$BIN_DIR/nostella
 
 # --- per-relay data -------------------------------------------------------------
-NAMES="ours strfry fastr ditto"
+NAMES="ours strfry fastr ditto nostella"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -60,13 +62,14 @@ assert_in_bench() {
 }
 
 valid_name() {
-    case "$1" in ours|strfry|fastr|ditto) return 0 ;; *) return 1 ;; esac
+    case "$1" in ours|strfry|fastr|ditto|nostella) return 0 ;; *) return 1 ;; esac
 }
 
 port_of() {
     case "$1" in
         fastr) echo $PORT_FASTR ;; ditto) echo $PORT_DITTO ;;
         strfry) echo $PORT_STRFRY ;; ours) echo $PORT_OURS ;;
+        nostella) echo $PORT_NOSTELLA ;;
     esac
 }
 
@@ -74,6 +77,7 @@ data_dir_of() {
     case "$1" in
         fastr) echo $BENCH_ROOT/fastr-data ;; ditto) echo $BENCH_ROOT/ditto-data ;;
         strfry) echo $BENCH_ROOT/strfry-db ;; ours) echo $BENCH_ROOT/ours-data ;;
+        nostella) echo $BENCH_ROOT/nostella-data ;;
     esac
 }
 
@@ -81,6 +85,7 @@ conf_of() {
     case "$1" in
         fastr) echo $BENCH_ROOT/fastr.env ;; ditto) echo $BENCH_ROOT/ditto.toml ;;
         strfry) echo $BENCH_ROOT/strfry-bench.conf ;; ours) echo "${OURS_CONF:-$BENCH_ROOT/ours.toml}" ;;
+        nostella) echo $BENCH_ROOT/nostella.toml ;;
     esac
 }
 
@@ -100,6 +105,7 @@ is_ours() {
         fastr)  [ "$exe" = "$BIN_FASTR" ] ;;
         ditto)  [ "$exe" = "$BIN_DITTO" ] ;;
         ours)   [ "$exe" = "$BIN_OURS" ] ;;
+        nostella) [ "$exe" = "$BIN_NOSTELLA" ] ;;
     esac
 }
 
@@ -112,7 +118,7 @@ bench_pids() {
         pid=${d#/proc/}
         exe=$(readlink "$d/exe" 2>/dev/null || true)
         case "$exe" in
-            "$BIN_FASTR"|"$BIN_DITTO"|"$BIN_OURS"|"$BIN_STRFRY") ;;
+            "$BIN_FASTR"|"$BIN_DITTO"|"$BIN_OURS"|"$BIN_STRFRY"|"$BIN_NOSTELLA") ;;
             *) continue ;;
         esac
         for n in $NAMES; do

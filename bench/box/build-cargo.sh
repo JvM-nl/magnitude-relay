@@ -15,11 +15,13 @@ which=${1:-}
 case "$which" in
     ditto) SRC=$BENCH_ROOT/src/ditto-relay; PKG=();                BIN=ditto-relay;      DEST=$BIN_DITTO ;;
     ours)  SRC=$BENCH_ROOT/src/ours;        PKG=(-p relay-server); BIN=magnitude-relay;  DEST=$BIN_OURS ;;
+    bench) SRC=$BENCH_ROOT/src/ours;        PKG=(-p relay-bench);  BIN=relay-bench;      DEST=$BIN_DIR/relay-bench ;;
+    nostella) SRC=$BENCH_ROOT/src/nostella; PKG=(-p nostella);     BIN=nostella;         DEST=$BIN_NOSTELLA ;;
     # Frame pointers on, in a target directory of its own, for profile.sh's stack sampling.
     ours-prof)
         SRC=$BENCH_ROOT/src/ours; PKG=(-p relay-server); BIN=magnitude-relay; DEST=$BIN_DIR/magnitude-relay-prof
         export CARGO_TARGET_DIR=$BENCH_ROOT/prof-target RUSTFLAGS="-C force-frame-pointers=yes" ;;
-    *) die "usage: build-cargo.sh <ditto|ours|ours-prof>" ;;
+    *) die "usage: build-cargo.sh <ditto|ours|bench|nostella|ours-prof>" ;;
 esac
 assert_in_bench "$SRC"; assert_in_bench "$DEST"
 
