@@ -22,14 +22,14 @@
     --grid: #e1e0d9;
     --axis: #c3c2b7;
     --ring: rgba(11, 11, 11, 0.10);
-    --series-1: #2a78d6;
-    --series-2: #eb6834;
-    --series-3: #1baf7a;
-    --fill-1: rgba(42, 120, 214, 0.14);
-    --fill-2: rgba(235, 104, 52, 0.14);
-    --fill-3: rgba(27, 175, 122, 0.14);
+    /* Vector's chart colours (purple, pink, green). The green is deepened on
+       light backgrounds, where the brand mint would barely show. */
+    --series-1: #9b64f6;
+    --series-2: #ff2ea9;
+    --series-3: #1fa774;
+    --fade: 0.22;
     --meter-track: #e9e8e3;
-    --good: #0ca30c;
+    --good: #1fa774;
     --warning: #fab219;
     --critical: #d03b3b;
     --critical-text: #b02a2a;
@@ -45,12 +45,11 @@
       --grid: #2c2c2a;
       --axis: #383835;
       --ring: rgba(255, 255, 255, 0.10);
-      --series-1: #3987e5;
-      --series-2: #d95926;
-      --series-3: #199e70;
-      --fill-1: rgba(57, 135, 229, 0.16);
-      --fill-2: rgba(217, 89, 38, 0.16);
-      --fill-3: rgba(25, 158, 112, 0.16);
+      --series-1: #9b64f6;
+      --series-2: #ff2ea9;
+      --series-3: #58fbb2;
+      --fade: 0.30;
+      --good: #58fbb2;
       --meter-track: #2c2c2a;
       --critical-text: #e66767;
     }
@@ -65,12 +64,11 @@
     --grid: #2c2c2a;
     --axis: #383835;
     --ring: rgba(255, 255, 255, 0.10);
-    --series-1: #3987e5;
-    --series-2: #d95926;
-    --series-3: #199e70;
-    --fill-1: rgba(57, 135, 229, 0.16);
-    --fill-2: rgba(217, 89, 38, 0.16);
-    --fill-3: rgba(25, 158, 112, 0.16);
+    --series-1: #9b64f6;
+    --series-2: #ff2ea9;
+    --series-3: #58fbb2;
+    --fade: 0.30;
+    --good: #58fbb2;
     --meter-track: #2c2c2a;
     --critical-text: #e66767;
   }
@@ -233,6 +231,11 @@
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+  <linearGradient id="fade-1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--series-1);stop-opacity:var(--fade)"/><stop offset="1" style="stop-color:var(--series-1);stop-opacity:0"/></linearGradient>
+  <linearGradient id="fade-2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--series-2);stop-opacity:var(--fade)"/><stop offset="1" style="stop-color:var(--series-2);stop-opacity:0"/></linearGradient>
+  <linearGradient id="fade-3" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--series-3);stop-opacity:var(--fade)"/><stop offset="1" style="stop-color:var(--series-3);stop-opacity:0"/></linearGradient>
+</defs></svg>
 <div class="wrap">
   <header>
     <div class="ident">
@@ -600,7 +603,7 @@
       // paints over the first line and the lower series disappears.
       def.series.forEach((s, k) => {
         for (const r of runs[k]) if (r.length > 1)
-          parts.push('<path d="' + line(r) + " L" + r[r.length - 1][0].toFixed(1) + "," + base + " L" + r[0][0].toFixed(1) + "," + base + ' Z" fill="var(--fill-' + s.slot + ')" stroke="none"/>');
+          parts.push('<path d="' + line(r) + " L" + r[r.length - 1][0].toFixed(1) + "," + base + " L" + r[0][0].toFixed(1) + "," + base + ' Z" fill="url(#fade-' + s.slot + ')" stroke="none"/>');
       });
       def.series.forEach((s, k) => {
         const c = "var(--series-" + s.slot + ")";
