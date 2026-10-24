@@ -1,0 +1,11 @@
+# Only the workspace's crates are built into the image.
+.git
+/target
+/data
+/adversarial
+/bench
+/docs
+/deploy
+/ops
+*.log
+.DS_Store

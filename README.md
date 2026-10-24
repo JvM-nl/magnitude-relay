@@ -78,6 +78,37 @@ url = "ws://127.0.0.1:7777"   # your strfry
 direction = "both"
 ```
 
+### With Docker
+
+No Rust needed, only Docker:
+
+```bash
+git clone https://github.com/VectorPrivacy/magnitude-relay
+cd magnitude-relay
+docker compose up -d
+```
+
+That's the same relay on `ws://127.0.0.1:7777`, with its events in the `relay-data` volume. Its settings are the commented file `init` writes, with `bind` opened to `0.0.0.0:7777` so the relay can be reached from outside the container. To change them, copy that file out, edit it, and uncomment the `relay.toml` mount in [`compose.yaml`](compose.yaml):
+
+```bash
+docker compose cp relay:/etc/magnitude-relay/relay.toml ./relay.toml
+docker compose up -d             # after editing, and uncommenting the mount
+```
+
+Operator commands run inside the container, against the running relay:
+
+```bash
+docker compose exec relay magnitude-relay --config /etc/magnitude-relay/relay.toml --data /data count --filter '{}'
+```
+
+An import needs the store to itself, so stop the relay first. From a strfry running in Docker:
+
+```bash
+docker compose stop relay
+docker exec <your-strfry-container> ./strfry export | docker compose run --rm -T relay import -
+docker compose start relay
+```
+
 ## Configuration
 
 Every setting is optional; `magnitude-relay init` documents them all. The highlights:

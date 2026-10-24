@@ -1,0 +1,32 @@
+# Magnitude Relay with Docker Compose: `docker compose up -d`.
+#
+# The relay listens on 127.0.0.1:7777 of this computer, for a web server such
+# as nginx or Caddy to put wss:// in front of (docs/nginx.md). To change
+# settings, copy the shipped file out, edit it, and uncomment the mount below:
+#
+#   docker compose cp relay:/etc/magnitude-relay/relay.toml ./relay.toml
+
+services:
+  relay:
+    build: .
+    image: magnitude-relay
+    restart: unless-stopped
+    ports:
+      # Loopback only. If relay.toml sets real_ip_header, this must stay so:
+      # anyone who can reach the relay directly could forge that header. To
+      # serve the internet without a web server, use [tls] and publish 443
+      # and 80 instead.
+      - "127.0.0.1:7777:7777"
+    volumes:
+      - relay-data:/data
+      # - ./relay.toml:/etc/magnitude-relay/relay.toml:ro
+    # A clean stop flushes the newest index entries; give it the time the
+    # systemd unit in deploy/relays/ does.
+    stop_grace_period: 60s
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+volumes:
+  relay-data:
