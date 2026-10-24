@@ -249,7 +249,7 @@ vector registers, rounds in scalar registers with BMI2's `rorx`, Maj from the
 previous round's a^b): 1.30x faster than the sha2 crate's assembly, so ring is
 still ~1.25x faster than ours; OpenSSL also schedules two blocks at once in
 256-bit registers, which ours does not. ring is now in the workspace (for TLS)
-but by PLAN.md runs only in `relay-tls`; using its SHA-256 here would save
+but by docs/DESIGN.md runs only in `relay-tls`; using its SHA-256 here would save
 another ~1.3 µs per event on the reactor (3%).
 
 ### Other costs
@@ -374,7 +374,7 @@ keys, sync), not verification.
 
 ## Open points
 
-- **The in-house line.** While this was being built, master's PLAN.md gained
+- **The in-house line.** While this was being built, master's design notes (docs/DESIGN.md) gained
   "TLS and cryptography are the one thing never written in-house". This branch
   writes secp256k1 field, scalar and group arithmetic and SHA-256 itself. Their
   scope: verification of public data only (no secret ever touches them, so
@@ -388,7 +388,7 @@ keys, sync), not verification.
   via a C shim compiled from secp256k1-sys's vendored sources (about 16 µs per
   signature against 10.6, and a second build of the library to maintain); and
   ring's SHA-256 for single messages instead of ours (faster, see above, but
-  ring outside `relay-tls`). PLAN.md's Hashing bullet is out of date either way.
+  ring outside `relay-tls`). docs/DESIGN.md's Hashing bullet is out of date either way.
 - **Import** is now limited by its single writer thread and the disk, not by
   verification.
 - **Affine buckets with a safegcd inversion**: ~0.5 µs per signature in bulk.

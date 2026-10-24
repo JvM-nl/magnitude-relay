@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_FILE: &str = "relay.toml";
 
 /// Event kinds the relay accepts out of the box: exactly what Vector produces
-/// and reads, per the kinds table in PLAN.md. Public notes are not on the list.
+/// and reads, per the kinds table in docs/DESIGN.md. Public notes are not on the list.
 /// Kept sorted and unique.
 pub const VECTOR_KINDS: &[u64] = &[
     // Profile.
@@ -93,7 +93,7 @@ pub const VECTOR_KINDS: &[u64] = &[
 /// (emoji lists and sets, 10030/30030), 38 (user status), 58 (badges: 8,
 /// 10008, 30008, 30009), 65 (relay lists), 78 (app data). Not 51: of its list kinds only the
 /// emoji ones are taken. Not 42: this relay never authenticates anyone
-/// (PLAN.md, Decisions). Blossom server lists (10063) are NIP-B7, which a list
+/// (docs/DESIGN.md, Decisions). Blossom server lists (10063) are NIP-B7, which a list
 /// of numbers cannot name.
 pub const SUPPORTED_NIPS: &[u32] = &[1, 9, 11, 17, 24, 30, 38, 40, 45, 46, 58, 59, 62, 65, 70, 77, 78];
 
@@ -2151,7 +2151,7 @@ segment_mb = 64
     #[test]
     fn vector_kinds_are_sorted_unique_and_cover_the_plan() {
         assert!(VECTOR_KINDS.windows(2).all(|w| w[0] < w[1]));
-        // PLAN.md's table of what Vector produces and reads.
+        // docs/DESIGN.md's table of what Vector produces and reads.
         for k in [0, 5, 8, 1059, 10002, 10008, 10030, 10050, 10063, 10304, 13303, 21059, 24133, 24590, 24681, 30008, 30009, 30030, 30078, 30315, 33301, 33302] {
             assert!(VECTOR_KINDS.contains(&k), "kind {k}");
         }

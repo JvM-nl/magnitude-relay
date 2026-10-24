@@ -494,7 +494,7 @@ impl Writer {
 
         // Tombstones. A gift wrap answers only to its recipients: its author is a
         // throwaway (DM) or shared (Concord plane) key, so author deletes are
-        // refused for it (Concord CORD-01; see PLAN.md decisions).
+        // refused for it (Concord CORD-01; see docs/DESIGN.md, Decisions).
         if k == kind::GIFT_WRAP {
             for p in p_tags(r) {
                 if b.has_key(&prefix(T_DELETED, &[id, &p])) {

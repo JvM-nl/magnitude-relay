@@ -3,7 +3,7 @@ name = "relay-adversarial"
 description = "Adversarial tests for the relay: parser fuzzing, a hostile-client harness, crash torture and stress"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-only"
 publish = false
 
 # Its own workspace, apart from the relay's: the store is built here with fault

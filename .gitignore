@@ -3,6 +3,6 @@
 *.log
 .DS_Store
 /.claude/worktrees
-/docs/bench-2026-10-21/comparison.html
-/docs/bench-2026-10-21/cards/
-/docs/bench-2026-10-21/morning/
+# Vector-internal notes and this deployment's real hosts: kept locally, never published
+/ops/
+/deploy/relays/hosts.env

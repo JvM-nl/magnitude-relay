@@ -106,7 +106,7 @@ Config files (copies here, installed by `push.sh`): `strfry-bench.conf`, `ours.t
 | negentropy | on, max 1,000,000 recs (was 500k) | on, max 1,000,000 | on, max 1,000,000 | on |
 | other | | `metrics_bind = ""` | `realIpHeader = ""` | |
 
-Why these: the numbers are the ones Vector/Concord ask for (PLAN.md): limit 5000, >= 2000 authors
+Why these: the numbers are the ones Vector/Concord ask for (docs/DESIGN.md): limit 5000, >= 2000 authors
 per filter, 200 subs, 256 KiB frames. `metrics_bind = ""` because ditto's default
 `127.0.0.1:13133` is outside 7801-7809. strfry's `auth.enabled` stays `true`: the live config
 documents that `enabled = false` alone leaves gift wraps unreadable (the kinds list is the

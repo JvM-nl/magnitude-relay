@@ -3,7 +3,7 @@
 //! store's rules. The torture parent replays acknowledgements into it and
 //! compares the store with it after every crash.
 //!
-//! Rules (PLAN.md, writer.rs): duplicates by id; kind-5 `e` tombstones (a gift
+//! Rules (docs/DESIGN.md, writer.rs): duplicates by id; kind-5 `e` tombstones (a gift
 //! wrap answers only to its p-tagged recipients); NIP-62 vanish tombstones;
 //! replaceable and addressable slots (newest wins, same second lowest id); `a`
 //! tombstones; vanish refused for a key that authored live gift wraps; operator

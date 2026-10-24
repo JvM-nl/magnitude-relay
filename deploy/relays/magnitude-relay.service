@@ -1,0 +1,24 @@
+# A hardened systemd unit for the relay, as Vector's relays run it. Install to
+# /etc/systemd/system/, then: systemctl daemon-reload && systemctl enable --now magnitude-relay
+[Unit]
+Description=Magnitude Relay (Nostr)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=magnitude-relay
+Group=magnitude-relay
+ExecStart=/usr/local/bin/magnitude-relay --config /etc/magnitude-relay/relay.toml serve
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=1
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/magnitude-relay
+
+[Install]
+WantedBy=multi-user.target

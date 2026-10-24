@@ -14,11 +14,12 @@
 #
 #   deploy/relays/deploy.sh               # HEAD to every relay
 #   deploy/relays/deploy.sh a4b1d83       # a given commit (also a way back)
-#   deploy/relays/deploy.sh --only asia   # one relay
+#   deploy/relays/deploy.sh --only eu     # one relay
 #   deploy/relays/status.sh               # what each relay runs, and its health
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
+[ -f "$HERE/hosts.env" ] || { echo "no $HERE/hosts.env: copy hosts.env.example and fill in your relays"; exit 1; }
 . "$HERE/hosts.env"
 REV_ARG=HEAD ONLY="" REBUILD=0
 while [ $# -gt 0 ]; do

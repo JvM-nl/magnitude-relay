@@ -8,7 +8,7 @@ pub const NAME: &str = "Magnitude Relay";
 pub const SLUG: &str = "magnitude-relay";
 
 /// NIP-11 `software`.
-pub const SOFTWARE_URL: &str = "https://github.com/VectorPrivacy";
+pub const SOFTWARE_URL: &str = "https://github.com/VectorPrivacy/magnitude-relay";
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The commit this binary was built from, as deploy/relays/deploy.sh stamps it

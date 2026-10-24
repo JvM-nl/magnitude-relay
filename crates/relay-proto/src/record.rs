@@ -40,7 +40,7 @@ pub const FLAG_PROTECTED: u8 = 1 << 1;
 pub const FLAG_RAW_FORM: u8 = 1 << 2;
 /// This relay took the event from a client and checked its signature itself
 /// (not from another relay, an import or a backup's source). Trusted peers
-/// may skip the check for these (see PLAN.md, trusted peers).
+/// may skip the check for these (see docs/DESIGN.md, Decisions: trusted peers).
 pub const FLAG_FIRST_HAND: u8 = 1 << 3;
 /// Content is the bytes the event's content decodes to as base64; the event's
 /// content is their padded standard encoding (see [`compact_into`]). Records

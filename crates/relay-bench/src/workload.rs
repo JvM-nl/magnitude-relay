@@ -11,7 +11,7 @@
 //! Two deliberate choices keep the relays comparable:
 //! * Filters that would otherwise match gift wraps always name an author, a `#p`
 //!   or ids, because the relay under development refuses (and others may hide) wraps
-//!   in broad scans, per PLAN.md.
+//!   in broad scans, per docs/DESIGN.md.
 //! * Every filter carries an explicit `limit` (relays differ on the default: strfry
 //!   500, ours 500, others unlimited).
 

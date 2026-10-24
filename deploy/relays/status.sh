@@ -1,6 +1,7 @@
 #!/bin/bash
 # status.sh: each relay's build, uptime, connections and health, side by side.
 HERE=$(cd "$(dirname "$0")" && pwd)
+[ -f "$HERE/hosts.env" ] || { echo "no $HERE/hosts.env: copy hosts.env.example and fill in your relays"; exit 1; }
 . "$HERE/hosts.env"
 on() { local h=$1; shift; local o="SSH_OPTS_$h" d="SSH_DEST_$h"; ssh -o BatchMode=yes -o ConnectTimeout=10 ${!o} "${!d}" "$@"; }
 printf "%-9s %-9s %-9s %-7s %-6s %-6s %s\n" host build uptime conns active sync warnings
