@@ -5,6 +5,15 @@
 # settings, copy the shipped file out, edit it, and uncomment the mount below:
 #
 #   docker compose cp relay:/etc/magnitude-relay/relay.toml ./relay.toml
+#
+# Behind a web server, do this before going live: in a container every client
+# arrives from Docker's gateway, not its own address, so without it the per-IP
+# limits count all your users as one. In relay.toml:
+#
+#   [relay]
+#   real_ip_header = "x-real-ip"
+#
+# and in nginx: proxy_set_header X-Real-IP $remote_addr; (see docs/nginx.md).
 
 services:
   relay:
@@ -12,8 +21,8 @@ services:
     image: magnitude-relay
     restart: unless-stopped
     ports:
-      # Loopback only. If relay.toml sets real_ip_header, this must stay so:
-      # anyone who can reach the relay directly could forge that header. To
+      # Loopback only, because real_ip_header (above) trusts whoever
+      # connects: anyone who could reach the relay directly could forge it. To
       # serve the internet without a web server, use [tls] and publish 443
       # and 80 instead.
       - "127.0.0.1:7777:7777"

@@ -95,6 +95,15 @@ docker compose cp relay:/etc/magnitude-relay/relay.toml ./relay.toml
 docker compose up -d             # after editing, and uncommenting the mount
 ```
 
+Behind a web server, set `real_ip_header` before going live. In a container every client arrives from Docker's gateway rather than its own address, so without it the per-IP limits treat all your users as one. In `relay.toml`:
+
+```toml
+[relay]
+real_ip_header = "x-real-ip"
+```
+
+and in nginx, `proxy_set_header X-Real-IP $remote_addr;` (see [docs/nginx.md](docs/nginx.md)). Keep the published port on `127.0.0.1`, as `compose.yaml` does: the header is trusted from whoever connects.
+
 Operator commands run inside the container, against the running relay:
 
 ```bash

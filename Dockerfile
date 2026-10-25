@@ -32,10 +32,8 @@ RUN magnitude-relay init /relay.toml \
     && sed -i 's|^# bind = "127.0.0.1:7777"$|bind = "0.0.0.0:7777"|' /relay.toml
 
 FROM debian:${DEBIAN_RELEASE}-slim
-# ca-certificates: wss:// [[sync]] to other relays and Let's Encrypt ([tls]).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# No ca-certificates: the relay's TLS roots (wss:// [[sync]], Let's Encrypt)
+# are compiled in from webpki-roots, so the system store is never read.
 RUN groupadd --system --gid 10001 magnitude-relay \
     && useradd --system --uid 10001 --gid 10001 --home-dir /data --no-create-home magnitude-relay \
     && install -d -o magnitude-relay -g magnitude-relay -m 0700 /data
