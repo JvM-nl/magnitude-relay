@@ -2,6 +2,7 @@
 //! what goes back. No sockets here; replies are written into an [`Outbox`]
 //! (the WebSocket layer frames them in place), so all of it is testable alone.
 
+use crate::bans::Bans;
 use crate::ingest::{ReactorMsg, Reply, WriteReq};
 use crate::metrics::{self, Block};
 use crate::subs::{ConnId, SubIndex};
@@ -36,12 +37,14 @@ pub struct SessionCfg {
     /// connection, and a REQ's stored results stop at it.
     pub max_outbound: usize,
     pub kind_allowed: Box<dyn Fn(u64) -> bool + Send + Sync>,
+    pub bans: Option<Arc<Bans>>,
 }
 
 impl SessionCfg {
-    pub fn from_config(cfg: &crate::config::Config) -> SessionCfg {
+    pub fn from_config(cfg: &crate::config::Config) -> Result<SessionCfg, String> {
         let kinds = cfg.policy.kind_policy();
-        SessionCfg {
+        let bans = Bans::from_config(cfg)?;
+        Ok(SessionCfg {
             max_subscriptions: cfg.limits.max_subscriptions,
             max_filters: cfg.limits.max_filters,
             max_filter_values: cfg.limits.max_filter_values,
@@ -52,7 +55,14 @@ impl SessionCfg {
             max_tags: cfg.policy.max_tags,
             max_outbound: cfg.limits.outbound_buffer_bytes,
             kind_allowed: Box::new(move |k| kinds.allows(k)),
-        }
+            bans,
+        })
+    }
+
+    /// Whether a valid event is to be answered `OK` and dropped (see `bans`).
+    #[inline]
+    pub fn silences(&self, rec: Record<'_>) -> bool {
+        self.bans.as_ref().is_some_and(|b| b.with(|s| s.silences(rec)))
     }
 
     /// Why an event is refused on policy alone, before anything is hashed:
@@ -470,6 +480,9 @@ impl Session {
                 return ok(out, &id, false, "invalid: bad signature");
             }
         }
+        if cx.cfg.silences(Record(rec)) {
+            return ok(out, &id, true, "");
+        }
         if kind::is_ephemeral(kind) {
             metrics::inc(&cx.m.events_ephemeral);
             (cx.broadcast)(ReactorMsg::Ephemeral(Arc::from(rec)));
@@ -504,6 +517,9 @@ impl Session {
             if wants_wraps && !addressed && !self.trusted {
                 return Err(String::from("restricted: gift wraps are requested by author, recipient or id"));
             }
+        }
+        if let Some(bans) = &cx.cfg.bans {
+            bans.with(|s| s.strip(filters));
         }
         Ok(())
     }

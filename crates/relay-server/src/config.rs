@@ -105,7 +105,7 @@ const KEYS: &[(&str, &[&str])] = &[
         "info",
         &["name", "description", "pubkey", "contact", "icon", "banner", "privacy_policy", "terms_of_service", "privacy_addresses"],
     ),
-    ("policy", &["kinds", "allow_kinds", "deny_kinds", "max_event_bytes", "max_future_seconds", "max_tags"]),
+    ("policy", &["kinds", "allow_kinds", "deny_kinds", "max_event_bytes", "max_future_seconds", "max_tags", "banlist"]),
     (
         "limits",
         &[
@@ -253,6 +253,8 @@ pub struct PolicyCfg {
     /// old events verbatim.
     pub max_future_seconds: u64,
     pub max_tags: usize,
+    /// A file of banned public keys (see `bans`). Empty means none.
+    pub banlist: String,
 }
 
 /// `[limits]`: per-connection and per-IP resource caps. Sized for what Vector
@@ -459,6 +461,7 @@ impl Default for PolicyCfg {
             max_event_bytes: 65_536,
             max_future_seconds: 900,
             max_tags: 2000,
+            banlist: String::new(),
         }
     }
 }
@@ -1076,6 +1079,7 @@ fn apply_policy(c: &mut PolicyCfg, e: &Entry) -> Result<bool, String> {
         "max_event_bytes" => c.max_event_bytes = int(e, 1024, 1 << 24)? as usize,
         "max_future_seconds" => c.max_future_seconds = int(e, 0, 365 * 86_400)?,
         "max_tags" => c.max_tags = int(e, 1, 1_000_000)? as usize,
+        "banlist" => c.banlist = path_setting(e)?,
         _ => return Ok(false),
     }
     Ok(true)
@@ -1469,6 +1473,18 @@ const TEMPLATE: &str = r##"# {name} settings
 
 # Most tags one event may carry.
 # max_tags = 2000
+
+# A file of public keys banned from this relay, like "/etc/relay/banlist.txt":
+# one npub or 64-character hex key per line, # starts a comment. The relay reads
+# it again within seconds of any change, no restart needed; a line it cannot
+# read leaves the list as it was. A banned key's events, and gift wraps
+# addressed to it, are answered OK and dropped, and the key is left out of every
+# filter: its owner sees an ordinary relay with nothing in it, everyone else
+# sees no such key. Without AUTH that is as far as a ban can reach: gift wraps
+# it sends are signed by one-time keys, and Concord by shared plane keys.
+# Removing what the key already stored is a separate step (`delete`).
+# Empty means no banlist.
+# banlist = ""
 
 [limits]
 # Vector asks a lot of a relay: thousands of authors in one filter, history pages

@@ -1466,3 +1466,64 @@ async fn loopback_is_not_held_to_per_address_limits() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A banned key's events, and gift wraps addressed to it, are answered OK like
+/// anyone's and never stored; asking for it finds nothing; everyone else is
+/// untouched; and editing the file takes effect without a restart.
+#[tokio::test]
+async fn a_banned_key_is_answered_ok_and_never_stored() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-bans-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (banned, friend, other) = (Signer::new(61), Signer::new(62), Signer::new(63));
+    let list = dir.join("banlist");
+    std::fs::write(&list, format!("# spam\n{}\n", banned.pk())).unwrap();
+    let port = free_port();
+    let relay = Relay::start_with(dir.clone(), port, &format!("[policy]\nbanlist = \"{}\"\n", list.display()));
+    let host = relay.addr.to_string();
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+
+    // Live: a subscription for the banned key's inbox ends at once and stays quiet.
+    send(&mut c, json!(["REQ", "theirs", {"kinds": [1059], "#p": [banned.pk()], "limit": 0}])).await;
+    assert_eq!(collect(&mut c, "theirs").await.1[0], "EOSE");
+
+    let profile = banned.event(now(), 0, json!([]), "{}");
+    let typing = banned.event(now(), 21059, json!([]), "x");
+    let to_banned = friend.event(now() - 3600, 1059, json!([["p", banned.pk()]]), "ciphertext");
+    let to_other = friend.event(now() - 3600, 1059, json!([["p", other.pk()]]), "ciphertext");
+    for ev in [&profile, &typing, &to_banned, &to_other] {
+        send(&mut c, json!(["EVENT", ev])).await;
+        assert_eq!(ok_of(&mut c).await, (true, String::new()), "{}", ev["kind"]);
+    }
+    // A forgery is still refused as one: the ban answers nothing early.
+    send(&mut c, json!(["EVENT", bad_sig(banned.event(now(), 0, json!([]), "{}"))])).await;
+    assert_eq!(ok_of(&mut c).await, (false, "invalid: bad signature".into()));
+
+    let found = |f: Value| ids_over_req(&relay, f);
+    assert!(found(json!({"authors": [banned.pk()]})).await.is_empty());
+    assert!(found(json!({"kinds": [1059], "#p": [banned.pk()]})).await.is_empty());
+    assert!(found(json!({"ids": [profile["id"], to_banned["id"]]})).await.is_empty());
+    assert_eq!(found(json!({"kinds": [1059], "#p": [banned.pk(), other.pk()]})).await, [to_other["id"].as_str().unwrap()]);
+    send(&mut c, json!(["COUNT", "n", {"kinds": [1059], "#p": [banned.pk()]}])).await;
+    assert_eq!(recv(&mut c).await[2]["count"], 0);
+    // The operator sees every stored event: none of the banned ones are there.
+    let stored = ids_printed(&run_ok(&dir, &["query", "--filter", "{}"]));
+    assert_eq!(stored, [to_other["id"].as_str().unwrap()]);
+
+    // Lifted by editing the file, with the relay running.
+    std::fs::write(&list, "# nobody\n").unwrap();
+    let t = Instant::now();
+    loop {
+        let ev = banned.event(now(), 30078, json!([["d", format!("t{}", t.elapsed().as_millis())]]), "back");
+        send(&mut c, json!(["EVENT", ev])).await;
+        assert!(ok_of(&mut c).await.0);
+        if found(json!({"ids": [ev["id"]]})).await.len() == 1 {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(15), "the lifted ban was not picked up");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    drop(c);
+    relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}

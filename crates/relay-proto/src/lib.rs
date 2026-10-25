@@ -12,6 +12,7 @@ pub mod json;
 pub mod kind;
 pub mod message;
 pub mod negentropy;
+pub mod nip19;
 pub mod record;
 pub mod secp;
 pub mod sha256;

@@ -86,7 +86,7 @@ Every setting is optional; `magnitude-relay init` documents them all. The highli
 |---|---|
 | `[relay]` | `bind` address, a Unix `unix_socket` for a web server in front, `urls` (the relay's public addresses), `real_ip_header` behind a proxy, `compression` (permessage-deflate) |
 | `[info]` | The NIP-11 identity: name, description, contact, icon, operator `pubkey`, and `privacy_addresses` for Tor and I2P twins |
-| `[policy]` | Which kinds it accepts: `"vector"` (default), `"all"`, or a list; plus `allow_kinds`, `deny_kinds`, event size and future-timestamp limits |
+| `[policy]` | Which kinds it accepts: `"vector"` (default), `"all"`, or a list; plus `allow_kinds`, `deny_kinds`, event size and future-timestamp limits, and a `banlist` |
 | `[limits]` | Message size, subscriptions, filters, `limit` caps, per-IP connections and events per minute |
 | `[store]` | Data directory, durability, file size, memory for the newest index entries |
 | `[tls]` | Built-in HTTPS: Let's Encrypt for your domains, or your own certificate files |
@@ -101,6 +101,15 @@ By default it accepts only what Vector produces and reads (profiles, gift-wrappe
 [policy]
 kinds = "all"            # or keep "vector" and add: allow_kinds = [1, 7]
 ```
+
+### Banning a key
+
+```toml
+[policy]
+banlist = "/etc/magnitude-relay/banlist.txt"   # one npub or hex key per line, # for comments
+```
+
+The relay reads the file again within seconds of a change, no restart needed. A banned key's events, and gift wraps addressed to it, are answered `OK` and dropped, and the key is left out of every filter, so its owner sees an ordinary, empty relay. Without AUTH that is as far as a ban reaches: gift wraps the key sends are signed by one-time keys, and Concord events by shared plane keys. `delete --filter '{"authors":["<hex>"]}'` removes what it stored before the ban.
 
 ### HTTPS
 

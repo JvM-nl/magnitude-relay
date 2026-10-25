@@ -94,6 +94,9 @@ fn check_unsigned(text: &str, at: usize, cfg: &SessionCfg, v: &Version, now: u64
     if let Some(msg) = cfg.refusal(&info, Record(rec), now) {
         return Err(Verdict::Refused(msg));
     }
+    if cfg.silences(Record(rec)) {
+        return Err(banned());
+    }
     if kind::is_ephemeral(info.kind) {
         return Err(Verdict::Ephemeral);
     }
@@ -104,6 +107,12 @@ fn check_unsigned(text: &str, at: usize, cfg: &SessionCfg, v: &Version, now: u64
         return Err(Verdict::Invalid("invalid: bad event id".into()));
     }
     Ok(())
+}
+
+/// Taken in sync or import as a client's would be (see `bans`); only the
+/// operator's report says so.
+fn banned() -> Verdict {
+    Verdict::Refused("blocked: banned key".into())
 }
 
 fn bad_signature() -> Verdict {
@@ -122,6 +131,9 @@ pub fn check_ephemeral(text: &str, at: usize, cfg: &SessionCfg, now: u64) -> Res
     }
     if let Some(msg) = cfg.refusal(&info, Record(&rec), now) {
         return Err(Verdict::Refused(msg));
+    }
+    if cfg.silences(Record(&rec)) {
+        return Err(banned());
     }
     if parser.confirm_id(Scanner::new_at(text, at), &mut rec, info).is_err() {
         return Err(Verdict::Invalid("invalid: bad event id".into()));
@@ -366,6 +378,7 @@ mod tests {
             max_tags: 100,
             max_outbound: 1 << 20,
             kind_allowed: Box::new(|k| k == 1),
+            bans: None,
         };
         let refs: Vec<(&str, usize, bool)> = texts.iter().map(|t| (t.as_str(), 0, false)).collect();
         let mut parser = EventParser::new();
@@ -418,6 +431,7 @@ mod tests {
             max_tags: 100,
             max_outbound: 1 << 20,
             kind_allowed: Box::new(|k| k == 1 || kind::is_ephemeral(k)),
+            bans: None,
         };
         let good = event(21059);
         let rec = check_ephemeral(&good, 0, &cfg, now).expect("a valid ephemeral event");

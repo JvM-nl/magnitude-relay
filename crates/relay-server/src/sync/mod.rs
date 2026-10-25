@@ -434,7 +434,7 @@ pub fn run_command(cfg: &Config, url: &str, filters: Vec<Filter>, dir: Direction
     let url = RelayUrl::parse(url)?;
     crate::operator::check_filters(&filters)?;
     let mut target = match Store::open(&cfg.store.data, store_options(cfg)) {
-        Ok((store, w)) => Target::Direct(Box::new(local::Direct::new(store, w, SessionCfg::from_config(cfg)))),
+        Ok((store, w)) => Target::Direct(Box::new(local::Direct::new(store, w, SessionCfg::from_config(cfg)?))),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Target::Socket(local::ViaSocket::new(crate::admin::socket_path(&cfg.store.data), e.to_string())),
         Err(e) => return Err(e.to_string()),
     };

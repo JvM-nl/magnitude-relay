@@ -1,6 +1,7 @@
 //! The relay binary.
 
 mod admin;
+mod bans;
 mod brand;
 mod config;
 mod ephemeral;
@@ -174,7 +175,8 @@ fn run() -> Result<(), String> {
             let policy = cfg.policy.kind_policy();
             let skip_kind: Option<Box<dyn Fn(u64) -> bool + Send + Sync>> =
                 cfg.policy.restricts_writes().then(|| Box::new(move |k| !policy.allows(k)) as _);
-            let opts = import::ImportOptions { verify, skip_kind, threads };
+            let bans = bans::Bans::from_config(&cfg)?;
+            let opts = import::ImportOptions { verify, skip_kind, bans, threads };
             let t = Instant::now();
             let report = |s: &import::ImportStats| {
                 let secs = t.elapsed().as_secs_f64();
@@ -206,8 +208,8 @@ fn run() -> Result<(), String> {
                 stats.bytes as f64 / 1e6 / secs
             );
             eprintln!(
-                "  stored {}, duplicate {}, superseded {}, deleted {}, vanished {}, ephemeral skipped {}, kind skipped {}",
-                stats.stored, stats.duplicate, stats.superseded, stats.deleted, stats.vanished, stats.ephemeral, stats.skipped_kind
+                "  stored {}, duplicate {}, superseded {}, deleted {}, vanished {}, ephemeral skipped {}, kind skipped {}, banned skipped {}",
+                stats.stored, stats.duplicate, stats.superseded, stats.deleted, stats.vanished, stats.ephemeral, stats.skipped_kind, stats.skipped_banned
             );
             let mut inv: Vec<_> = stats.invalid.into_iter().collect();
             inv.sort_by_key(|e| std::cmp::Reverse(e.1));

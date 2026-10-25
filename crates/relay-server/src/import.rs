@@ -20,6 +20,8 @@ pub struct ImportOptions {
     pub verify: bool,
     /// Events of these kinds are skipped (ephemeral kinds are always skipped).
     pub skip_kind: Option<Box<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// Events a client could not store here are left out as well (see `bans`).
+    pub bans: Option<std::sync::Arc<crate::bans::Bans>>,
     pub threads: usize,
 }
 
@@ -34,6 +36,7 @@ pub struct ImportStats {
     pub vanished: u64,
     pub ephemeral: u64,
     pub skipped_kind: u64,
+    pub skipped_banned: u64,
     pub invalid: HashMap<String, u64>,
     pub bytes: u64,
 }
@@ -51,6 +54,7 @@ struct Parsed {
     lines: u64,
     ephemeral: u64,
     skipped_kind: u64,
+    skipped_banned: u64,
     invalid: Vec<String>,
 }
 
@@ -100,6 +104,7 @@ pub fn run(input: impl Read + Send, w: &mut Writer, opts: ImportOptions, mut pro
         // Parsers.
         let work_rx = &work_rx;
         let skip_kind = &opts.skip_kind;
+        let bans = &opts.bans;
         for _ in 0..threads {
             let done_tx = done_tx.clone();
             let verify = opts.verify;
@@ -119,6 +124,7 @@ pub fn run(input: impl Read + Send, w: &mut Writer, opts: ImportOptions, mut pro
                         lines: chunk.lines.len() as u64,
                         ephemeral: 0,
                         skipped_kind: 0,
+                        skipped_banned: 0,
                         invalid: Vec::new(),
                     };
                     let lines: Vec<&str> = chunk.lines.iter().map(String::as_str).filter(|l| !l.trim().is_empty()).collect();
@@ -126,6 +132,7 @@ pub fn run(input: impl Read + Send, w: &mut Writer, opts: ImportOptions, mut pro
                     let take = |r: &Result<EventInfo, Reject>, rec: &[u8], out: &mut Parsed| match r {
                         Ok(info) if kind::is_ephemeral(info.kind) => out.ephemeral += 1,
                         Ok(info) if skip_kind.as_ref().is_some_and(|f| f(info.kind)) => out.skipped_kind += 1,
+                        Ok(_) if bans.as_ref().is_some_and(|b| b.with(|s| s.silences(relay_proto::Record(rec)))) => out.skipped_banned += 1,
                         Ok(_) => {
                             out.data.extend_from_slice(rec);
                             out.ends.push(out.data.len());
@@ -163,6 +170,7 @@ pub fn run(input: impl Read + Send, w: &mut Writer, opts: ImportOptions, mut pro
                 stats.lines += p.lines;
                 stats.ephemeral += p.ephemeral;
                 stats.skipped_kind += p.skipped_kind;
+                stats.skipped_banned += p.skipped_banned;
                 for r in p.invalid {
                     *stats.invalid.entry(r).or_default() += 1;
                 }

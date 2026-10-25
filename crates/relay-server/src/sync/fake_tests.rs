@@ -171,7 +171,7 @@ fn local_store(tag: &str, events: &[(u64, [u8; 32])]) -> Direct {
         w.write(&refs).unwrap();
     }
     let cfg = Config { policy: crate::config::PolicyCfg { kinds: crate::config::KindBase::All, ..Default::default() }, ..Config::default() };
-    Direct::new(store, w, SessionCfg::from_config(&cfg))
+    Direct::new(store, w, SessionCfg::from_config(&cfg).unwrap())
 }
 
 fn id(n: u64) -> [u8; 32] {
@@ -270,7 +270,7 @@ async fn fetched_events_are_checked_and_accounted_for() {
     let dir = std::env::temp_dir().join(format!("relay-sync-fake-fetch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let (store, w) = Store::open(&dir, Options { segment_size: 16 << 20, ..Options::default() }).unwrap();
-    let mut local = Direct::new(store, w, SessionCfg::from_config(&Config::default()));
+    let mut local = Direct::new(store, w, SessionCfg::from_config(&Config::default()).unwrap());
     let mut r = Report::default();
     sync_filter(&mut remote, &mut local, &Filter::default(), &Opts::new(Direction::Down), &mut r).await.unwrap();
     assert_eq!((r.need, r.fetched, r.not_returned, r.unrequested), (29, 27, 2, 1));
@@ -317,7 +317,7 @@ async fn a_trusted_peer_vouches_only_for_signatures_and_only_first_hand() {
             let dir = std::env::temp_dir().join(format!("relay-sync-fake-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let (store, w) = Store::open(&dir, Options { segment_size: 16 << 20, ..Options::default() }).unwrap();
-            let mut local = Direct::new(store, w, SessionCfg::from_config(&Config::default()));
+            let mut local = Direct::new(store, w, SessionCfg::from_config(&Config::default()).unwrap());
             let mut r = Report::default();
             let opts = Opts { trusted, ..Opts::new(Direction::Down) };
             sync_filter(&mut remote, &mut local, &Filter::default(), &opts, &mut r).await.unwrap();

@@ -34,7 +34,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let https_bind = cfg.tls.enabled.then_some(cfg.tls.https_bind);
     let http_bind = cfg.tls.http_bind.filter(|_| cfg.tls.enabled);
 
-    let scfg = Arc::new(SessionCfg::from_config(&cfg));
+    let scfg = Arc::new(SessionCfg::from_config(&cfg)?);
+    if let Some(bans) = &scfg.bans {
+        eprintln!("banlist: {} keys from {}", bans.len(), bans.path().display());
+        bans.watch();
+    }
     let syncs = cfg.sync.clone();
 
     let (wtx, wrx) = mpsc::sync_channel(WRITE_QUEUE);
