@@ -43,7 +43,8 @@ impl Inbound {
 }
 
 /// `(created_at, id)` of every live event `f` matches here, newest first:
-/// a negentropy set. At most `cap` + 1 items, so a caller can tell "more than
+/// a negentropy set. Events expiring by `now` are left out; a pass passes
+/// [`super::bulk_horizon`], so short-lived ones stay with the live link. At most `cap` + 1 items, so a caller can tell "more than
 /// `cap`" without reading the rest. With `hide_wraps`, gift wraps are left out
 /// of a filter that does not name their author, recipient or id, as this relay
 /// does for its own clients.
@@ -175,7 +176,7 @@ impl Direct {
 
 impl Local for Direct {
     fn items(&mut self, f: &Filter, hide_wraps: bool, cap: usize) -> Result<Vec<(u64, [u8; 32])>, String> {
-        Ok(items_of(&self.store.snapshot(), f, hide_wraps, cap, ingest::now()))
+        Ok(items_of(&self.store.snapshot(), f, hide_wraps, cap, super::bulk_horizon()))
     }
 
     fn events(&mut self, ids: &[[u8; 32]]) -> Result<Vec<String>, String> {
@@ -257,7 +258,7 @@ impl InServer {
 
 impl Local for InServer {
     fn items(&mut self, f: &Filter, hide_wraps: bool, cap: usize) -> Result<Vec<(u64, [u8; 32])>, String> {
-        Ok(items_of(&self.store.snapshot(), f, hide_wraps, cap, ingest::now()))
+        Ok(items_of(&self.store.snapshot(), f, hide_wraps, cap, super::bulk_horizon()))
     }
 
     fn events(&mut self, ids: &[[u8; 32]]) -> Result<Vec<String>, String> {

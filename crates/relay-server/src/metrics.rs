@@ -49,6 +49,9 @@ counters! {
     messages_in,
     /// EVENT messages received.
     events_in,
+    /// Of those, from a trusted peer (`[[peer]]`): what reached this relay over
+    /// a sync link rather than from an app.
+    events_in_peer,
     /// Events stored (OK true, new).
     events_stored,
     /// Events already stored (OK true, duplicate).

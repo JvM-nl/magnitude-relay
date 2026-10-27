@@ -185,7 +185,7 @@ While the relay runs, `query`, `count`, `delete`, `backup` and `sync` reach it t
 
 ### Watching it
 
-Every relay has a public dashboard at `/dashboard`, a landing page at `/`, JSON at `/stats`, a heartbeat at `/live`, and Prometheus metrics at `/metrics`. Behind a path such as `/nostr`, they live at `/nostr/dashboard` and so on. Refusals are counted by reason there (a kind not accepted, invalid, rate-limited, gift wraps asked for wholesale, and so on); which address did what is only for the operator, through `top`.
+Every relay has a public dashboard at `/dashboard`, a landing page at `/`, JSON at `/stats`, a heartbeat at `/live`, and Prometheus metrics at `/metrics`. Behind a path such as `/nostr`, they live at `/nostr/dashboard` and so on. Refusals are counted by reason there (a kind not accepted, invalid, rate-limited, gift wraps asked for wholesale, and so on); which address did what is only for the operator, through `top`. While a bulk sync with another relay runs, the top of the dashboard says so ("JSKitty Relay is syncing with Vector Asia Relay"), and events that arrived over a sync link are charted apart from those apps sent.
 
 <p align="center">
   <img src="docs/assets/dashboard.jpg" alt="The relay's live dashboard" width="820">

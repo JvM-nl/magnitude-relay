@@ -124,7 +124,7 @@ const KEYS: &[(&str, &[&str])] = &[
     ),
     ("store", &["data", "sync", "segment_mb", "memory_mb"]),
     ("tls", &["enabled", "domains", "email", "https_bind", "http_bind", "cert", "key", "staging", "directory"]),
-    ("sync", &["url", "filter", "direction", "reconcile_seconds", "full_reconcile_seconds", "recent_seconds", "trusted"]),
+    ("sync", &["url", "name", "filter", "direction", "reconcile_seconds", "full_reconcile_seconds", "recent_seconds", "trusted"]),
     ("peer", &["name", "secret", "ips"]),
 ];
 
@@ -368,6 +368,8 @@ impl TlsCfg {
 /// `[[sync]]`: another relay to copy events from or to, and keep in step with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCfg {
+    /// What the dashboard calls the other relay; its host when not set.
+    pub name: String,
     /// `ws://` or `wss://`.
     pub url: String,
     /// The events to sync: one filter, or several (their union). `{}` is everything.
@@ -428,6 +430,7 @@ impl Default for SyncCfg {
     /// Everything, theirs to us, compared hourly. No url: one must be given.
     fn default() -> Self {
         SyncCfg {
+            name: String::new(),
             url: String::new(),
             filters: vec![Filter::default()],
             direction: Direction::Down,
@@ -1275,6 +1278,7 @@ fn apply_sync(c: &mut SyncCfg, e: &Entry) -> Result<bool, String> {
                 format!("`direction` is \"down\" (theirs to us), \"up\" (ours to them) or \"both\", not \"{s}\"{hint}")
             })?;
         }
+        "name" => c.name = string(e)?.to_string(),
         "reconcile_seconds" => c.reconcile_seconds = int(e, 1, 30 * 86_400)?,
         "full_reconcile_seconds" => c.full_reconcile_seconds = int(e, 1, 365 * 86_400)?,
         "recent_seconds" => c.recent_seconds = int(e, 0, 365 * 86_400)?,
@@ -1627,9 +1631,16 @@ const TEMPLATE: &str = r##"# {name} settings
 # then new events stream live, and the comparison runs again every
 # reconcile_seconds to catch anything the stream missed. Events copied in are
 # checked like any app's: signatures, the kinds accepted here, deletions.
+# Ephemeral events travel only live, and events expiring within 10 minutes are
+# left out of comparisons (and of the catch-up after a dropped stream): they
+# would be gone, or nearly, by the time they landed.
 #
 # [[sync]]
 # url = "wss://relay.example.com"
+
+# What the dashboard calls the other relay ("Vector Asia Relay is syncing with
+# ..."). Its host when not set.
+# name = "relay.example.com"
 
 # Which events: a Nostr filter in JSON, or a list of filters. Put JSON in
 # 'single quotes' so its own quotes need no backslashes, as in
@@ -1663,6 +1674,8 @@ const TEMPLATE: &str = r##"# {name} settings
 # wss://this-relay/peer/<secret>, AND the address it connects from; both, or
 # it is an ordinary client (and a wrong secret is turned away). Behind a web
 # server set real_ip_header, and pass /peer/ on to the relay.
+#
+# The name is what the dashboard shows while the peer syncs with this relay.
 #
 # [[peer]]
 # name = "eu-2"
@@ -1738,7 +1751,7 @@ mod tests {
                 }
             })
             .collect();
-        let example = SyncCfg { url: "wss://relay.example.com".into(), ..SyncCfg::default() };
+        let example = SyncCfg { name: "relay.example.com".into(), url: "wss://relay.example.com".into(), ..SyncCfg::default() };
         let peer = PeerCfg { name: "eu-2".into(), secret: "replace-with-your-own-secret-from-openssl-rand".into(), ips: vec!["203.0.113.7".parse().unwrap()] };
         assert_eq!(ok(&uncommented), Config { sync: vec![example], peers: vec![peer], ..Config::default() }, "with every setting uncommented");
 

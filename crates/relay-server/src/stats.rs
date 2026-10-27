@@ -33,10 +33,11 @@ pub fn json(shared: &Shared) -> String {
     let mut o = String::with_capacity(1024);
     let _ = write!(
         o,
-        "{{\"software\":\"{}\",\"version\":\"{}\",\"build\":\"{}\",\"uptime_secs\":{},\"connections_open\":{},\"neg_items_held\":{}",
+        "{{\"software\":\"{}\",\"version\":\"{}\",\"build\":\"{}\",\"name\":{},\"uptime_secs\":{},\"connections_open\":{},\"neg_items_held\":{}",
         crate::brand::NAME,
         crate::brand::VERSION,
         crate::brand::BUILD,
+        json_str(&shared.cfg.info.name),
         shared.metrics.uptime_secs(),
         shared.metrics.open.load(Ordering::Relaxed),
         crate::session::NEG_ITEMS.load(Ordering::Relaxed)
@@ -67,6 +68,34 @@ pub fn json(shared: &Shared) -> String {
             let _ = write!(o, ",\"{k}\":{v}");
         }
         o.push('}');
+    }
+    o.push(']');
+    // Bulk passes with other relays, both ways: the ones this relay runs
+    // ([[sync]]) and the ones its peers run against it ([[peer]]). `since` is
+    // when the running (or last) pass began, `last_at` when the last one ended
+    // (or was last heard from), `moved` the events it copied either way;
+    // `window_secs` how far back a pass of ours reaches (0: every event, and
+    // always 0 for a peer's, whose reach only the peer knows).
+    let now = crate::ingest::now();
+    let g = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    let mut links = Vec::new();
+    for s in &shared.sync {
+        let since = g(&s.pass_since);
+        links.push((&s.name, "running", since > 0, since, g(&s.pass_window), g(&s.last_reconcile_at), g(&s.last_need) + g(&s.last_have)));
+    }
+    for l in &shared.links {
+        links.push((&l.name, "serving", l.active(now), g(&l.since), 0, g(&l.last), g(&l.moved)));
+    }
+    o.push_str(",\"links\":[");
+    for (i, (name, role, active, since, window, last_at, moved)) in links.into_iter().enumerate() {
+        if i > 0 {
+            o.push(',');
+        }
+        let _ = write!(
+            o,
+            "{{\"name\":{},\"role\":\"{role}\",\"active\":{active},\"since\":{since},\"window_secs\":{window},\"last_at\":{last_at},\"moved\":{moved}}}",
+            json_str(name)
+        );
     }
     o.push(']');
     // The host, the store's durability, and what deserves attention.

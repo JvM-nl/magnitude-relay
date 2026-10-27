@@ -56,6 +56,8 @@ pub struct Shared {
     pub metrics: Metrics,
     /// One per `[[sync]]` entry.
     pub sync: Vec<Arc<crate::sync::live::Stats>>,
+    /// One per `[[peer]]`: its passes against this relay.
+    pub links: Vec<Arc<crate::sync::PeerLink>>,
     /// Checks reads' signatures in batches across connections.
     pub verify: crate::verify::Pool,
     /// Ephemeral ids of the last two minutes: each is delivered once.
@@ -128,6 +130,7 @@ impl Shared {
     pub fn new(cfg: Config, scfg: Arc<SessionCfg>, store: Store, writer: SyncSender<WriteReq>, reactors: usize) -> Shared {
         let nip11 = cfg.nip11_json();
         let sync = crate::sync::live::stats_for(&cfg.sync);
+        let links = cfg.peers.iter().map(|p| Arc::new(crate::sync::PeerLink::new(&p.name))).collect();
         Shared {
             cfg,
             scfg,
@@ -140,6 +143,7 @@ impl Shared {
             ips: Mutex::new(IpTable { map: FxMap::default(), swept: Instant::now() }),
             metrics: Metrics::new(reactors),
             sync,
+            links,
             verify: crate::verify::Pool::new(reactors),
             ephemeral_seen: crate::ephemeral::Seen::default(),
             ephemeral_out: tokio::sync::broadcast::channel(EPHEMERAL_OUT).0,
@@ -735,16 +739,16 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
     }
 }
 
-/// Whether a connection is one of our trusted peers': `/peer/<secret>` naming a
+/// Which of our trusted peers a connection is: `/peer/<secret>` naming a
 /// `[[peer]]`, from one of that peer's addresses; both, or it is not. `None`
-/// for any other path; `Some(false)` for a peer path that does not check out.
-fn trusted_peer(peers: &[crate::config::PeerCfg], path: &str, ip: IpAddr) -> Option<bool> {
+/// for any other path; `Some(None)` for a peer path that does not check out.
+fn trusted_peer(peers: &[crate::config::PeerCfg], path: &str, ip: IpAddr) -> Option<Option<usize>> {
     let rest = path.strip_prefix("/peer/")?;
     let secret = rest.split(['?', '#', '/']).next().unwrap_or("").as_bytes();
     // Every secret compared in full: how long a comparison takes says nothing
     // about how much of a guess was right.
     let same = |a: &[u8], b: &[u8]| a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
-    Some(peers.iter().fold(false, |ok, p| ok | (same(p.secret.as_bytes(), secret) & p.ips.contains(&ip))))
+    Some(peers.iter().enumerate().fold(None, |found, (i, p)| if same(p.secret.as_bytes(), secret) & p.ips.contains(&ip) { Some(i) } else { found }))
 }
 
 fn client_ip(req: &OwnedRequest, peer: SocketAddr, header: &str) -> IpAddr {
@@ -765,7 +769,8 @@ struct Accepted {
     buf: Vec<u8>,
     ip: IpAddr,
     deflate: Option<DeflateParams>,
-    trusted: bool,
+    /// Which `[[peer]]` it is, if it is one.
+    peer: Option<usize>,
     conn: ConnId,
     out: Rc<ConnOut>,
 }
@@ -775,8 +780,8 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
     // async fn's state is as large as its largest phase, and every idle
     // connection carried the handshake's (and kept its request's headers).
     let Some(a) = Box::pin(accept(s, peer, tls, &st, &shared)).await else { return };
-    let Accepted { mut s, mut buf, ip, deflate, trusted, conn, out } = a;
-    let _ = serve(&mut s, &mut buf, conn, ip, deflate, trusted, &out, &st, &shared).await;
+    let Accepted { mut s, mut buf, ip, deflate, peer, conn, out } = a;
+    let _ = serve(&mut s, &mut buf, conn, ip, deflate, peer, &out, &st, &shared).await;
 
     {
         let mut r = st.borrow_mut();
@@ -806,7 +811,7 @@ async fn accept(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: &Rc<Ref
     // 429 before the upgrade. A trusted peer is not held to it.
     let check = |req: &OwnedRequest| {
         let ip = client_ip(req, peer, real_ip_header);
-        if trusted_peer(&shared.cfg.peers, &req.path, ip) == Some(true) {
+        if matches!(trusted_peer(&shared.cfg.peers, &req.path, ip), Some(Some(_))) {
             return None;
         }
         shared.allow_connection(ip).err().map(|wait| {
@@ -825,10 +830,10 @@ async fn accept(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: &Rc<Ref
         _ => return None,
     };
     let ip = client_ip(&req, peer, real_ip_header);
-    let trusted = match trusted_peer(&shared.cfg.peers, &req.path, ip) {
-        None => false,
-        Some(true) => true,
-        Some(false) => {
+    let peer = match trusted_peer(&shared.cfg.peers, &req.path, ip) {
+        None => None,
+        Some(Some(i)) => Some(i),
+        Some(None) => {
             metrics::inc(&shared.metrics.of(idx).connections_refused);
             let mut out = Vec::new();
             ws::write_close(&mut out, 1008, "not a known peer");
@@ -851,10 +856,10 @@ async fn accept(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: &Rc<Ref
         metrics::inc(&shared.metrics.of(idx).connections_deflate);
     }
     let ua: Box<str> = req.headers.iter().find(|(n, _)| n == "user-agent").map_or_else(Box::default, |(_, v)| String::from_utf8_lossy(&v[..v.len().min(96)]).into());
-    let out = Rc::new(ConnOut::new(z, s.is_clear(), trusted, ip, ua));
+    let out = Rc::new(ConnOut::new(z, s.is_clear(), peer.is_some(), ip, ua));
     st.borrow_mut().conns.insert(conn, out.clone());
 
-    Some(Accepted { s, buf, ip, deflate, trusted, conn, out })
+    Some(Accepted { s, buf, ip, deflate, peer, conn, out })
 }
 
 /// The least time a write to a client may take before the client counts as
@@ -1057,7 +1062,7 @@ async fn serve(
     conn: ConnId,
     ip: IpAddr,
     deflate: Option<DeflateParams>,
-    trusted: bool,
+    peer: Option<usize>,
     out: &Rc<ConnOut>,
     st: &Rc<RefCell<Reactor>>,
     shared: &Arc<Shared>,
@@ -1067,7 +1072,7 @@ async fn serve(
     if let Some(p) = &deflate {
         dec = dec.with_deflate(p);
     }
-    let mut session = Session::new(conn, trusted);
+    let mut session = Session::new(conn, peer.map(|i| shared.links[i].clone()));
     let mut wbuf = Vec::new();
     let mut wspliced: Vec<(usize, Rc<[u8]>)> = Vec::new();
     let mut last_rx = Instant::now();

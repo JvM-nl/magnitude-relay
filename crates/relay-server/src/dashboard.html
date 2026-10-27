@@ -27,6 +27,8 @@
     --series-1: #9b64f6;
     --series-2: #ff2ea9;
     --series-3: #1fa774;
+    /* Traffic from our other relays: neutral, so it never reads as an app's. */
+    --series-4: #a3a19a;
     --fade: 0.22;
     --meter-track: #e9e8e3;
     --good: #1fa774;
@@ -48,6 +50,7 @@
       --series-1: #9b64f6;
       --series-2: #ff2ea9;
       --series-3: #58fbb2;
+      --series-4: #77756f;
       --fade: 0.30;
       --good: #58fbb2;
       --meter-track: #2c2c2a;
@@ -67,6 +70,7 @@
     --series-1: #9b64f6;
     --series-2: #ff2ea9;
     --series-3: #58fbb2;
+    --series-4: #77756f;
     --fade: 0.30;
     --good: #58fbb2;
     --meter-track: #2c2c2a;
@@ -129,6 +133,8 @@
   .alert.critical { border-color: var(--critical); background: color-mix(in srgb, var(--critical) 9%, var(--surface)); }
   .alert b { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; flex: none; min-width: 5.5em; }
   .alert.critical b { color: var(--critical-text); }
+  .alert.link { border-color: color-mix(in srgb, var(--series-1) 55%, var(--surface)); background: color-mix(in srgb, var(--series-1) 7%, var(--surface)); }
+  .alert.link b { color: var(--series-1); }
   .meter > span.warn { background: var(--warning); }
   .meter > span.bad { background: var(--critical); }
   main { transition: opacity .3s ease; }
@@ -250,6 +256,7 @@
   <linearGradient id="fade-1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--series-1);stop-opacity:var(--fade)"/><stop offset="1" style="stop-color:var(--series-1);stop-opacity:0"/></linearGradient>
   <linearGradient id="fade-2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--series-2);stop-opacity:var(--fade)"/><stop offset="1" style="stop-color:var(--series-2);stop-opacity:0"/></linearGradient>
   <linearGradient id="fade-3" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--series-3);stop-opacity:var(--fade)"/><stop offset="1" style="stop-color:var(--series-3);stop-opacity:0"/></linearGradient>
+  <linearGradient id="fade-4" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--series-4);stop-opacity:var(--fade)"/><stop offset="1" style="stop-color:var(--series-4);stop-opacity:0"/></linearGradient>
 </defs></svg>
 <div class="wrap">
   <header>
@@ -371,7 +378,7 @@
     "connections_total", "connections_refused", "messages_in", "events_in",
     "events_stored", "events_duplicate", "events_refused", "events_ephemeral",
     "events_out", "events_live", "reqs", "counts", "neg_opens", "req_micros",
-    "bytes_out", "bytes_in", "slow_drops",
+    "bytes_out", "bytes_in", "slow_drops", "events_in_peer",
     "events_refused_kind", "events_refused_invalid", "events_refused_protected", "events_refused_rate",
     "events_refused_superseded", "events_refused_deleted", "events_refused_other",
     "reqs_refused_wraps", "reqs_refused_limits", "reqs_refused_invalid", "reqs_refused_busy",
@@ -462,6 +469,12 @@
   function ingest(d) {
     const s = { t: Date.now(), up: n0(d.uptime_secs), open: n0(d.connections_open), gap: failStreak >= DOWN_AFTER, c: {} };
     for (const k of COUNTERS) s.c[k] = n0(d[k]);
+    // Events from our other relays: a peer's own pushes (counted in events_in
+    // too), and what our [[sync]] entries took in (not counted there).
+    const syncIn = (Array.isArray(d.sync) ? d.sync : []).reduce((t, x) =>
+      t + n0(x.events_in) + n0(x.events_in_ephemeral) + n0(x.events_in_superseded) + n0(x.events_in_deleted) + n0(x.events_in_refused), 0);
+    s.c.link_in = n0(d.events_in_peer) + syncIn;
+    s.c.events_in_apps = s.c.events_in - n0(d.events_in_peer);
     const prev = newest();
     if (prev && (s.up < prev.up || COUNTERS.some((k) => s.c[k] < prev.c[k]))) {
       samples.length = 0;
@@ -481,7 +494,8 @@
   const bytesPerSec = (v) => bytes(v) + "/s";
   const CHARTS = [
     { id: "c-in", title: "Events in", fmt: rate, val: perSec, min: 1, series: [
-      { name: "in", key: "events_in", slot: 1 },
+      { name: "in", key: "events_in_apps", slot: 1 },
+      { name: "via link", key: "link_in", slot: 4 },
       { name: "stored", key: "events_stored", slot: 3 },
       { name: "refused", key: "events_refused", slot: 2 } ] },
     { id: "c-out", title: "Events out", fmt: rate, val: perSec, min: 1, series: [
@@ -844,6 +858,9 @@
     $("away-rest").textContent = "Also since start: " + rest.map(([k, v]) => k + " " + num(v)).join(" · ");
   }
 
+  /// How long a finished pass that copied events stays on the page.
+  const LINK_HOLD = 60;
+
   function warningsOf(d) {
     return Array.isArray(d && d.warnings) ? d.warnings.filter((w) => w && typeof w.message === "string") : [];
   }
@@ -864,20 +881,51 @@
     if (!p || typeof p.some_avg60 !== "number") return setTile(id, "—", "", "not reported by this system");
     setTile(id, pct(p.some_avg60), "", "of the last minute something waited · all stalled " + pct(n0(p.full_avg60)));
   }
+  /// Seconds as a reader would say them: "3 days", "6 hours", or exactly.
+  const span = (s) => {
+    const [n, unit] = s >= 86400 ? [Math.round(s / 86400), "day"] : s >= 3600 ? [Math.round(s / 3600), "hour"] : [0, ""];
+    return n ? n + " " + unit + (n === 1 ? "" : "s") : dur(s);
+  };
+  /// A bulk pass with another relay, running or finished within LINK_HOLD
+  /// seconds having copied something, as a sentence; null for nothing to say.
+  function linkLine(l, me, now) {
+    if (l.active) {
+      // Only the side running a pass knows how far back it reaches.
+      const what = l.role === "serving" ? l.name + " started it" : l.window_secs > 0 ? "comparing the last " + span(l.window_secs) : "comparing every event";
+      return me + " is syncing with " + l.name + ": " + what + " · " + dur(now - l.since) + " so far" + (l.moved > 0 ? " · " + num(l.moved) + " events" : "");
+    }
+    if (l.moved > 0 && l.last_at > 0 && now - l.last_at < LINK_HOLD) {
+      return me + " synced with " + l.name + " " + dur(now - l.last_at) + " ago: " + num(l.moved) + (l.moved === 1 ? " event" : " events") + " copied";
+    }
+    return null;
+  }
   function renderHealth(d) {
     const ws = warningsOf(d);
     const box = $("alerts");
     box.textContent = "";
-    for (const w of ws) {
-      const row = document.createElement("div");
-      row.className = "alert" + (w.level === "critical" ? " critical" : "");
+    const row = (cls, label, text) => {
+      const r = document.createElement("div");
+      r.className = "alert" + cls;
       const b = document.createElement("b");
-      b.textContent = (w.level === "critical" ? "Critical" : "Warning") + " · " + (w.what || "");
-      row.appendChild(b);
-      row.appendChild(document.createTextNode(w.message));
-      box.appendChild(row);
+      b.textContent = label;
+      r.appendChild(b);
+      r.appendChild(document.createTextNode(text));
+      box.appendChild(r);
+    };
+    for (const w of ws) {
+      row(w.level === "critical" ? " critical" : "", (w.level === "critical" ? "Critical" : "Warning") + " · " + (w.what || ""), w.message);
     }
-    box.hidden = ws.length === 0;
+    const me = (typeof d.name === "string" && d.name) || location.hostname || "This relay";
+    const now = Date.now() / 1000;
+    let links = 0;
+    for (const l of Array.isArray(d.links) ? d.links : []) {
+      const text = linkLine(l, me, now);
+      if (text) {
+        row(" link", "Link sync", text);
+        links++;
+      }
+    }
+    box.hidden = ws.length + links === 0;
 
     const h = d.host || {}, du = d.durability || {};
     const dt = h.disk_total_bytes, da = h.disk_available_bytes;

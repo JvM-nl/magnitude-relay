@@ -65,6 +65,8 @@ const RETRY_FIRST: Duration = Duration::from_secs(10);
 /// One entry's counters, for `/stats` and `/metrics`.
 #[derive(Debug, Default)]
 pub struct Stats {
+    /// What the dashboard calls the other relay: `[[sync]] name`, or its host.
+    pub name: String,
     pub url: String,
     pub direction: &'static str,
     pub filter: String,
@@ -80,6 +82,10 @@ pub struct Stats {
     pub last_have: AtomicU64,
     /// Comparisons over every event (the rest cover recent ones only).
     pub full_reconciles: AtomicU64,
+    /// Unix time the running pass began (0 between passes), and how far back
+    /// it compares in seconds (0: every event).
+    pub pass_since: AtomicU64,
+    pub pass_window: AtomicU64,
     /// Events of theirs, by fate here: stored; delivered live and never
     /// stored (ephemeral); older than the version here (superseded); deleted
     /// or vanished here; refused (policy, invalid, failed). Ones already here
@@ -157,9 +163,17 @@ pub fn stats_for(entries: &[SyncCfg]) -> Vec<Arc<Stats>> {
         .map(|c| {
             let filters: Vec<String> = c.filters.iter().map(filter_text).collect();
             let filter = if filters.len() == 1 { filters[0].clone() } else { format!("[{}]", filters.join(",")) };
-            Arc::new(Stats { url: super::shown(&c.url), direction: c.direction.name(), filter, ..Stats::default() })
+            let name = if c.name.is_empty() { host_of(&c.url) } else { c.name.clone() };
+            Arc::new(Stats { name, url: super::shown(&c.url), direction: c.direction.name(), filter, ..Stats::default() })
         })
         .collect()
+}
+
+/// The host of a relay URL, which is all the dashboard shows of an unnamed one
+/// (a peer URL's path holds its secret).
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest).to_string()
 }
 
 /// Seqs this entry stored itself: its pushes leave them out, since they came
@@ -285,7 +299,11 @@ async fn reconciler(e: Rc<Entry>) {
             || last_ok.is_none_or(|t| t.elapsed() >= Duration::from_secs(window / 2));
         let since = (!full).then(|| ingest::now().saturating_sub(window));
         let started = Instant::now();
-        match reconcile_once(&e, since).await {
+        e.stats.pass_window.store(if full { 0 } else { window }, Ordering::Relaxed);
+        e.stats.pass_since.store(ingest::now(), Ordering::Relaxed);
+        let result = reconcile_once(&e, since).await;
+        e.stats.pass_since.store(0, Ordering::Relaxed);
+        match result {
             Ok(r) => {
                 let s = &e.stats;
                 last_ok = Some(Instant::now());
@@ -385,6 +403,8 @@ async fn live_once(e: &Rc<Entry>, cursor: &mut u64, reconnected: bool) -> Result
         // Whatever happened while we were away.
         e.wake.notify_one();
     }
+    // What was written while the stream was down is a backlog, sent in bulk.
+    let backlog_end = e.store.snapshot().count.min(e.store.durable_seq());
     let mut local = e.local();
     let mut parser = EventParser::new();
     let mut rec = Vec::new();
@@ -438,7 +458,7 @@ async fn live_once(e: &Rc<Entry>, cursor: &mut u64, reconnected: bool) -> Result
             e.stats.count_in(&t);
         }
         if ticked && dir.up() {
-            publish_new(e, &mut remote, &mut out, cursor, hide_wraps).await?;
+            publish_new(e, &mut remote, &mut out, cursor, hide_wraps, backlog_end).await?;
         }
     }
 }
@@ -473,7 +493,9 @@ fn answered(e: &Entry, out: &mut Outbox, id: [u8; 32], accepted: bool, message: 
 
 /// Publishes our events that became durable since the last walk, plus any the
 /// other relay asked us to send again, keeping at most `PUSH_WINDOW` unanswered.
-async fn publish_new(e: &Entry, remote: &mut Remote, out: &mut Outbox, cursor: &mut u64, hide_wraps: bool) -> Result<(), String> {
+/// Of the backlog (seqs before `backlog_end`: written while the stream was
+/// down), events expiring within `SHORT_LIVED` are left out, as in a reconcile.
+async fn publish_new(e: &Entry, remote: &mut Remote, out: &mut Outbox, cursor: &mut u64, hide_wraps: bool, backlog_end: u64) -> Result<(), String> {
     let now = Instant::now();
     // Unanswered for too long: the next reconcile will find it if it is missing.
     out.waiting.retain(|_, (_, sent)| now.duration_since(*sent) < OK_WAIT);
@@ -488,6 +510,7 @@ async fn publish_new(e: &Entry, remote: &mut Remote, out: &mut Outbox, cursor: &
     let v = e.store.snapshot();
     let end = v.count.min(e.store.durable_seq());
     let stop = cursor.saturating_add(WALK_PER_TICK).min(end);
+    let horizon = super::bulk_horizon();
     while *cursor < stop && out.waiting.len() < PUSH_WINDOW {
         let seq = *cursor;
         *cursor += 1;
@@ -495,7 +518,7 @@ async fn publish_new(e: &Entry, remote: &mut Remote, out: &mut Outbox, cursor: &
             continue;
         }
         let Some(rec) = v.record(seq) else { continue };
-        if !carries(&e.cfg.filters, rec, hide_wraps) {
+        if !carries(&e.cfg.filters, rec, hide_wraps) || (seq < backlog_end && rec.expiration().is_some_and(|x| x <= horizon)) {
             continue;
         }
         let json = rec.to_json();

@@ -6,6 +6,7 @@ use crate::bans::Bans;
 use crate::ingest::{ReactorMsg, Reply, WriteReq};
 use crate::metrics::{self, Block};
 use crate::subs::{ConnId, SubIndex};
+use crate::sync::PeerLink;
 use crate::talk::{bump, Shape, Talk};
 use relay_proto::event::EventInfo;
 use relay_proto::json::{escape_str, Scanner};
@@ -402,6 +403,11 @@ pub struct Session {
     /// One of our own relays (a `[[peer]]`): gift wraps are listed to it like
     /// any other event, and events this relay took from clients are marked so.
     trusted: bool,
+    /// That peer's passes against this relay, for the dashboard.
+    link: Option<Arc<PeerLink>>,
+    /// This is the connection a peer runs its passes on (it opened a
+    /// negentropy session): what it sends or asks for by id is bulk.
+    bulk: bool,
     /// A batch of this connection's signatures failed once: check the rest
     /// one at a time (a client mixing bad signatures into bursts would
     /// otherwise make every batch pay twice).
@@ -409,8 +415,16 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(conn: ConnId, trusted: bool) -> Session {
-        Session { conn, pending: 0, neg: Vec::new(), trusted, no_batch: false }
+    /// `link` is set for a trusted peer's connection.
+    pub fn new(conn: ConnId, link: Option<Arc<PeerLink>>) -> Session {
+        Session { conn, pending: 0, neg: Vec::new(), trusted: link.is_some(), link, bulk: false, no_batch: false }
+    }
+
+    /// Counts `n` events of a pass that moved over this connection.
+    fn moved(&self, n: u64) {
+        if let (true, Some(l), 1..) = (self.bulk, &self.link, n) {
+            l.moved(crate::ingest::now(), n);
+        }
     }
 
     pub fn on_text(&mut self, text: &str, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
@@ -445,6 +459,10 @@ impl Session {
 
     fn on_event(&mut self, text: &str, info: EventInfo, at: usize, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
         metrics::inc(&cx.m.events_in);
+        if self.trusted {
+            metrics::inc(&cx.m.events_in_peer);
+            self.moved(1);
+        }
         bump(&cx.talk.events);
         let id = *Record(cx.rec).id();
         // Cheap checks first: nothing below costs a hash until these pass.
@@ -607,6 +625,7 @@ impl Session {
         if let Err(msg) = self.check_filters(&mut filters, cx) {
             return closed(out, sub_id, &msg);
         }
+        self.moved(filters.iter().map(|f| f.ids.as_ref().map_or(0, |ids| ids.len() as u64)).sum());
         let replacing = cx.subs.count(self.conn) > 0 && cx.subs.remove(self.conn, sub_id);
         if !replacing && cx.subs.count(self.conn) >= cx.cfg.max_subscriptions {
             ReqRefused::Limits.count(cx.m, Some(cx.talk));
@@ -686,6 +705,10 @@ impl Session {
             return neg_err(out, sub_id, &m);
         }
         let [filter] = fs;
+        if let Some(l) = &self.link {
+            self.bulk = true;
+            l.touch(cx.now);
+        }
         if self.neg.len() >= MAX_NEG_SESSIONS {
             ReqRefused::Limits.count(cx.m, Some(cx.talk));
             return neg_err(out, sub_id, "blocked: too many open negentropy sessions");
@@ -694,11 +717,14 @@ impl Session {
         // `limit` does not apply to a set reconciliation: the whole matching set is the set.
         let mut f = filter;
         f.limit = None;
+        // A peer's pass is bulk: what expires soon is left to the live link
+        // (crate::sync::SHORT_LIVED), on its side and on ours.
+        let horizon = if self.trusted { cx.now.saturating_add(crate::sync::SHORT_LIVED) } else { cx.now };
         // Vector's DM shape is answered from covering index keys alone.
-        let items = match cx.snap.neg_items(&f, cx.now) {
+        let items = match cx.snap.neg_items(&f, horizon) {
             Some(items) => items,
             None => {
-                let hits = cx.snap.query(&f, MAX_NEG_ITEMS + 1, cx.now);
+                let hits = cx.snap.query(&f, MAX_NEG_ITEMS + 1, horizon);
                 hits.iter().filter(|h| self.trusted || !broad_wrap(&f, cx.snap, h.seq)).map(|h| (h.created_at, h.id)).collect()
             }
         };
@@ -727,6 +753,9 @@ impl Session {
     }
 
     fn on_neg_msg(&mut self, sub_id: &str, msg: &[u8], out: &mut dyn Outbox) {
+        if let Some(l) = &self.link {
+            l.touch(crate::ingest::now());
+        }
         let Some(storage) = self.neg.iter().find(|n| &*n.sub == sub_id).map(|n| &n.storage) else {
             return neg_err(out, sub_id, "closed: no open negentropy session with this id");
         };

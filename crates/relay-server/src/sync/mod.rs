@@ -38,6 +38,7 @@ use relay_store::Store;
 use remote::{NegFail, Remote};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 /// Events per window to aim for, on whichever side holds more.
@@ -62,6 +63,62 @@ const PUSH_CHUNK: usize = 500;
 const IDLE: Duration = Duration::from_secs(60);
 /// The longest a push waits after the other relay says to slow down.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Events expiring sooner than this are left to the live link. A bulk pass
+/// (a reconcile, or the backlog the live link sends after a reconnect) does not
+/// copy them: they would be gone, or nearly, by the time they landed. Ephemeral
+/// events never travel in bulk at all, since they are never stored.
+pub const SHORT_LIVED: u64 = 600;
+
+/// What a bulk pass treats as already expired: everything expiring within
+/// [`SHORT_LIVED`] of now.
+pub fn bulk_horizon() -> u64 {
+    ingest::now().saturating_add(SHORT_LIVED)
+}
+
+/// A `[[peer]]`'s passes against this relay, as seen from here. A peer runs a
+/// pass on a connection of its own: negentropy messages to find what differs,
+/// then REQs by id for what it lacks and EVENTs for what we lack. (How far back
+/// the pass reaches only the peer knows: it compares in time windows, and each
+/// window's filter says only that window.)
+#[derive(Debug, Default)]
+pub struct PeerLink {
+    pub name: String,
+    /// Unix seconds: when the current (or last) pass began, and its last sign of life.
+    pub since: AtomicU64,
+    pub last: AtomicU64,
+    /// Events it sent here or asked for by id during the current (or last) pass.
+    pub moved: AtomicU64,
+}
+
+impl PeerLink {
+    /// Silence after which a pass is over.
+    pub const QUIET: u64 = 20;
+
+    pub fn new(name: &str) -> PeerLink {
+        PeerLink { name: name.to_string(), ..PeerLink::default() }
+    }
+
+    /// A negentropy message of a pass: one after a quiet spell begins a new pass.
+    pub fn touch(&self, now: u64) {
+        if now.saturating_sub(self.last.load(Relaxed)) > Self::QUIET {
+            self.since.store(now, Relaxed);
+            self.moved.store(0, Relaxed);
+        }
+        self.last.store(now, Relaxed);
+    }
+
+    /// Events of the pass fetched or sent: the pass is still going, though
+    /// copying a large difference can be a long time between negentropy messages.
+    pub fn moved(&self, now: u64, n: u64) {
+        self.moved.fetch_add(n, Relaxed);
+        self.last.store(now, Relaxed);
+    }
+
+    pub fn active(&self, now: u64) -> bool {
+        let last = self.last.load(Relaxed);
+        last > 0 && now.saturating_sub(last) <= Self::QUIET
+    }
+}
 
 /// What a sync of one filter did.
 #[derive(Debug, Default, Clone)]
@@ -82,6 +139,9 @@ pub struct Report {
     pub not_returned: u64,
     /// Sent though nobody asked; ignored.
     pub unrequested: u64,
+    /// Fetched but expiring within [`SHORT_LIVED`], so not stored: a relay
+    /// that is not one of ours leaves them in its set.
+    pub short_lived: u64,
     /// Messages from the other relay that could not be read.
     pub unreadable: u64,
     /// What became of what we fetched.
@@ -107,6 +167,7 @@ impl Report {
         self.fetched += o.fetched;
         self.not_returned += o.not_returned;
         self.unrequested += o.unrequested;
+        self.short_lived += o.short_lived;
         self.unreadable += o.unreadable;
         self.down.merge(&o.down);
         self.up.merge(&o.up);
@@ -259,6 +320,7 @@ async fn fetch(remote: &mut Remote, local: &mut impl Local, need: &[[u8; 32]], t
     let mut batch_bytes = 0;
     let mut parser = EventParser::new();
     let mut rec = Vec::new();
+    let horizon = bulk_horizon();
     loop {
         while asked.len() < FETCH_PARALLEL {
             let Some(chunk) = chunks.next() else { break };
@@ -288,6 +350,10 @@ async fn fetch(remote: &mut Remote, local: &mut impl Local, need: &[[u8; 32]], t
                     continue;
                 }
                 report.fetched += 1;
+                if Record(&rec).expiration().is_some_and(|x| x <= horizon) {
+                    report.short_lived += 1;
+                    continue;
+                }
                 batch_bytes += text.len();
                 batch.push(Inbound { text, at, vouched: trusted && first_hand });
                 ids.push(id);
@@ -499,7 +565,10 @@ fn print_report(r: &Report, dir: Direction, dry_run: bool) {
         return;
     }
     if dir.down() {
-        println!("  fetched {} of {} (not returned {}, unrequested {}, unreadable {})", r.fetched, r.need, r.not_returned, r.unrequested, r.unreadable);
+        println!(
+            "  fetched {} of {} (not returned {}, unrequested {}, unreadable {}, expiring too soon to keep {})",
+            r.fetched, r.need, r.not_returned, r.unrequested, r.unreadable, r.short_lived
+        );
         println!("  here: {}", r.down);
     }
     if dir.up() {

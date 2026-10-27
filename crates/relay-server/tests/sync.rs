@@ -453,6 +453,64 @@ async fn a_trusted_peer_gets_everything_and_vouches_for_first_hand_events() {
     }
 }
 
+/// A bulk pass leaves events expiring within ten minutes to the live link: a
+/// peer leaves them out of its set (so they are never even found missing), a
+/// relay that is not ours sends them and they are dropped, and one published
+/// while the link is up still crosses live. Both relays name the link in /stats.
+#[tokio::test]
+async fn short_lived_events_cross_only_live() {
+    let secret = "c".repeat(20) + &"9".repeat(20);
+    let (da, db, dc) = (tmp("short-a"), tmp("short-b"), tmp("short-c"));
+    let pa = free_port();
+    let mut a = Relay::configure(&da, pa, "", &format!("[[peer]]\nname = \"B relay\"\nsecret = \"{secret}\"\nips = [\"127.0.0.1\"]\n"));
+    let sync = format!("[[sync]]\nname = \"A relay\"\nurl = \"ws://127.0.0.1:{pa}/peer/{secret}\"\ndirection = \"down\"\ntrusted = true\nreconcile_seconds = 3600\n");
+    let mut b = Relay::configure(&db, free_port(), "", &sync);
+    let c = Relay::configure(&dc, free_port(), "", "");
+    a.start();
+    let s = Signer::new(91);
+    let expiring = |secs: u64, what: &str| s.event(now(), 1, json!([["expiration", (now() + secs).to_string()]]), what);
+    let (plain, long, short) = (s.event(now(), 1, json!([]), "plain"), expiring(7200, "two hours"), expiring(300, "five minutes"));
+    publish(&a, &[plain.clone(), long.clone(), short.clone()]).await;
+    let has = |r: &Relay, e: &Value| r.count(&json!({"ids": [e["id"]]}).to_string()) == 1;
+
+    b.start();
+    let t = Instant::now();
+    while stats(&b).await["sync"][0]["reconciles"].as_u64().unwrap_or(0) < 1 {
+        assert!(t.elapsed() < Duration::from_secs(30), "B never finished a pass");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(has(&b, &plain) && has(&b, &long), "what outlives the pass is copied");
+    assert!(!has(&b, &short), "what expires within ten minutes is not");
+    assert_eq!(stats(&b).await["sync"][0]["last_need"], 2, "A left the short-lived one out of its set");
+
+    // Each side names the other, and counts what the pass moved.
+    let (sa, sb) = (stats(&a).await, stats(&b).await);
+    let link = |st: &Value| st["links"][0].clone();
+    assert_eq!((link(&sb)["name"].as_str(), link(&sb)["role"].as_str(), link(&sb)["moved"].as_u64()), (Some("A relay"), Some("running"), Some(2)), "{sb}");
+    assert_eq!((link(&sa)["name"].as_str(), link(&sa)["role"].as_str(), link(&sa)["moved"].as_u64()), (Some("B relay"), Some("serving"), Some(2)), "{sa}");
+    assert!(link(&sa)["last_at"].as_u64().unwrap() > 0 && link(&sb)["last_at"].as_u64().unwrap() > 0);
+
+    // Live, a short-lived event crosses like any other.
+    let fresh = expiring(300, "five minutes, live");
+    publish(&a, std::slice::from_ref(&fresh)).await;
+    let t = Instant::now();
+    while !has(&b, &fresh) {
+        assert!(t.elapsed() < Duration::from_secs(15), "the live link never brought it");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A relay that is not a peer of A gets A's whole set, and drops the short-lived.
+    c.run_ok(&["sync", &a.url()]);
+    assert!(has(&c, &plain) && has(&c, &long));
+    assert!(!has(&c, &short) && !has(&c, &fresh), "fetched, and dropped as expiring too soon");
+
+    a.stop();
+    b.stop();
+    for d in [da, db, dc] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// Ephemeral events cross a sync both ways, as Asia's strfry router carried
 /// typing and voice presence: delivered live on the other relay, once each,
 /// never stored and never circling back, even when a client sends the same one
@@ -549,7 +607,15 @@ async fn an_old_event_the_recent_passes_miss_arrives_with_the_next_full_pass() {
         assert_eq!(b.count(&author), 1, "a recent pass reached back ten days: {s}");
     }
     wait_for("the old event, with a full pass", || b.count(&author) == 2).await;
-    let s = stats(&b).await;
+    // The pass stores the event before it counts itself finished.
+    let t = Instant::now();
+    let s = loop {
+        let s = stats(&b).await;
+        if s["sync"][0]["full_reconciles"].as_u64().unwrap() >= 2 || t.elapsed() > Duration::from_secs(10) {
+            break s;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert!(s["sync"][0]["full_reconciles"].as_u64().unwrap() >= 2, "{s}");
     assert!(s["sync"][0]["reconciles"].as_u64().unwrap() > s["sync"][0]["full_reconciles"].as_u64().unwrap(), "{s}");
 
