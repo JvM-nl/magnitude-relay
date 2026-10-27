@@ -194,6 +194,21 @@
   .tile .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .tile .sub .dot { display: inline-block; margin-right: 6px; vertical-align: 0; }
 
+  /* Turned away: below what the relay does, folded until opened */
+  details.away { margin-top: 30px; }
+  details.away > summary { list-style: none; cursor: pointer; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; }
+  details.away > summary::-webkit-details-marker { display: none; }
+  details.away > summary h2 { margin: 0; }
+  details.away > summary h2::before { content: ""; display: inline-block; width: 5px; height: 5px; margin: 0 10px 2px 1px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(-45deg); transition: transform .15s ease; }
+  details.away[open] > summary h2::before { transform: rotate(45deg); margin-bottom: 4px; }
+  .away-line { font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  details.away .tiles { margin-top: 12px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  @media (max-width: 760px) { details.away .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .spark { display: block; width: 100%; height: 22px; margin-top: 6px; overflow: visible; }
+  .spark path { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+  .s-kind { stroke: var(--series-1); } .s-inv { stroke: var(--series-3); } .s-rate { stroke: var(--warning); } .s-scrape { stroke: var(--series-2); }
+  .away-rest { font-size: 12px; color: var(--muted); margin-top: 10px; }
+
   /* Store */
   .store { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 22px 36px; }
   @media (max-width: 760px) { .store { grid-template-columns: minmax(0, 1fr); } }
@@ -264,7 +279,7 @@
       <div class="tile"><div class="k">Ephemeral events</div><div class="v" id="t-eph">—</div><div class="sub" id="t-eph-sub">—</div></div>
       <div class="tile"><div class="k">NIP-77 sessions</div><div class="v" id="t-neg">—</div><div class="sub" id="t-neg-sub">—</div></div>
       <div class="tile"><div class="k">Slow-client drops</div><div class="v" id="t-slow">—</div><div class="sub" id="t-slow-sub">—</div></div>
-      <div class="tile"><div class="k">Refused connections</div><div class="v" id="t-ref">—</div><div class="sub" id="t-ref-sub">—</div></div>
+      <div class="tile"><div class="k">Turned away</div><div class="v" id="t-away">—</div><div class="sub" id="t-away-sub">—</div></div>
     </div>
 
     <h2>Store <em>counted now, not remembered</em></h2>
@@ -321,6 +336,16 @@
       <div class="tile"><div class="k">Disk syncs</div><div class="v" id="t-sync">—</div><div class="sub" id="t-sync-sub">—</div></div>
       <div class="tile"><div class="k">Write failures</div><div class="v" id="t-wfail">—</div><div class="sub" id="t-wfail-sub">—</div></div>
     </div>
+    <details class="away" id="away">
+      <summary><h2>Turned away <em>since start</em></h2><span class="away-line" id="away-line">—</span></summary>
+      <div class="tiles">
+        <div class="tile"><div class="k">Kind not accepted</div><div class="v" id="t-akind">—</div><svg class="spark" viewBox="0 0 100 22" preserveAspectRatio="none" aria-hidden="true"><path class="s-kind" id="sp-akind"/></svg><div class="sub" id="t-akind-sub">—</div></div>
+        <div class="tile"><div class="k">Invalid</div><div class="v" id="t-ainv">—</div><svg class="spark" viewBox="0 0 100 22" preserveAspectRatio="none" aria-hidden="true"><path class="s-inv" id="sp-ainv"/></svg><div class="sub" id="t-ainv-sub">—</div></div>
+        <div class="tile"><div class="k">Rate-limited</div><div class="v" id="t-arate">—</div><svg class="spark" viewBox="0 0 100 22" preserveAspectRatio="none" aria-hidden="true"><path class="s-rate" id="sp-arate"/></svg><div class="sub" id="t-arate-sub">—</div></div>
+        <div class="tile"><div class="k">Gift-wrap scrapes</div><div class="v" id="t-ascrape">—</div><svg class="spark" viewBox="0 0 100 22" preserveAspectRatio="none" aria-hidden="true"><path class="s-scrape" id="sp-ascrape"/></svg><div class="sub" id="t-ascrape-sub">—</div></div>
+      </div>
+      <div class="away-rest" id="away-rest"></div>
+    </details>
   </main>
 
   <footer>
@@ -347,6 +372,10 @@
     "events_stored", "events_duplicate", "events_refused", "events_ephemeral",
     "events_out", "events_live", "reqs", "counts", "neg_opens", "req_micros",
     "bytes_out", "bytes_in", "slow_drops",
+    "events_refused_kind", "events_refused_invalid", "events_refused_protected", "events_refused_rate",
+    "events_refused_superseded", "events_refused_deleted", "events_refused_other",
+    "reqs_refused_wraps", "reqs_refused_limits", "reqs_refused_invalid", "reqs_refused_busy",
+    "auth_refused", "connections_rate_limited",
   ];
 
   const samples = [];              // {t, up, open, gap, c: {counter: value}}
@@ -416,10 +445,12 @@
     const out = [];
     for (let i = 1; i < samples.length; i++) {
       const a = samples[i - 1], b = samples[i], dt = (b.t - a.t) / 1000;
-      out.push(b.gap || dt <= 0 ? null : Math.max(0, (b.c[key] - a.c[key]) / dt));
+      out.push(b.gap || dt <= 0 ? null : Math.max(0, (count(b, key) - count(a, key)) / dt));
     }
     return out;
   }
+  /// A counter in a sample, or several summed.
+  const count = (s, key) => Array.isArray(key) ? key.reduce((t, k) => t + s.c[k], 0) : s.c[key];
   const meanOf = (xs) => {
     const v = xs.filter((x) => x !== null);
     return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
@@ -680,7 +711,7 @@
   /// Growth of a counter over the window shown, as a phrase, and whether it grew.
   function lately(key) {
     if (samples.length < 2) return { text: "watching…", grew: false };
-    const L = newest(), a = back(SPAN_MS + POLL_MS), inc = L.c[key] - a.c[key];
+    const L = newest(), a = back(SPAN_MS + POLL_MS), inc = count(L, key) - count(a, key);
     const span = (L.t - a.t) / 1000;
     const label = span >= SPAN_MS / 1000 - 5 ? "5 min" : dur(span);
     return { text: inc > 0 ? "+" + num(inc) + " in the last " + label : "none in the last " + label, grew: inc > 0, inc, label };
@@ -688,10 +719,14 @@
   function setFlagged(id, value, sub, key, exact) {
     const l = lately(key);
     setTile(id, value, "", "", exact);
+    setSub(id, sub + " · " + l.text, l.grew);
+  }
+  /// A tile's subline, led by a warning dot when `warn`.
+  function setSub(id, text, warn) {
     const el = $("t-" + id + "-sub");
     el.textContent = "";
-    if (l.grew) { const d = document.createElement("span"); d.className = "dot warn"; el.appendChild(d); }
-    el.appendChild(document.createTextNode(sub + " · " + l.text));
+    if (warn) { const d = document.createElement("span"); d.className = "dot warn"; el.appendChild(d); }
+    el.appendChild(document.createTextNode(text));
   }
 
   function render() {
@@ -733,7 +768,7 @@
     const neg = lately("neg_opens");
     setTile("neg", big(c.neg_opens), "", "NEG-OPEN since start · " + neg.text, num(c.neg_opens));
     setFlagged("slow", big(c.slow_drops), "dropped for falling behind", "slow_drops", num(c.slow_drops));
-    setFlagged("ref", big(c.connections_refused), "over the per-IP limit", "connections_refused", num(c.connections_refused));
+    renderAway(c);
 
     const st = d.store || {};
     const live = n0(st.live), dead = n0(st.dead), mem = n0(st.index_memory_bytes), seg = n0(st.index_segment_bytes), segs = n0(st.segments);
@@ -759,6 +794,56 @@
   }
 
   // ── host health ─────────────────────────────────────────────────────────
+  // ── turned away ────────────────────────────────────────────────────────
+  /// The rate of `key` over the last five minutes as a sparkline, each poll
+  /// interval one point; a gap breaks the line.
+  function spark(id, key) {
+    const r = rateOf(key), top = Math.max(0, ...r.filter((v) => v !== null));
+    let d = "", pen = "M";
+    r.forEach((v, i) => {
+      if (v === null) { pen = "M"; return; }
+      const x = r.length > 1 ? i / (r.length - 1) * 100 : 0, y = top > 0 ? 21 - v / top * 19 : 21;
+      d += pen + x.toFixed(1) + "," + y.toFixed(1) + " ";
+      pen = "L";
+    });
+    $(id).setAttribute("d", d.trim());
+  }
+  /// What the relay refused, by reason, since it started. The page is about
+  /// what it does, so this is one share among the signals and a band folded
+  /// at the bottom.
+  function renderAway(c) {
+    const reqKeys = ["reqs_refused_wraps", "reqs_refused_limits", "reqs_refused_invalid", "reqs_refused_busy"];
+    const evs = c.events_refused, reqs = reqKeys.reduce((t, k) => t + c[k], 0);
+    const conns = c.connections_rate_limited + c.connections_refused;
+    const asked = c.reqs + c.counts + c.neg_opens, opened = c.connections_total + conns;
+    const all = c.events_in + asked + opened, refused = evs + reqs + conns;
+    const share = (part, whole) => (whole > 0 ? pct(Math.min(100, part / whole * 100)) : "—");
+
+    setTile("away", share(refused, all), "", "", num(refused) + " of " + num(all) + " since start");
+    const scrapes = lately("reqs_refused_wraps").grew;
+    setSub("away", (scrapes ? "gift-wrap scrapes lately" : "of all traffic since start") + " · details below", scrapes);
+
+    $("away-line").textContent = big(evs) + " events (" + share(evs, c.events_in) + ") · " + big(reqs) + " requests (" +
+      share(reqs, asked) + ") · " + big(conns) + " connections (" + share(conns, opened) + ") · " +
+      big(c.reqs_refused_wraps) + " gift-wrap " + (c.reqs_refused_wraps === 1 ? "scrape" : "scrapes");
+
+    const tile = (id, key, what) => {
+      const n = count(newest(), key);
+      setTile(id, big(n), "", what + " · " + lately(key).text, num(n));
+      spark("sp-" + id, key);
+    };
+    tile("akind", "events_refused_kind", "kinds this relay does not take");
+    tile("ainv", ["events_refused_invalid", "reqs_refused_invalid"], "malformed events and filters");
+    tile("arate", ["connections_rate_limited", "events_refused_rate", "reqs_refused_busy"], "over an address's allowance");
+    setFlagged("ascrape", big(c.reqs_refused_wraps), "wraps asked for wholesale", "reqs_refused_wraps", num(c.reqs_refused_wraps));
+    spark("sp-ascrape", "reqs_refused_wraps");
+
+    const rest = [["deleted", c.events_refused_deleted], ["superseded", c.events_refused_superseded],
+      ["protected (NIP-70)", c.events_refused_protected], ["over a limit", c.reqs_refused_limits],
+      ["AUTH tried", c.auth_refused], ["over the connection cap", c.connections_refused], ["other", c.events_refused_other]];
+    $("away-rest").textContent = "Also since start: " + rest.map(([k, v]) => k + " " + num(v)).join(" · ");
+  }
+
   function warningsOf(d) {
     return Array.isArray(d && d.warnings) ? d.warnings.filter((w) => w && typeof w.message === "string") : [];
   }
@@ -885,6 +970,12 @@
     busy = false;
     timer = setTimeout(poll, Math.max(250, POLL_MS - (Date.now() - started)));
   }
+
+  const band = $("away");
+  try { band.open = localStorage.getItem("relay-dashboard-away") === "open"; } catch (e) { /* storage blocked: stays folded */ }
+  band.addEventListener("toggle", () => {
+    try { localStorage.setItem("relay-dashboard-away", band.open ? "open" : "folded"); } catch (e) { /* not remembered */ }
+  });
 
   buildCharts();
   poll();
