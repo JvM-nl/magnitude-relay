@@ -495,8 +495,8 @@ impl Default for LimitsCfg {
             max_limit: 5000,
             max_connections_per_ip: 256,
             events_per_minute_per_ip: 1200,
-            connections_per_minute_per_ip: 30,
-            connection_burst_per_ip: 120,
+            connections_per_minute_per_ip: 60,
+            connection_burst_per_ip: 300,
             outbound_buffer_bytes: 33_554_432,
         }
     }
@@ -1543,11 +1543,13 @@ const TEMPLATE: &str = r##"# {name} settings
 # New connections per minute from one address, after a first burst of
 # connection_burst_per_ip. Past that, the relay answers 429 with Retry-After
 # before the WebSocket opens, which clients treat as a failed connection and
-# back off from. It catches clients that open a connection for every request
-# instead of keeping one; Vector starting up, even with many Communities, is
-# nowhere near it. Loopback has no limit, as above. 0 turns it off.
-# connections_per_minute_per_ip = 30
-# connection_burst_per_ip = 120
+# back off from. It catches floods: an address opening more than a connection a
+# second for minutes on end. The burst is generous because Vector opens a
+# connection per Concord plane while it backfills Communities (up to 24 at
+# once, replaced as it moves on), and a household or carrier address carries
+# several clients. Loopback has no limit, as above. 0 turns it off.
+# connections_per_minute_per_ip = 60
+# connection_burst_per_ip = 300
 
 # Memory one connection may use for messages waiting to be sent. A client that
 # reads too slowly to stay under this is disconnected, and a REQ whose stored
