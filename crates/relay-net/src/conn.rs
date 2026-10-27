@@ -128,6 +128,35 @@ pub async fn server_handshake_with<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    server_handshake_checked(stream, buf, max_head, policy, |_| None).await
+}
+
+/// Why a valid upgrade is turned away before the `101` (see
+/// [`server_handshake_checked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: u16,
+    /// Seconds, sent as `Retry-After`.
+    pub retry_after: Option<u64>,
+    pub message: &'static str,
+}
+
+/// [`server_handshake_with`], with `check` asked about each valid upgrade
+/// before anything is written: a refusal is answered with its status (a 429,
+/// say) and the connection is never upgraded, which costs less than an
+/// accept and a close, and which clients treat as a failed connection and
+/// back off from, rather than one that worked.
+pub async fn server_handshake_checked<S>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    max_head: usize,
+    policy: &ExtensionPolicy,
+    check: impl FnOnce(&OwnedRequest) -> Option<Refusal>,
+) -> io::Result<(Handshake, Extensions)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut check = Some(check);
     loop {
         let mut reply = Vec::new();
         match parse_request_with(buf, max_head) {
@@ -167,6 +196,14 @@ where
                     let _ = stream.shutdown().await;
                     return Err(invalid_data("invalid websocket handshake"));
                 };
+                if let Some(r) = check.take().and_then(|c| c(&owned)) {
+                    let wait = r.retry_after.map(|s| s.to_string());
+                    let headers: Vec<(&str, &str)> = wait.as_deref().map(|w| ("Retry-After", w)).into_iter().collect();
+                    write_response(&mut reply, r.status, reason_phrase(r.status), "text/plain", &headers, format!("{}\n", r.message).as_bytes(), true);
+                    stream.write_all(&reply).await?;
+                    let _ = stream.shutdown().await;
+                    return Err(io::Error::other(r.message));
+                }
                 let extensions = Extensions::negotiate(&req, policy);
                 write_upgrade_response(&mut reply, &accept_key(key), &extensions);
                 buf.drain(..n);
@@ -771,6 +808,33 @@ mod tests {
         assert_eq!(c.recv().await.unwrap(), Message::Pong(b"are you there".to_vec()));
         assert_eq!(c.close().await.unwrap(), Some((1000, String::new())));
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_checked_upgrade_can_be_refused_before_the_101() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let refuse = |req: &OwnedRequest| {
+                assert_eq!(req.path, "/relay");
+                Some(Refusal { status: 429, retry_after: Some(7), message: "rate-limited: slow down" })
+            };
+            server_handshake_checked(&mut s, &mut buf, DEFAULT_MAX_HEAD, &ExtensionPolicy::NONE, refuse).await
+        });
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /relay HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+            .await
+            .unwrap();
+        let mut all = Vec::new();
+        s.read_to_end(&mut all).await.unwrap();
+        let text = String::from_utf8(all).unwrap();
+        assert!(text.starts_with("HTTP/1.1 429 Too Many Requests\r\n"), "{text}");
+        assert!(text.contains("\r\nRetry-After: 7\r\n") && text.ends_with("rate-limited: slow down\n"), "{text}");
+        assert!(!text.contains("101"), "{text}");
+        assert!(server.await.unwrap().is_err());
     }
 
     #[tokio::test]

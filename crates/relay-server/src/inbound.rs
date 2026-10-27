@@ -91,7 +91,7 @@ impl Verdict {
 /// client: a refusal or an event already here costs no signature check.
 fn check_unsigned(text: &str, at: usize, cfg: &SessionCfg, v: &Version, now: u64, parser: &mut EventParser, rec: &mut Vec<u8>) -> Result<(), Verdict> {
     let info = parser.parse_unchecked(&mut Scanner::new_at(text, at), rec).map_err(|e| Verdict::Invalid(format!("invalid: {e}")))?;
-    if let Some(msg) = cfg.refusal(&info, Record(rec), now) {
+    if let Some((_, msg)) = cfg.refusal(&info, Record(rec), now) {
         return Err(Verdict::Refused(msg));
     }
     if cfg.silences(Record(rec)) {
@@ -129,7 +129,7 @@ pub fn check_ephemeral(text: &str, at: usize, cfg: &SessionCfg, now: u64) -> Res
     if !kind::is_ephemeral(info.kind) {
         return Err(Verdict::Invalid("invalid: not an ephemeral event".into()));
     }
-    if let Some(msg) = cfg.refusal(&info, Record(&rec), now) {
+    if let Some((_, msg)) = cfg.refusal(&info, Record(&rec), now) {
         return Err(Verdict::Refused(msg));
     }
     if cfg.silences(Record(&rec)) {
@@ -241,10 +241,11 @@ impl Tally {
         self.stored + self.duplicate + self.superseded + self.deleted + self.vanished + self.ephemeral + self.failed + self.refused.values().sum::<u64>() + self.invalid.values().sum::<u64>()
     }
 
-    /// Everything that was not stored and not already here.
-    pub fn turned_away(&self) -> u64 {
-        self.total() - self.stored - self.duplicate
+    /// Refused by policy, invalid, or failed: what was actually turned down.
+    pub fn rejected(&self) -> u64 {
+        self.failed + self.refused.values().sum::<u64>() + self.invalid.values().sum::<u64>()
     }
+
 }
 
 impl fmt::Display for Tally {
@@ -308,7 +309,8 @@ mod tests {
         u.add(&Verdict::Duplicate);
         u.add(&Verdict::Invalid("invalid: bad id".into()));
         t.merge(&u);
-        assert_eq!((t.total(), t.turned_away(), t.stored, t.refused["blocked: x"]), (7, 4, 2, 2));
+        // A deletion is a fate, not a refusal: of the 4 not stored and not here, 3 were turned down.
+        assert_eq!((t.total(), t.rejected(), t.deleted, t.stored, t.refused["blocked: x"]), (7, 3, 1, 2, 2));
         let text = t.to_string();
         assert!(text.starts_with("stored 2, already here 1, deleted (kind 5) 1"), "{text}");
         assert!(text.contains("\n    refused 2: blocked: x") && text.contains("\n    invalid 1: invalid: bad id"), "{text}");

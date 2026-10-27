@@ -117,8 +117,17 @@ pub struct Replies {
     pub replies: Vec<Vec<Reply>>,
 }
 
+/// The operator's `top`: each reactor sends its addresses' totals from slot
+/// `from` on, open connections included (see `talk`).
+pub struct TopAsk {
+    pub from: u64,
+    pub reply: std::sync::mpsc::Sender<crate::subs::FxMap<std::net::IpAddr, crate::talk::Agg>>,
+}
+
 #[derive(Clone)]
 pub enum ReactorMsg {
+    /// Answered by each reactor, off the hot path.
+    Top(Arc<TopAsk>),
     Live(Arc<LiveBatch>),
     Replies(Arc<Replies>),
     /// An ephemeral event: delivered live, never stored.

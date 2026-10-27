@@ -78,22 +78,35 @@ pub struct Stats {
     /// What the last reconcile found missing on each side.
     pub last_need: AtomicU64,
     pub last_have: AtomicU64,
-    /// Events of theirs stored here, and turned away here (deleted, vanished,
-    /// refused by policy, invalid; not counting ones already here).
+    /// Comparisons over every event (the rest cover recent ones only).
+    pub full_reconciles: AtomicU64,
+    /// Events of theirs, by fate here: stored; delivered live and never
+    /// stored (ephemeral); older than the version here (superseded); deleted
+    /// or vanished here; refused (policy, invalid, failed). Ones already here
+    /// are not counted.
     pub events_in: AtomicU64,
+    pub events_in_ephemeral: AtomicU64,
+    pub events_in_superseded: AtomicU64,
+    pub events_in_deleted: AtomicU64,
     pub events_in_refused: AtomicU64,
     /// Theirs not fetched again because an earlier pass turned them away.
     pub events_in_skipped: AtomicU64,
-    /// Events of ours they stored, and turned away.
+    /// Events of ours, by fate there.
     pub events_out: AtomicU64,
+    pub events_out_superseded: AtomicU64,
+    pub events_out_deleted: AtomicU64,
     pub events_out_refused: AtomicU64,
     pub reconnects: AtomicU64,
 }
 
 impl Stats {
     fn count_in(&self, t: &Tally) {
-        self.events_in.fetch_add(t.stored, Ordering::Relaxed);
-        self.events_in_refused.fetch_add(t.turned_away(), Ordering::Relaxed);
+        let add = |a: &AtomicU64, n: u64| a.fetch_add(n, Ordering::Relaxed);
+        add(&self.events_in, t.stored);
+        add(&self.events_in_ephemeral, t.ephemeral);
+        add(&self.events_in_superseded, t.superseded);
+        add(&self.events_in_deleted, t.deleted + t.vanished);
+        add(&self.events_in_refused, t.rejected());
     }
 
     fn count_out(&self, v: &Verdict) {
@@ -103,8 +116,11 @@ impl Stats {
     }
 
     fn count_out_all(&self, t: &Tally) {
-        self.events_out.fetch_add(t.stored, Ordering::Relaxed);
-        self.events_out_refused.fetch_add(t.turned_away(), Ordering::Relaxed);
+        let add = |a: &AtomicU64, n: u64| a.fetch_add(n, Ordering::Relaxed);
+        add(&self.events_out, t.stored);
+        add(&self.events_out_superseded, t.superseded);
+        add(&self.events_out_deleted, t.deleted + t.vanished);
+        add(&self.events_out_refused, t.rejected());
     }
 
     /// `(name, value)` pairs, for the text formats.
@@ -113,15 +129,21 @@ impl Stats {
         vec![
             ("connected", g(&self.connected)),
             ("reconciles", g(&self.reconciles)),
+            ("full_reconciles", g(&self.full_reconciles)),
             ("reconcile_failures", g(&self.reconcile_failures)),
             ("last_reconcile_at", g(&self.last_reconcile_at)),
             ("last_reconcile_ms", g(&self.last_reconcile_ms)),
             ("last_need", g(&self.last_need)),
             ("last_have", g(&self.last_have)),
             ("events_in", g(&self.events_in)),
+            ("events_in_ephemeral", g(&self.events_in_ephemeral)),
+            ("events_in_superseded", g(&self.events_in_superseded)),
+            ("events_in_deleted", g(&self.events_in_deleted)),
             ("events_in_refused", g(&self.events_in_refused)),
             ("events_in_skipped", g(&self.events_in_skipped)),
             ("events_out", g(&self.events_out)),
+            ("events_out_superseded", g(&self.events_out_superseded)),
+            ("events_out_deleted", g(&self.events_out_deleted)),
             ("events_out_refused", g(&self.events_out_refused)),
             ("reconnects", g(&self.reconnects)),
         ]
@@ -135,7 +157,7 @@ pub fn stats_for(entries: &[SyncCfg]) -> Vec<Arc<Stats>> {
         .map(|c| {
             let filters: Vec<String> = c.filters.iter().map(filter_text).collect();
             let filter = if filters.len() == 1 { filters[0].clone() } else { format!("[{}]", filters.join(",")) };
-            Arc::new(Stats { url: c.url.clone(), direction: c.direction.name(), filter, ..Stats::default() })
+            Arc::new(Stats { url: super::shown(&c.url), direction: c.direction.name(), filter, ..Stats::default() })
         })
         .collect()
 }
@@ -243,6 +265,9 @@ pub fn start(entries: Vec<SyncCfg>, stats: Vec<Arc<Stats>>, store: Store, ctl: S
 
 async fn reconciler(e: Rc<Entry>) {
     let every = Duration::from_secs(e.cfg.reconcile_seconds);
+    let full_every = Duration::from_secs(e.cfg.full_reconcile_seconds);
+    let window = e.cfg.recent_seconds;
+    let (mut last_full, mut last_ok): (Option<Instant>, Option<Instant>) = (None, None);
     let mut next = Instant::now();
     let mut retry = RETRY_FIRST;
     loop {
@@ -250,10 +275,24 @@ async fn reconciler(e: Rc<Entry>) {
             _ = tokio::time::sleep_until(next.into()) => {}
             _ = e.wake.notified() => {}
         }
+        // Everything at start and every full_every; in between, only events
+        // dated within the window, which is what a stream that dropped since
+        // the last pass can have missed (NIP-17 backdates by up to two days).
+        // A pass that has not succeeded for half the window may not reach far
+        // enough back, so it covers everything.
+        let full = window == 0
+            || last_full.is_none_or(|t| t.elapsed() >= full_every)
+            || last_ok.is_none_or(|t| t.elapsed() >= Duration::from_secs(window / 2));
+        let since = (!full).then(|| ingest::now().saturating_sub(window));
         let started = Instant::now();
-        match reconcile_once(&e).await {
+        match reconcile_once(&e, since).await {
             Ok(r) => {
                 let s = &e.stats;
+                last_ok = Some(Instant::now());
+                if full {
+                    last_full = last_ok;
+                    s.full_reconciles.fetch_add(1, Ordering::Relaxed);
+                }
                 s.reconciles.fetch_add(1, Ordering::Relaxed);
                 s.last_reconcile_at.store(ingest::now(), Ordering::Relaxed);
                 s.last_reconcile_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -263,7 +302,7 @@ async fn reconciler(e: Rc<Entry>) {
                 retry = RETRY_FIRST;
             }
             Err(why) => {
-                eprintln!("sync with {}: reconcile failed: {why}", e.url);
+                eprintln!("{}", super::shown(&format!("sync with {}: reconcile failed: {why}", e.url)));
                 e.stats.reconcile_failures.fetch_add(1, Ordering::Relaxed);
                 next = Instant::now() + retry.min(every);
                 retry = (retry * 2).min(Duration::from_secs(600));
@@ -272,15 +311,19 @@ async fn reconciler(e: Rc<Entry>) {
     }
 }
 
-async fn reconcile_once(e: &Rc<Entry>) -> Result<Report, String> {
+async fn reconcile_once(e: &Rc<Entry>, since: Option<u64>) -> Result<Report, String> {
     let mut remote = Remote::connect(&e.connector, &e.url).await?;
     let hide_wraps = if e.broad() { remote.hides_wraps().await? } else { false };
     let mut local = e.local();
     let opts = Opts { hide_wraps, trusted: e.cfg.trusted, ..Opts::new(e.cfg.direction) };
     let mut total = Report::default();
     for f in &e.cfg.filters {
+        let mut f = f.clone();
+        if let Some(s) = since {
+            f.since = Some(f.since.map_or(s, |x| x.max(s)));
+        }
         let mut r = Report::default();
-        let result = sync_filter(&mut remote, &mut local, f, &opts, &mut r).await;
+        let result = sync_filter(&mut remote, &mut local, &f, &opts, &mut r).await;
         e.stats.count_in(&r.down);
         e.stats.events_in_skipped.fetch_add(r.refused_before, Ordering::Relaxed);
         e.stats.count_out_all(&r.up);
@@ -301,7 +344,7 @@ async fn live(e: Rc<Entry>) {
         let result = live_once(&e, &mut cursor, !first).await;
         e.stats.connected.store(0, Ordering::Relaxed);
         if let Err(why) = result {
-            eprintln!("sync with {}: {why}; reconnecting in {} s", e.url, backoff.as_secs());
+            eprintln!("{}", super::shown(&format!("sync with {}: {why}; reconnecting in {} s", e.url, backoff.as_secs())));
         }
         first = false;
         // A connection that lasted was not part of a failing streak.

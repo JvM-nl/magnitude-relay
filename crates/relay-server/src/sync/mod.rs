@@ -223,6 +223,24 @@ async fn windows(remote: &mut Remote, local: &mut impl Local, f: &Filter, opts: 
     }
 }
 
+/// `text` fit to show where others can read it (/stats, /metrics, the log):
+/// the secret of a peer address (`/peer/<secret>`) is left out.
+pub fn shown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("/peer/") {
+        out.push_str(&rest[..i + "/peer/".len()]);
+        rest = &rest[i + "/peer/".len()..];
+        let end = rest.find(|c: char| matches!(c, '/' | '?' | '#' | ':' | '"') || c.is_whitespace()).unwrap_or(rest.len());
+        if end > 0 {
+            out.push('…');
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn filter_text(f: &Filter) -> String {
     let mut b = Vec::new();
     f.write_json(&mut b);
@@ -493,6 +511,20 @@ fn print_report(r: &Report, dir: Direction, dry_run: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_secret_is_never_shown() {
+        let url = "wss://relay.example.com/nostr/peer/149b308886368b3c";
+        assert_eq!(shown(url), "wss://relay.example.com/nostr/peer/…");
+        assert_eq!(
+            shown(&format!("sync with {url}: {url}: unexpected end of file")),
+            "sync with wss://relay.example.com/nostr/peer/…: wss://relay.example.com/nostr/peer/…: unexpected end of file"
+        );
+        assert_eq!(shown("wss://h/peer/s3cret?x=1"), "wss://h/peer/…?x=1");
+        for plain in ["wss://relay.ditto.pub", "ws://127.0.0.1:7777/nostr", "wss://h/peer/"] {
+            assert_eq!(shown(plain), plain);
+        }
+    }
 
     #[test]
     fn ok_messages() {

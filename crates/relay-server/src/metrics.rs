@@ -55,6 +55,30 @@ counters! {
     events_duplicate,
     /// Events refused (policy, invalid, deleted, superseded, rate limit).
     events_refused,
+    /// The same, by reason (they add up to `events_refused`): a kind this
+    /// relay does not accept; malformed, a bad id or signature, too large,
+    /// too many tags, dated too far ahead or already expired; NIP-70
+    /// protected; over the address's allowance or the relay busy; older than
+    /// the version held of a replaceable event; deleted or vanished; other.
+    events_refused_kind,
+    events_refused_invalid,
+    events_refused_protected,
+    events_refused_rate,
+    events_refused_superseded,
+    events_refused_deleted,
+    events_refused_other,
+    /// REQs, COUNTs and NEG-OPENs refused, by reason: gift wraps asked for
+    /// wholesale rather than by author, recipient or id (how a scraper shows
+    /// itself); over a limit (filters, values, subscriptions, answer or sync
+    /// size); a filter that does not parse; the relay too busy.
+    reqs_refused_wraps,
+    reqs_refused_limits,
+    reqs_refused_invalid,
+    reqs_refused_busy,
+    /// AUTH messages, answered that this relay does not use AUTH.
+    auth_refused,
+    /// New connections turned away at the per-address rate (HTTP 429).
+    connections_rate_limited,
     /// Ephemeral events relayed.
     events_ephemeral,
     /// Signatures accepted by a batch check (a read that brought several EVENTs).

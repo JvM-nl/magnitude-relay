@@ -12,8 +12,9 @@ use crate::metrics::{self, Metrics};
 use crate::session::{self, Ctx, HeldReqs, Outbox, Session, SessionCfg, SigQueue};
 use crate::sock::{Incoming, Sock, Stream, TlsConfig};
 use crate::subs::{ConnId, FxMap, SubIndex};
+use crate::talk::{self, Agg, Talk, TalkLog};
 use crate::verify::Job;
-use relay_net::conn::{server_handshake_with, Handshake, OwnedRequest};
+use relay_net::conn::{server_handshake_checked, Handshake, OwnedRequest, Refusal};
 use relay_net::http::{write_response, ExtensionPolicy};
 use relay_net::ws::{self, Compressor, DeflateParams, Decoder, Event, Role};
 use relay_proto::{EventParser, Record};
@@ -51,7 +52,7 @@ pub struct Shared {
     pub counts: OnceLock<SyncSender<crate::ingest::Job>>,
     pub nip11: String,
     pub next_conn: AtomicU64,
-    ips: Mutex<FxMap<IpAddr, IpState>>,
+    ips: Mutex<IpTable>,
     pub metrics: Metrics,
     /// One per `[[sync]]` entry.
     pub sync: Vec<Arc<crate::sync::live::Stats>>,
@@ -63,11 +64,64 @@ pub struct Shared {
     pub ephemeral_out: tokio::sync::broadcast::Sender<Arc<[u8]>>,
 }
 
+/// Per address: connections open, and two token buckets (tokens scaled by
+/// 1000 for sub-token refill), one for EVENTs and one for new connections.
 struct IpState {
     conns: u32,
-    /// Token bucket for EVENTs: tokens (scaled by 1000 for sub-token refill) and last refill.
     tokens: u64,
     last: Instant,
+    conn_tokens: u64,
+    conn_last: Instant,
+}
+
+/// The per-address table. An address stays in it while it has connections
+/// open or either bucket is still refilling: one that reconnected must not
+/// come back to a full allowance.
+struct IpTable {
+    map: FxMap<IpAddr, IpState>,
+    swept: Instant,
+}
+
+/// How often addresses with nothing left to remember are dropped.
+const IP_SWEEP: Duration = Duration::from_secs(60);
+
+/// Refills a bucket of `cap` tokens (scaled) at `per_min` tokens a minute.
+fn refill(tokens: &mut u64, last: &mut Instant, now: Instant, per_min: u64, cap: u64) {
+    let add = now.duration_since(*last).as_millis() as u64 * per_min / 60;
+    *tokens = (*tokens + add).min(cap);
+    *last = now;
+}
+
+impl IpState {
+    fn new(now: Instant, l: &crate::config::LimitsCfg) -> IpState {
+        IpState {
+            conns: 0,
+            tokens: u64::from(l.events_per_minute_per_ip) * 1000,
+            last: now,
+            conn_tokens: u64::from(l.connection_burst_per_ip) * 1000,
+            conn_last: now,
+        }
+    }
+
+    /// Nothing to remember: no connections, and both buckets would be full.
+    fn idle(&self, now: Instant, l: &crate::config::LimitsCfg) -> bool {
+        let full = |tokens: u64, last: Instant, per_min: u64, cap: u64| {
+            per_min == 0 || tokens + now.duration_since(last).as_millis() as u64 * per_min / 60 >= cap
+        };
+        let (epm, cpm) = (u64::from(l.events_per_minute_per_ip), u64::from(l.connections_per_minute_per_ip));
+        self.conns == 0
+            && full(self.tokens, self.last, epm, epm * 1000)
+            && full(self.conn_tokens, self.conn_last, cpm, u64::from(l.connection_burst_per_ip) * 1000)
+    }
+}
+
+impl IpTable {
+    fn sweep(&mut self, now: Instant, l: &crate::config::LimitsCfg) {
+        if now.duration_since(self.swept) >= IP_SWEEP {
+            self.map.retain(|_, e| !e.idle(now, l));
+            self.swept = now;
+        }
+    }
 }
 
 impl Shared {
@@ -83,7 +137,7 @@ impl Shared {
             counts: OnceLock::new(),
             nip11,
             next_conn: AtomicU64::new(1),
-            ips: Mutex::new(FxMap::default()),
+            ips: Mutex::new(IpTable { map: FxMap::default(), swept: Instant::now() }),
             metrics: Metrics::new(reactors),
             sync,
             verify: crate::verify::Pool::new(reactors),
@@ -120,10 +174,12 @@ impl Shared {
         if ip.is_loopback() {
             return true;
         }
-        let max = self.cfg.limits.max_connections_per_ip;
+        let l = &self.cfg.limits;
+        let max = l.max_connections_per_ip;
+        let now = Instant::now();
         let mut ips = self.ips.lock().unwrap();
-        let burst = u64::from(self.cfg.limits.events_per_minute_per_ip) * 1000;
-        let e = ips.entry(ip).or_insert(IpState { conns: 0, tokens: burst, last: Instant::now() });
+        ips.sweep(now, l);
+        let e = ips.map.entry(ip).or_insert_with(|| IpState::new(now, l));
         if max != 0 && e.conns >= max {
             return false;
         }
@@ -132,12 +188,34 @@ impl Shared {
     }
 
     fn release(&self, ip: IpAddr) {
+        let now = Instant::now();
         let mut ips = self.ips.lock().unwrap();
-        if let Some(e) = ips.get_mut(&ip) {
+        if let Some(e) = ips.map.get_mut(&ip) {
             e.conns = e.conns.saturating_sub(1);
-            if e.conns == 0 {
-                ips.remove(&ip);
+            if e.idle(now, &self.cfg.limits) {
+                ips.map.remove(&ip);
             }
+        }
+    }
+
+    /// Takes one new-connection token for `ip`, or says how many seconds until
+    /// one is due. Asked before the WebSocket upgrade (see `accept`).
+    pub fn allow_connection(&self, ip: IpAddr) -> Result<(), u64> {
+        let l = &self.cfg.limits;
+        let per_min = u64::from(l.connections_per_minute_per_ip);
+        if per_min == 0 || ip.is_loopback() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let mut ips = self.ips.lock().unwrap();
+        ips.sweep(now, l);
+        let e = ips.map.entry(ip).or_insert_with(|| IpState::new(now, l));
+        refill(&mut e.conn_tokens, &mut e.conn_last, now, per_min, u64::from(l.connection_burst_per_ip) * 1000);
+        if e.conn_tokens >= 1000 {
+            e.conn_tokens -= 1000;
+            Ok(())
+        } else {
+            Err(((1000 - e.conn_tokens) * 60).div_ceil(per_min * 1000).max(1))
         }
     }
 
@@ -149,17 +227,31 @@ impl Shared {
             return true;
         }
         let mut ips = self.ips.lock().unwrap();
-        let Some(e) = ips.get_mut(&ip) else { return true };
-        let now = Instant::now();
-        let refill = now.duration_since(e.last).as_millis() as u64 * per_min / 60;
-        e.tokens = (e.tokens + refill).min(per_min * 1000);
-        e.last = now;
+        let Some(e) = ips.map.get_mut(&ip) else { return true };
+        refill(&mut e.tokens, &mut e.last, Instant::now(), per_min, per_min * 1000);
         if e.tokens >= 1000 {
             e.tokens -= 1000;
             true
         } else {
             false
         }
+    }
+
+    /// Every address's totals over the last `minutes` (to the slot), from each
+    /// reactor's table and its open connections: the operator's `top`.
+    pub fn top(&self, minutes: u64) -> FxMap<IpAddr, Agg> {
+        let from = crate::ingest::now().saturating_sub(minutes * 60) / talk::SLOT_SECS;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reactors = self.reactors.get().map_or(0, Vec::len);
+        self.broadcast(ReactorMsg::Top(Arc::new(crate::ingest::TopAsk { from, reply: tx })));
+        let mut all: FxMap<IpAddr, Agg> = FxMap::default();
+        for _ in 0..reactors {
+            let Ok(part) = rx.recv_timeout(Duration::from_secs(5)) else { break };
+            for (ip, a) in part {
+                all.entry(ip).or_default().merge(&a);
+            }
+        }
+        all
     }
 
     pub fn broadcast(&self, msg: ReactorMsg) {
@@ -187,13 +279,22 @@ struct ConnOut {
     share: bool,
     /// A trusted peer's: events this relay took from clients are marked so.
     peer: bool,
+    /// For the operator's `top`: who, with what, since when, and its counts.
+    ip: IpAddr,
+    ua: Box<str>,
+    started: Instant,
+    talk: Talk,
 }
 
 impl ConnOut {
-    fn new(deflate: Option<Compressor>, plain: bool, peer: bool) -> ConnOut {
+    fn new(deflate: Option<Compressor>, plain: bool, peer: bool, ip: IpAddr, ua: Box<str>) -> ConnOut {
         ConnOut {
             share: plain && deflate.is_none(),
             peer,
+            ip,
+            ua,
+            started: Instant::now(),
+            talk: Talk::default(),
             buf: RefCell::new(Vec::new()),
             spliced: RefCell::new(Vec::new()),
             spliced_bytes: Cell::new(0),
@@ -256,6 +357,8 @@ struct Reactor {
     pending: std::collections::VecDeque<Arc<crate::ingest::LiveBatch>>,
     /// Subscriptions waiting for a worker's answer to their REQ.
     held: HeldReqs,
+    /// Closed connections' counts by address, for the operator's `top`.
+    talk: TalkLog,
 }
 
 /// Frames each reply as a WebSocket text message: built in place, or, for a
@@ -408,6 +511,7 @@ pub fn run(
             scratch: vec![0; READ_CHUNK],
             pending: std::collections::VecDeque::new(),
             held: HeldReqs::default(),
+            talk: TalkLog::default(),
         }));
         tokio::task::spawn_local(fanout(rx, st.clone(), shared.clone()));
         tokio::task::spawn_local(keep_fresh(st.clone(), shared.clone()));
@@ -507,6 +611,15 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
             }
         }
         let (events, gen): (&[Arc<[u8]>], u64) = match &msg {
+            ReactorMsg::Top(ask) => {
+                let mut part = FxMap::default();
+                r.talk.since(ask.from, &mut part);
+                for o in r.conns.values() {
+                    part.entry(o.ip).or_default().add(&o.talk, &o.ua, 0, true);
+                }
+                let _ = ask.reply.send(part);
+                (&[], 0)
+            }
             ReactorMsg::Live(b) => {
                 // Kept until published: a REQ answered from an older snapshot in
                 // the meantime replays it (see Session::on_req).
@@ -519,10 +632,13 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                 }
                 let m = shared.metrics.of(r.idx);
                 for reply in &c.replies[r.idx] {
+                    let t = r.conns.get(&reply.conn).map(|o| &o.talk);
                     match reply.outcome {
                         Some(relay_store::Outcome::Stored(_)) => metrics::inc(&m.events_stored),
                         Some(relay_store::Outcome::Duplicate) => metrics::inc(&m.events_duplicate),
-                        _ => metrics::inc(&m.events_refused),
+                        Some(relay_store::Outcome::Superseded) => session::Refused::Superseded.count(m, t),
+                        Some(relay_store::Outcome::Deleted | relay_store::Outcome::Vanished) => session::Refused::Deleted.count(m, t),
+                        _ => session::Refused::Other.count(m, t),
                     }
                     if let Some(o) = r.conns.get(&reply.conn) {
                         o.write(|w| session::ok_reply(w, reply));
@@ -544,6 +660,9 @@ async fn fanout(mut rx: mpsc::UnboundedReceiver<ReactorMsg>, st: Rc<RefCell<Reac
                 // stored events, EOSE, then what came live while it was held.
                 if let (Some(h), Some(o)) = (r.held.take(a.conn, &a.sub, a.token), r.conns.get(&a.conn)) {
                     let max = shared.scfg.max_outbound;
+                    if a.too_big {
+                        session::ReqRefused::Limits.count(shared.metrics.of(r.idx), Some(&o.talk));
+                    }
                     o.write(|w| {
                         let mut start = 0;
                         for &end in &a.ends {
@@ -664,6 +783,7 @@ async fn connection(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: Rc<
         r.subs.remove_conn(conn);
         r.held.release_conn(conn);
         r.conns.remove(&conn);
+        r.talk.fold(crate::ingest::now(), ip, &out.ua, &out.talk, out.started.elapsed().as_secs());
     }
     shared.release(ip);
     shared.metrics.open.fetch_sub(1, Ordering::Relaxed);
@@ -681,7 +801,20 @@ async fn accept(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: &Rc<Ref
         Some(p) => ExtensionPolicy::with_deflate(p),
         None => ExtensionPolicy::NONE,
     };
-    let (req, deflate) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, server_handshake_with(&mut s, &mut buf, MAX_HEAD, &policy)).await {
+    let idx = st.borrow().idx;
+    // An address opening connections faster than its allowance is answered
+    // 429 before the upgrade. A trusted peer is not held to it.
+    let check = |req: &OwnedRequest| {
+        let ip = client_ip(req, peer, real_ip_header);
+        if trusted_peer(&shared.cfg.peers, &req.path, ip) == Some(true) {
+            return None;
+        }
+        shared.allow_connection(ip).err().map(|wait| {
+            metrics::inc(&shared.metrics.of(idx).connections_rate_limited);
+            Refusal { status: 429, retry_after: Some(wait), message: "rate-limited: too many new connections from your address" }
+        })
+    };
+    let (req, deflate) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, server_handshake_checked(&mut s, &mut buf, MAX_HEAD, &policy, check)).await {
         Ok(Ok((Handshake::Upgraded(req), ext))) => (req, ext.deflate),
         Ok(Ok((Handshake::PlainHttp(req), _))) => {
             let _ = plain_http(&mut s, &req, shared).await;
@@ -690,7 +823,6 @@ async fn accept(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: &Rc<Ref
         _ => return None,
     };
     let ip = client_ip(&req, peer, real_ip_header);
-    let idx = st.borrow().idx;
     let trusted = match trusted_peer(&shared.cfg.peers, &req.path, ip) {
         None => false,
         Some(true) => true,
@@ -716,7 +848,8 @@ async fn accept(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: &Rc<Ref
     if z.is_some() {
         metrics::inc(&shared.metrics.of(idx).connections_deflate);
     }
-    let out = Rc::new(ConnOut::new(z, s.is_clear(), trusted));
+    let ua: Box<str> = req.headers.iter().find(|(n, _)| n == "user-agent").map_or_else(Box::default, |(_, v)| String::from_utf8_lossy(&v[..v.len().min(96)]).into());
+    let out = Rc::new(ConnOut::new(z, s.is_clear(), trusted, ip, ua));
     st.borrow_mut().conns.insert(conn, out.clone());
 
     Some(Accepted { s, buf, ip, deflate, trusted, conn, out })
@@ -831,6 +964,7 @@ fn with_cx(st: &RefCell<Reactor>, shared: &Shared, ip: IpAddr, conn: ConnId, out
         offload: &offload,
         held: &mut r.held,
         conn,
+        talk: &out.talk,
     };
     out.write(|w| f(&mut cx, w));
 }
@@ -958,6 +1092,7 @@ async fn serve(
             let spliced = out.spliced_bytes.replace(0);
             metrics::add(&shared.metrics.of(st.borrow().idx).bytes_out, (wbuf.len() + spliced) as u64);
             let len = wbuf.len() + spliced;
+            out.talk.bytes_out.set(out.talk.bytes_out.get() + len as u64);
             let write = async {
                 if wspliced.is_empty() {
                     s.write_all(&wbuf).await

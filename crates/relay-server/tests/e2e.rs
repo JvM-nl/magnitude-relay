@@ -1527,3 +1527,204 @@ async fn a_banned_key_is_answered_ok_and_never_stored() {
     relay.stop();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A relay behind a pretend web server: it takes each connection's address
+/// from X-Forwarded-For, so a test can speak from many addresses.
+fn start_forwarded(dir: PathBuf, port: u16, sections: &str) -> Relay {
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("relay.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[relay]\nbind = \"127.0.0.1:{port}\"\nthreads = 2\nreal_ip_header = \"x-forwarded-for\"\n{sections}\n[store]\ndata = \"{}\"\n",
+            dir.join("data").display()
+        ),
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_magnitude-relay")).arg("--config").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let t = Instant::now();
+    while std::net::TcpStream::connect(addr).is_err() {
+        assert!(t.elapsed() < Duration::from_secs(10), "relay did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Relay { child, addr, dir }
+}
+
+/// A WebSocket opened by hand, to send headers the client API does not (the
+/// address a web server names, a user agent). Frames are masked with zeros.
+struct RawWs {
+    s: tokio::net::TcpStream,
+    buf: Vec<u8>,
+}
+
+/// The status and head of the answer to an upgrade, and the socket when it was upgraded.
+async fn raw_upgrade(addr: SocketAddr, headers: &str) -> (u16, String, Option<RawWs>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{headers}\r\n"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let end = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p + 4;
+        }
+        let mut chunk = [0u8; 4096];
+        let n = s.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "closed before answering: {}", String::from_utf8_lossy(&buf));
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+    let status: u16 = head.split(' ').nth(1).unwrap().parse().unwrap();
+    let rest = buf[end..].to_vec();
+    (status, head, (status == 101).then_some(RawWs { s, buf: rest }))
+}
+
+impl RawWs {
+    async fn send(&mut self, v: Value) {
+        use tokio::io::AsyncWriteExt;
+        let text = v.to_string();
+        let mut f = vec![0x81];
+        match text.len() {
+            n if n < 126 => f.push(0x80 | n as u8),
+            n => {
+                f.push(0x80 | 126);
+                f.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+        }
+        f.extend_from_slice(&[0, 0, 0, 0]);
+        f.extend_from_slice(text.as_bytes());
+        self.s.write_all(&f).await.unwrap();
+    }
+
+    async fn recv(&mut self) -> Value {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if self.buf.len() >= 2 {
+                let (op, len0) = (self.buf[0] & 0x0F, (self.buf[1] & 0x7F) as usize);
+                let (hdr, len) = match len0 {
+                    126 if self.buf.len() >= 4 => (4, u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize),
+                    127 if self.buf.len() >= 10 => (10, u64::from_be_bytes(self.buf[2..10].try_into().unwrap()) as usize),
+                    126 | 127 => (usize::MAX, 0),
+                    n => (2, n),
+                };
+                if hdr != usize::MAX && self.buf.len() >= hdr + len {
+                    let payload: Vec<u8> = self.buf.drain(..hdr + len).skip(hdr).collect();
+                    if op == 1 {
+                        return serde_json::from_slice(&payload).unwrap();
+                    }
+                    continue;
+                }
+            }
+            let mut chunk = [0u8; 65536];
+            let n = tokio::time::timeout(Duration::from_secs(5), self.s.read(&mut chunk)).await.expect("timed out waiting for a frame").unwrap();
+            assert!(n > 0, "connection closed");
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// The next message of one of `kinds` (OK, EOSE, CLOSED, ...).
+    async fn next_of(&mut self, kinds: &[&str]) -> Value {
+        loop {
+            let m = self.recv().await;
+            if kinds.contains(&m[0].as_str().unwrap()) {
+                return m;
+            }
+        }
+    }
+}
+
+/// An address that opens connections faster than its allowance is answered
+/// 429 before the upgrade; other addresses are not; and reconnecting does not
+/// refill the address's EVENT allowance.
+#[tokio::test]
+async fn an_address_past_its_connection_allowance_gets_429() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-connrate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = start_forwarded(dir.clone(), port, "[limits]\nconnections_per_minute_per_ip = 1\nconnection_burst_per_ip = 3\nevents_per_minute_per_ip = 2\n");
+    let from = |ip: &str| format!("X-Forwarded-For: {ip}\r\n");
+
+    for i in 0..3 {
+        let (status, head, _) = raw_upgrade(relay.addr, &from("203.0.113.5")).await;
+        assert_eq!(status, 101, "connection {i}: {head}");
+    }
+    let (status, head, _) = raw_upgrade(relay.addr, &from("203.0.113.5")).await;
+    assert_eq!(status, 429, "{head}");
+    assert!(head.contains("Retry-After: "), "{head}");
+    assert_eq!(raw_upgrade(relay.addr, &from("203.0.113.6")).await.0, 101);
+
+    // Two EVENTs a minute: spent on one connection, still spent on the next.
+    let me = Signer::new(70);
+    let (_, _, ws) = raw_upgrade(relay.addr, &from("203.0.113.7")).await;
+    let mut ws = ws.unwrap();
+    for i in 0..2 {
+        ws.send(json!(["EVENT", me.event(now() - i, 30078, json!([["d", format!("k{i}")]]), "x")])).await;
+        assert_eq!(ws.next_of(&["OK"]).await[2], true);
+    }
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (_, _, ws) = raw_upgrade(relay.addr, &from("203.0.113.7")).await;
+    let mut ws = ws.unwrap();
+    ws.send(json!(["EVENT", me.event(now(), 30078, json!([["d", "k2"]]), "x")])).await;
+    let ok = ws.next_of(&["OK"]).await;
+    assert_eq!((ok[2].as_bool(), ok[3].as_str().unwrap().starts_with("rate-limited:")), (Some(false), true), "{ok}");
+
+    let s = stats(&relay).await;
+    assert_eq!((s["connections_rate_limited"].as_u64(), s["events_refused_rate"].as_u64()), (Some(1), Some(1)), "{s}");
+    drop(ws);
+    relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `top` names each address with its app, what it asked for (kinds and
+/// counts, never keys) and what was refused; /stats says why things were.
+#[tokio::test]
+async fn top_shows_each_address_and_what_it_asked_for() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-top-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let port = free_port();
+    let relay = start_forwarded(dir.clone(), port, "");
+    let me = Signer::new(71);
+
+    let (_, _, ws) = raw_upgrade(relay.addr, "X-Forwarded-For: 203.0.113.20\r\nUser-Agent: scraper/1\r\n").await;
+    let mut scraper = ws.unwrap();
+    scraper.send(json!(["REQ", "all", {"kinds": [1059], "limit": 10}])).await;
+    let c = scraper.next_of(&["CLOSED", "EOSE"]).await;
+    assert_eq!(c[0], "CLOSED", "{c}");
+    scraper.send(json!(["EVENT", me.event(now(), 1, json!([]), "a note")])).await;
+    assert_eq!(scraper.next_of(&["OK"]).await[2], false);
+
+    let (_, _, ws) = raw_upgrade(relay.addr, "X-Forwarded-For: 203.0.113.21\r\nUser-Agent: reader/2\r\n").await;
+    let mut reader = ws.unwrap();
+    reader.send(json!(["REQ", "p", {"kinds": [0], "authors": [me.pk()], "limit": 1}])).await;
+    assert_eq!(reader.next_of(&["EOSE"]).await[0], "EOSE");
+    drop(reader);
+
+    let t = Instant::now();
+    let out = loop {
+        let out = run_ok(&dir, &["top", "--by", "conns"]);
+        if out.contains("reader/2") {
+            break out;
+        }
+        assert!(t.elapsed() < Duration::from_secs(5), "{out}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let line = |ip: &str| out.lines().find(|l| l.starts_with(ip)).unwrap_or_else(|| panic!("no {ip} in\n{out}")).to_string();
+    let (s, r) = (line("203.0.113.20"), line("203.0.113.21"));
+    assert!(s.contains("scraper/1") && s.contains("kinds 1059 · limit 10"), "{s}");
+    let cols: Vec<&str> = s.split_whitespace().collect();
+    // address, conns, open, avg s, reqs, events, refused, scrapes
+    assert_eq!(&cols[1..8], ["1", "1", "0", "1", "1", "1", "1"], "{s}");
+    assert!(r.contains("reader/2") && r.contains("kinds 0 · authors×1 · limit 1") && !r.contains(&me.pk()), "{r}");
+    assert!(out.lines().next().unwrap().contains("1 gift-wrap scrapes refused"), "{out}");
+    run_refused(&dir, &["top", "--by", "nope"], "--by is one of");
+
+    let st = stats(&relay).await;
+    assert_eq!((st["reqs_refused_wraps"].as_u64(), st["events_refused_kind"].as_u64()), (Some(1), Some(1)), "{st}");
+    drop(scraper);
+    relay.stop();
+    let _ = std::fs::remove_dir_all(dir);
+}

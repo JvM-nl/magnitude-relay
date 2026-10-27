@@ -77,7 +77,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Ready before the relay's own port is, so that a script which waits for
     // the port can run operator commands at once. Not fatal: the relay serves
     // without it.
-    let admin = match admin::start(&data, admin::Ctx { store: admin_store.clone(), ctl: ctl_tx.clone(), policy: scfg.clone() }) {
+    let asks = shared.clone();
+    let top: admin::TopFn = Arc::new(move |minutes| asks.top(minutes));
+    let admin = match admin::start(&data, admin::Ctx { store: admin_store.clone(), ctl: ctl_tx.clone(), policy: scfg.clone(), top: Some(top) }) {
         Ok(a) => Some(a),
         Err(e) => {
             eprintln!("admin socket unavailable ({e}): query, count, delete and sync cannot reach this relay while it runs");

@@ -139,12 +139,13 @@ email = "you@example.com"
 | `delete` | Removes matching events (`--dry-run` first, then `--yes`) |
 | `sync <url>` | Compares with another relay over NIP-77 and copies what one side lacks |
 | `stats` / `cert` | Store statistics; the HTTPS certificate |
+| `top` | Who has used the running relay in the last hour, by address: connections, requests, refusals, bytes out, app, and what their last request asked for (kinds and counts, never keys) |
 
 While the relay runs, `query`, `count`, `delete`, `backup` and `sync` reach it through `<data>/admin.sock`, which only the relay's user can open. Run `magnitude-relay --help` for every option.
 
 ### Watching it
 
-Every relay has a public dashboard at `/dashboard`, a landing page at `/`, JSON at `/stats`, a heartbeat at `/live`, and Prometheus metrics at `/metrics`. Behind a path such as `/nostr`, they live at `/nostr/dashboard` and so on.
+Every relay has a public dashboard at `/dashboard`, a landing page at `/`, JSON at `/stats`, a heartbeat at `/live`, and Prometheus metrics at `/metrics`. Behind a path such as `/nostr`, they live at `/nostr/dashboard` and so on. Refusals are counted by reason there (a kind not accepted, invalid, rate-limited, gift wraps asked for wholesale, and so on); which address did what is only for the operator, through `top`.
 
 <p align="center">
   <img src="docs/assets/dashboard.jpg" alt="The relay's live dashboard" width="820">

@@ -6,6 +6,7 @@ use crate::bans::Bans;
 use crate::ingest::{ReactorMsg, Reply, WriteReq};
 use crate::metrics::{self, Block};
 use crate::subs::{ConnId, SubIndex};
+use crate::talk::{bump, Shape, Talk};
 use relay_proto::event::EventInfo;
 use relay_proto::json::{escape_str, Scanner};
 use relay_proto::message::{ClientMsg, MsgError};
@@ -21,6 +22,63 @@ pub trait Outbox {
     fn text(&mut self, f: &mut dyn FnMut(&mut Vec<u8>));
     /// Bytes already waiting to be written to this connection.
     fn queued(&self) -> usize;
+}
+
+/// Why an EVENT was refused, for the counters; the message tells the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    Kind,
+    Invalid,
+    Protected,
+    Rate,
+    Superseded,
+    Deleted,
+    Other,
+}
+
+impl Refused {
+    /// Counts one, under its reason and in the total, and against its
+    /// connection when it has one.
+    #[inline]
+    pub fn count(self, m: &Block, t: Option<&Talk>) {
+        if let Some(t) = t {
+            bump(&t.refused);
+        }
+        metrics::inc(&m.events_refused);
+        metrics::inc(match self {
+            Refused::Kind => &m.events_refused_kind,
+            Refused::Invalid => &m.events_refused_invalid,
+            Refused::Protected => &m.events_refused_protected,
+            Refused::Rate => &m.events_refused_rate,
+            Refused::Superseded => &m.events_refused_superseded,
+            Refused::Deleted => &m.events_refused_deleted,
+            Refused::Other => &m.events_refused_other,
+        });
+    }
+}
+
+/// Why a REQ, COUNT or NEG-OPEN was refused, for the counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReqRefused {
+    Wraps,
+    Limits,
+    Invalid,
+    Busy,
+}
+
+impl ReqRefused {
+    #[inline]
+    pub fn count(self, m: &Block, t: Option<&Talk>) {
+        if let (ReqRefused::Wraps, Some(t)) = (self, t) {
+            bump(&t.wraps);
+        }
+        metrics::inc(match self {
+            ReqRefused::Wraps => &m.reqs_refused_wraps,
+            ReqRefused::Limits => &m.reqs_refused_limits,
+            ReqRefused::Invalid => &m.reqs_refused_invalid,
+            ReqRefused::Busy => &m.reqs_refused_busy,
+        });
+    }
 }
 
 /// The limits and policy a session enforces (built once from the config).
@@ -67,20 +125,20 @@ impl SessionCfg {
 
     /// Why an event is refused on policy alone, before anything is hashed:
     /// the same answer for a client's EVENT and for an event synced in.
-    pub fn refusal(&self, info: &EventInfo, rec: Record<'_>, now: u64) -> Option<String> {
+    pub fn refusal(&self, info: &EventInfo, rec: Record<'_>, now: u64) -> Option<(Refused, String)> {
         if !(self.kind_allowed)(info.kind) {
-            Some(format!("blocked: kind {} is not accepted by this relay", info.kind))
+            Some((Refused::Kind, format!("blocked: kind {} is not accepted by this relay", info.kind)))
         } else if info.tag_count as usize > self.max_tags {
-            Some(String::from("invalid: too many tags"))
+            Some((Refused::Invalid, String::from("invalid: too many tags")))
         } else if info.created_at > now + self.max_future_seconds {
-            Some(String::from("invalid: created_at is too far in the future"))
+            Some((Refused::Invalid, String::from("invalid: created_at is too far in the future")))
         } else if info.expiration.is_some_and(|e| e <= now) {
-            Some(String::from("invalid: event has already expired"))
+            Some((Refused::Invalid, String::from("invalid: event has already expired")))
         } else if info.protected {
             // NIP-70 needs AUTH to prove authorship, and this relay never uses AUTH.
-            Some(String::from("blocked: protected events are not accepted here"))
+            Some((Refused::Protected, String::from("blocked: protected events are not accepted here")))
         } else if rec.json_len() > self.max_event_bytes {
-            Some(format!("invalid: event is larger than {} bytes", self.max_event_bytes))
+            Some((Refused::Invalid, format!("invalid: event is larger than {} bytes", self.max_event_bytes)))
         } else {
             None
         }
@@ -113,6 +171,8 @@ pub struct Ctx<'a> {
     /// This reactor's subscriptions whose stored events a worker is finding.
     pub held: &'a mut HeldReqs,
     pub conn: ConnId,
+    /// This connection's counts, for the operator's `top`.
+    pub talk: &'a Talk,
 }
 
 /// COUNTs expected to walk more index keys than this (about 2.5 ms of work)
@@ -368,27 +428,32 @@ impl Session {
                 cx.held.release(self.conn, sub_id);
             }
             Ok(ClientMsg::Auth { .. }) => {
+                metrics::inc(&cx.m.auth_refused);
                 let id = *Record(cx.rec).id();
                 ok(out, &id, false, "restricted: this relay does not use AUTH");
             }
             Ok(ClientMsg::NegOpen { sub_id, filter, msg }) => self.on_neg_open(sub_id, filter, &msg, cx, out),
             Ok(ClientMsg::NegMsg { sub_id, msg }) => self.on_neg_msg(sub_id, &msg, out),
             Ok(ClientMsg::NegClose { sub_id }) => self.neg.retain(|n| &*n.sub != sub_id),
-            Err(MsgError::Filter { sub_id, err }) => closed(out, &sub_id, &format!("error: {err}")),
+            Err(MsgError::Filter { sub_id, err }) => {
+                ReqRefused::Invalid.count(cx.m, Some(cx.talk));
+                closed(out, &sub_id, &format!("error: {err}"))
+            }
             Err(e) => notice(out, &e.to_string()),
         }
     }
 
     fn on_event(&mut self, text: &str, info: EventInfo, at: usize, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
         metrics::inc(&cx.m.events_in);
+        bump(&cx.talk.events);
         let id = *Record(cx.rec).id();
         // Cheap checks first: nothing below costs a hash until these pass.
-        if let Some(msg) = cx.cfg.refusal(&info, Record(cx.rec), cx.now) {
-            metrics::inc(&cx.m.events_refused);
+        if let Some((why, msg)) = cx.cfg.refusal(&info, Record(cx.rec), cx.now) {
+            why.count(cx.m, Some(cx.talk));
             return ok(out, &id, false, &msg);
         }
         if !(cx.allow_event)() {
-            metrics::inc(&cx.m.events_refused);
+            Refused::Rate.count(cx.m, Some(cx.talk));
             return ok(out, &id, false, "rate-limited: slow down, too many events from your address");
         }
         // A resend is answered from the index, before any hashing.
@@ -405,7 +470,7 @@ impl Session {
         // received, which only this reactor still has. Every other id is
         // hashed with the signature check, eight at a time.
         if info.any_escaped && cx.parser.confirm_id(Scanner::new_at(text, at), cx.rec, info).is_err() {
-            metrics::inc(&cx.m.events_refused);
+            Refused::Invalid.count(cx.m, Some(cx.talk));
             return ok(out, &id, false, "invalid: bad event id");
         }
         // Taken from a client and checked here. What a peer sends was taken by
@@ -472,15 +537,16 @@ impl Session {
         match verdict {
             Verdict::Valid => {}
             Verdict::BadId => {
-                metrics::inc(&cx.m.events_refused);
+                Refused::Invalid.count(cx.m, Some(cx.talk));
                 return ok(out, &id, false, "invalid: bad event id");
             }
             Verdict::BadSig => {
-                metrics::inc(&cx.m.events_refused);
+                Refused::Invalid.count(cx.m, Some(cx.talk));
                 return ok(out, &id, false, "invalid: bad signature");
             }
         }
         if cx.cfg.silences(Record(rec)) {
+            bump(&cx.talk.silenced);
             return ok(out, &id, true, "");
         }
         if kind::is_ephemeral(kind) {
@@ -491,14 +557,21 @@ impl Session {
         }
         match cx.writer.try_send(WriteReq { reactor: cx.reactor, conn: self.conn, rec: rec.to_vec(), at: std::time::Instant::now() }) {
             Ok(()) => self.pending += 1,
-            Err(TrySendError::Full(_)) => ok(out, &id, false, "rate-limited: the relay is busy, try again shortly"),
-            Err(TrySendError::Disconnected(_)) => ok(out, &id, false, "error: the relay is shutting down"),
+            Err(TrySendError::Full(_)) => {
+                Refused::Rate.count(cx.m, Some(cx.talk));
+                ok(out, &id, false, "rate-limited: the relay is busy, try again shortly")
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                Refused::Other.count(cx.m, Some(cx.talk));
+                ok(out, &id, false, "error: the relay is shutting down")
+            }
         }
     }
 
     /// Validates filters against the limits and the gift-wrap rule.
     fn check_filters(&self, filters: &mut [Filter], cx: &Ctx<'_>) -> Result<(), String> {
         if filters.len() > cx.cfg.max_filters {
+            ReqRefused::Limits.count(cx.m, Some(cx.talk));
             return Err(format!("error: at most {} filters per request", cx.cfg.max_filters));
         }
         for f in filters.iter_mut() {
@@ -508,6 +581,7 @@ impl Session {
                 || f.kinds.as_ref().is_some_and(|v| v.len() > max)
                 || f.tags.iter().any(|t| t.values.len() > max);
             if too_many {
+                ReqRefused::Limits.count(cx.m, Some(cx.talk));
                 return Err(format!("error: at most {max} values per filter list"));
             }
             // No bulk scraping of gift wraps: they are found by author (Concord),
@@ -515,6 +589,7 @@ impl Session {
             let addressed = f.ids.is_some() || f.authors.is_some() || f.tags.iter().any(|t| t.name == b'p');
             let wants_wraps = f.kinds.as_ref().is_some_and(|k| k.contains(&kind::GIFT_WRAP));
             if wants_wraps && !addressed && !self.trusted {
+                ReqRefused::Wraps.count(cx.m, Some(cx.talk));
                 return Err(String::from("restricted: gift wraps are requested by author, recipient or id"));
             }
         }
@@ -526,12 +601,15 @@ impl Session {
 
     fn on_req(&mut self, sub_id: &str, mut filters: Vec<Filter>, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
         metrics::inc(&cx.m.reqs);
+        bump(&cx.talk.reqs);
+        cx.talk.shape.set(Shape::of(&filters));
         let started = std::time::Instant::now();
         if let Err(msg) = self.check_filters(&mut filters, cx) {
             return closed(out, sub_id, &msg);
         }
         let replacing = cx.subs.count(self.conn) > 0 && cx.subs.remove(self.conn, sub_id);
         if !replacing && cx.subs.count(self.conn) >= cx.cfg.max_subscriptions {
+            ReqRefused::Limits.count(cx.m, Some(cx.talk));
             return closed(out, sub_id, &format!("error: at most {} open subscriptions", cx.cfg.max_subscriptions));
         }
         cx.held.release(self.conn, sub_id);
@@ -578,6 +656,7 @@ impl Session {
             cx.held.release(self.conn, sub_id);
             if snap.req_cost(&filters, &limits, FALLBACK_REQ_RANGES) > FALLBACK_REQ_COST {
                 cx.subs.remove(self.conn, sub_id);
+                ReqRefused::Busy.count(cx.m, Some(cx.talk));
                 return closed(out, sub_id, "rate-limited: too many large requests in progress, try again shortly");
             }
             metrics::inc(&cx.m.reqs_inline_fallback);
@@ -586,6 +665,7 @@ impl Session {
         let a = answer(&snap, &filters, &limits, sub_id, self.trusted, cx.now, cx.cfg.max_outbound, out);
         metrics::add(&cx.m.events_out, a.sent);
         if a.too_big {
+            ReqRefused::Limits.count(cx.m, Some(cx.talk));
             cx.subs.remove(self.conn, sub_id);
             return closed_too_big(out, sub_id, cx.cfg.max_outbound);
         }
@@ -599,6 +679,7 @@ impl Session {
 
     fn on_neg_open(&mut self, sub_id: &str, filter: Filter, msg: &[u8], cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
         metrics::inc(&cx.m.neg_opens);
+        bump(&cx.talk.negs);
         self.neg.retain(|n| &*n.sub != sub_id);
         let mut fs = [filter];
         if let Err(m) = self.check_filters(&mut fs, cx) {
@@ -606,6 +687,7 @@ impl Session {
         }
         let [filter] = fs;
         if self.neg.len() >= MAX_NEG_SESSIONS {
+            ReqRefused::Limits.count(cx.m, Some(cx.talk));
             return neg_err(out, sub_id, "blocked: too many open negentropy sessions");
         }
         cx.store.refresh(cx.snap);
@@ -621,12 +703,14 @@ impl Session {
             }
         };
         if items.len() > MAX_NEG_ITEMS {
+            ReqRefused::Limits.count(cx.m, Some(cx.talk));
             return neg_err(out, sub_id, "blocked: too many records to reconcile, narrow the filter");
         }
         // Reserved before the set is built; given back if it is refused.
         let n = items.len() as u64;
         if NEG_ITEMS.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n > NEG_ITEMS_BUDGET {
             NEG_ITEMS.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+            ReqRefused::Busy.count(cx.m, Some(cx.talk));
             return neg_err(out, sub_id, "rate-limited: too many records held by open sync sessions, try again shortly");
         }
         let session = NegSession { sub: sub_id.into(), storage: VecStorage::new(items), items: n };
@@ -635,7 +719,10 @@ impl Session {
                 neg_msg(out, sub_id, &resp);
                 self.neg.push(session);
             }
-            Err(e) => neg_err(out, sub_id, &format!("error: {e}")),
+            Err(e) => {
+                ReqRefused::Invalid.count(cx.m, Some(cx.talk));
+                neg_err(out, sub_id, &format!("error: {e}"))
+            }
         }
     }
 
@@ -654,6 +741,7 @@ impl Session {
 
     fn on_count(&mut self, sub_id: &str, mut filters: Vec<Filter>, cx: &mut Ctx<'_>, out: &mut dyn Outbox) {
         metrics::inc(&cx.m.counts);
+        bump(&cx.talk.counts);
         if let Err(msg) = self.check_filters(&mut filters, cx) {
             return closed(out, sub_id, &msg);
         }
@@ -668,6 +756,7 @@ impl Session {
             // The workers are busy: one Vector sizes a sync with is counted
             // here (slower for this reactor), a hostile one is refused.
             if cx.snap.count_cost(&filters) > FALLBACK_COUNT_KEYS {
+                ReqRefused::Busy.count(cx.m, Some(cx.talk));
                 return closed(out, sub_id, "rate-limited: too many large counts in progress, try again shortly");
             }
             metrics::inc(&cx.m.reqs_inline_fallback);

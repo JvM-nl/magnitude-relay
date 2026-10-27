@@ -362,6 +362,9 @@ async fn continuous_sync_keeps_two_relays_in_step() {
     assert!(e["events_out"].as_u64().unwrap() >= 21, "{s}");
     // The reactions were fetched and refused once; later passes skip them.
     assert_eq!(e["events_in_refused"], 10, "{s}");
+    // The pass at start covered everything; the one after A came back, only
+    // recent events, which is all that went missing.
+    assert_eq!(e["full_reconciles"], 1, "{s}");
     assert!(e["events_in_skipped"].as_u64().unwrap() >= 10, "{s}");
 
     a.stop();
@@ -507,6 +510,48 @@ async fn ephemeral_events_cross_a_sync_once_and_are_never_kept() {
     }
     let kept = json!({"kinds": [21059]}).to_string();
     assert_eq!((a.count(&kept), b.count(&kept)), (0, 0), "ephemeral events are never stored");
+
+    a.stop();
+    b.stop();
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
+
+/// Between full passes a comparison covers recent events only; an old event
+/// that slipped past the stream (here, imported behind its back) waits for the
+/// next full pass, and arrives with it.
+#[tokio::test]
+async fn an_old_event_the_recent_passes_miss_arrives_with_the_next_full_pass() {
+    let (da, db) = (tmp("fa"), tmp("fb"));
+    let pa = free_port();
+    let mut a = Relay::configure(&da, pa, "", "");
+    let mut b = Relay::configure(
+        &db,
+        free_port(),
+        "",
+        &format!("[[sync]]\nurl = \"ws://127.0.0.1:{pa}\"\ndirection = \"down\"\nreconcile_seconds = 1\nfull_reconcile_seconds = 6\n"),
+    );
+    a.start();
+    b.start();
+    let x = Signer::new(90);
+    wait_for("the first, full, reconcile", || b.count("{}") == a.count("{}")).await;
+
+    // Dated ten days ago, far outside the three-day window, and never streamed.
+    a.stop();
+    let old = x.event(now() - 10 * 86_400, 1, json!([]), "old");
+    let recent = x.event(now() - 60, 1, json!([]), "recent");
+    a.import(&[old, recent]);
+    a.start();
+    let author = json!({"authors": [x.pk()]}).to_string();
+    wait_for("the recent event", || b.count(&author) >= 1).await;
+    let s = stats(&b).await;
+    if s["sync"][0]["full_reconciles"] == 1 {
+        assert_eq!(b.count(&author), 1, "a recent pass reached back ten days: {s}");
+    }
+    wait_for("the old event, with a full pass", || b.count(&author) == 2).await;
+    let s = stats(&b).await;
+    assert!(s["sync"][0]["full_reconciles"].as_u64().unwrap() >= 2, "{s}");
+    assert!(s["sync"][0]["reconciles"].as_u64().unwrap() > s["sync"][0]["full_reconciles"].as_u64().unwrap(), "{s}");
 
     a.stop();
     b.stop();

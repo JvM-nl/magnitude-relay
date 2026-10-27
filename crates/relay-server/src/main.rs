@@ -20,6 +20,7 @@ mod sock;
 mod stats;
 mod subs;
 mod sync;
+mod talk;
 mod toml;
 mod verify;
 
@@ -52,6 +53,11 @@ commands:
   query --filter JSON [--limit N]
                        print matching events as JSONL, newest first
   count --filter JSON  print how many events match
+  top [--minutes M] [--by bytes|conns|reqs|events|refused] [--limit N]
+                       who has used the running relay in the last M minutes
+                       (at most 60), by address: connections, requests,
+                       events, refusals, bytes out, app, and the shape of
+                       the last request (kinds and counts, never keys)
   delete --filter JSON [--age SECS] [--all] (--dry-run | --yes)
                        remove matching events. --dry-run prints how many would
                        go, with a few samples, and changes nothing; --yes does
@@ -254,6 +260,13 @@ fn run() -> Result<(), String> {
             let fs = filters(&mut args, "count")?;
             no_more(&args)?;
             operator::run_count(&load()?, fs)
+        }
+        "top" => {
+            let minutes = value(&mut args, "--minutes")?;
+            let by = text(&mut args, "--by")?;
+            let limit = value(&mut args, "--limit")?;
+            no_more(&args)?;
+            operator::run_top(&load()?, minutes, by, limit)
         }
         "delete" => {
             let fs = filters(&mut args, "delete")?;

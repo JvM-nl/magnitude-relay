@@ -117,12 +117,14 @@ const KEYS: &[(&str, &[&str])] = &[
             "max_limit",
             "max_connections_per_ip",
             "events_per_minute_per_ip",
+            "connections_per_minute_per_ip",
+            "connection_burst_per_ip",
             "outbound_buffer_bytes",
         ],
     ),
     ("store", &["data", "sync", "segment_mb", "memory_mb"]),
     ("tls", &["enabled", "domains", "email", "https_bind", "http_bind", "cert", "key", "staging", "directory"]),
-    ("sync", &["url", "filter", "direction", "reconcile_seconds", "trusted"]),
+    ("sync", &["url", "filter", "direction", "reconcile_seconds", "full_reconcile_seconds", "recent_seconds", "trusted"]),
     ("peer", &["name", "secret", "ips"]),
 ];
 
@@ -272,6 +274,10 @@ pub struct LimitsCfg {
     pub max_connections_per_ip: u32,
     /// 0 = unlimited.
     pub events_per_minute_per_ip: u32,
+    /// New connections per minute from one address, after a first burst of
+    /// `connection_burst_per_ip`. 0 = unlimited.
+    pub connections_per_minute_per_ip: u32,
+    pub connection_burst_per_ip: u32,
     pub outbound_buffer_bytes: usize,
 }
 
@@ -367,9 +373,13 @@ pub struct SyncCfg {
     /// The events to sync: one filter, or several (their union). `{}` is everything.
     pub filters: Vec<Filter>,
     pub direction: Direction,
-    /// Between two full comparisons new events stream live; the comparison
-    /// catches whatever the stream missed (a disconnect, a restart).
+    /// Between two comparisons new events stream live; the comparison catches
+    /// whatever the stream missed (a disconnect, a restart).
     pub reconcile_seconds: u64,
+    /// How often a comparison covers every event. The others cover events
+    /// dated in the last `recent_seconds` (0: every comparison is full).
+    pub full_reconcile_seconds: u64,
+    pub recent_seconds: u64,
     /// The other relay is one of ours ([[peer]] there): the signatures of
     /// events it took from clients itself are not checked again here.
     pub trusted: bool,
@@ -417,7 +427,15 @@ impl Direction {
 impl Default for SyncCfg {
     /// Everything, theirs to us, compared hourly. No url: one must be given.
     fn default() -> Self {
-        SyncCfg { url: String::new(), filters: vec![Filter::default()], direction: Direction::Down, reconcile_seconds: 3600, trusted: false }
+        SyncCfg {
+            url: String::new(),
+            filters: vec![Filter::default()],
+            direction: Direction::Down,
+            reconcile_seconds: 3600,
+            full_reconcile_seconds: 86_400,
+            recent_seconds: 3 * 86_400,
+            trusted: false,
+        }
     }
 }
 
@@ -477,6 +495,8 @@ impl Default for LimitsCfg {
             max_limit: 5000,
             max_connections_per_ip: 256,
             events_per_minute_per_ip: 1200,
+            connections_per_minute_per_ip: 30,
+            connection_burst_per_ip: 120,
             outbound_buffer_bytes: 33_554_432,
         }
     }
@@ -1095,6 +1115,8 @@ fn apply_limits(c: &mut LimitsCfg, e: &Entry) -> Result<bool, String> {
         "max_limit" => c.max_limit = int(e, 1, 1_000_000)? as usize,
         "max_connections_per_ip" => c.max_connections_per_ip = int(e, 0, 10_000_000)? as u32,
         "events_per_minute_per_ip" => c.events_per_minute_per_ip = int(e, 0, 10_000_000)? as u32,
+        "connections_per_minute_per_ip" => c.connections_per_minute_per_ip = int(e, 0, 10_000_000)? as u32,
+        "connection_burst_per_ip" => c.connection_burst_per_ip = int(e, 1, 10_000_000)? as u32,
         "outbound_buffer_bytes" => c.outbound_buffer_bytes = int(e, 64 * 1024, 1 << 31)? as usize,
         _ => return Ok(false),
     }
@@ -1254,6 +1276,8 @@ fn apply_sync(c: &mut SyncCfg, e: &Entry) -> Result<bool, String> {
             })?;
         }
         "reconcile_seconds" => c.reconcile_seconds = int(e, 1, 30 * 86_400)?,
+        "full_reconcile_seconds" => c.full_reconcile_seconds = int(e, 1, 365 * 86_400)?,
+        "recent_seconds" => c.recent_seconds = int(e, 0, 365 * 86_400)?,
         "trusted" => c.trusted = boolean(e)?,
         _ => return Ok(false),
     }
@@ -1516,6 +1540,15 @@ const TEMPLATE: &str = r##"# {name} settings
 # max_connections_per_ip = 256
 # events_per_minute_per_ip = 1200
 
+# New connections per minute from one address, after a first burst of
+# connection_burst_per_ip. Past that, the relay answers 429 with Retry-After
+# before the WebSocket opens, which clients treat as a failed connection and
+# back off from. It catches clients that open a connection for every request
+# instead of keeping one; Vector starting up, even with many Communities, is
+# nowhere near it. Loopback has no limit, as above. 0 turns it off.
+# connections_per_minute_per_ip = 30
+# connection_burst_per_ip = 120
+
 # Memory one connection may use for messages waiting to be sent. A client that
 # reads too slowly to stay under this is disconnected, and a REQ whose stored
 # events add up to more ends with CLOSED (ask for fewer at a time). At least
@@ -1604,8 +1637,16 @@ const TEMPLATE: &str = r##"# {name} settings
 # "down" copies their events here, "up" copies ours to them, "both" does both.
 # direction = "down"
 
-# Seconds between full comparisons. New events arrive live in between.
+# Seconds between comparisons. New events arrive live in between.
 # reconcile_seconds = 3600
+
+# A comparison of every event runs at start and every full_reconcile_seconds;
+# the others compare only events dated within the last recent_seconds, which
+# is what a stream that dropped can have missed (Vector backdates messages by
+# up to two days). A large store compares in a fraction of the time. 0 for
+# recent_seconds makes every comparison full.
+# full_reconcile_seconds = 86400
+# recent_seconds = 259200
 
 # true when the other relay is one of yours and lists this one as a [[peer]]
 # (the url is then its private peer address, wss://host/peer/<secret>): events

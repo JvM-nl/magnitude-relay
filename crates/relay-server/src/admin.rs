@@ -23,6 +23,8 @@
 //!     newest first, at most N+1 in all, then {"done":true,"count":N}
 //! {"op":"ingest","events":[{...},...]}
 //!     {"verdicts":["stored","refused blocked: ...",...]}, one per event
+//! {"op":"top","filters":[],"minutes":M,"by":"bytes","limit":N}
+//!     {"text":"..."} per line of the table (see `talk`), then {"done":true,"count":N}
 //! ```
 //!
 //! `items` is a negentropy set and `ingest` stores events another relay sent:
@@ -79,11 +81,19 @@ pub enum Op {
     Backup,
     Items,
     Ingest,
+    Top,
 }
 
 impl Op {
-    const NAMES: [(Op, &'static str); 6] =
-        [(Op::Query, "query"), (Op::Count, "count"), (Op::Delete, "delete"), (Op::Backup, "backup"), (Op::Items, "items"), (Op::Ingest, "ingest")];
+    const NAMES: [(Op, &'static str); 7] = [
+        (Op::Query, "query"),
+        (Op::Count, "count"),
+        (Op::Delete, "delete"),
+        (Op::Backup, "backup"),
+        (Op::Items, "items"),
+        (Op::Ingest, "ingest"),
+        (Op::Top, "top"),
+    ];
 
     fn name(self) -> &'static str {
         Op::NAMES.iter().find(|(o, _)| *o == self).map(|(_, n)| *n).expect("every op is named")
@@ -112,6 +122,9 @@ pub struct Request {
     /// ingest: indices into `events` whose signatures a trusted peer vouched
     /// for (it took them from a client itself): not checked again.
     pub trusted: Vec<u64>,
+    /// top: the last this many minutes, sorted by this (see `talk::By`).
+    pub minutes: Option<u64>,
+    pub by: Option<String>,
 }
 
 /// Items per `{"items":..}` line: 80 KB of hex.
@@ -148,7 +161,20 @@ fn boolean(s: &mut Scanner<'_>) -> Result<bool, Bad> {
 
 impl Request {
     pub fn new(op: Op, filters: Vec<Filter>) -> Request {
-        Request { op, filters, limit: None, age: None, all: false, dry_run: false, dest: None, hide_wraps: false, events: Vec::new(), trusted: Vec::new() }
+        Request {
+            op,
+            filters,
+            limit: None,
+            age: None,
+            all: false,
+            dry_run: false,
+            dest: None,
+            hide_wraps: false,
+            events: Vec::new(),
+            trusted: Vec::new(),
+            minutes: None,
+            by: None,
+        }
     }
 
     fn to_line(&self) -> String {
@@ -160,7 +186,7 @@ impl Request {
             f.write_json(&mut out);
         }
         out.push(b']');
-        for (key, v) in [("limit", self.limit), ("age", self.age)] {
+        for (key, v) in [("limit", self.limit), ("age", self.age), ("minutes", self.minutes)] {
             if let Some(v) = v {
                 out.extend_from_slice(format!(",\"{key}\":").as_bytes());
                 push_u64(&mut out, v);
@@ -171,10 +197,12 @@ impl Request {
                 out.extend_from_slice(format!(",\"{key}\":true").as_bytes());
             }
         }
-        if let Some(dest) = &self.dest {
-            out.extend_from_slice(b",\"dest\":\"");
-            json::escape_str(dest, &mut out);
-            out.push(b'"');
+        for (key, v) in [("dest", &self.dest), ("by", &self.by)] {
+            if let Some(v) = v {
+                out.extend_from_slice(format!(",\"{key}\":\"").as_bytes());
+                json::escape_str(v, &mut out);
+                out.push(b'"');
+            }
         }
         if !self.events.is_empty() {
             out.extend_from_slice(b",\"events\":[");
@@ -235,6 +263,8 @@ impl Request {
                     r.trusted.push(s.u64()?);
                     Ok(())
                 })?,
+                b"minutes" => r.minutes = Some(s.u64()?),
+                b"by" => r.by = Some(s.string()?.to_text()),
                 _ => return Err("unknown key".into()),
             }
             Ok(())
@@ -267,7 +297,11 @@ pub struct Ctx {
     pub store: Store,
     pub ctl: Sender<Control>,
     pub policy: Arc<SessionCfg>,
+    /// Asks the reactors who has been using the relay (`Shared::top`).
+    pub top: Option<TopFn>,
 }
+
+pub type TopFn = Arc<dyn Fn(u64) -> crate::subs::FxMap<std::net::IpAddr, crate::talk::Agg> + Send + Sync>;
 
 /// Starts listening on `<data>/admin.sock`.
 pub fn start(data: &Path, cx: Ctx) -> io::Result<Admin> {
@@ -395,6 +429,9 @@ fn handle(line: &str, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
     if req.op == Op::Ingest {
         return ingest(&req, out, cx);
     }
+    if req.op == Op::Top {
+        return top(&req, out, cx);
+    }
     operator::check_filters(&req.filters)?;
     let now = ingest::now();
     match req.op {
@@ -432,8 +469,31 @@ fn handle(line: &str, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
             writeln!(out, "{{\"count\":{n}}}").map_err(|e| e.to_string())
         }
         Op::Delete => delete(&req, out, store, ctl, now),
-        Op::Backup => unreachable!("answered above"),
+        Op::Backup | Op::Top => unreachable!("answered above"),
     }
+}
+
+/// Who has been using the relay, as the lines of a table.
+fn top(req: &Request, out: &mut impl Write, cx: &Ctx) -> Result<(), String> {
+    let Some(ask) = &cx.top else { return Err("top reports on connections, which only the running relay has".into()) };
+    let minutes = req.minutes.unwrap_or(60).clamp(1, crate::talk::SLOTS as u64 * crate::talk::SLOT_SECS / 60);
+    let by = match &req.by {
+        None => crate::talk::By::Bytes,
+        Some(b) => crate::talk::By::parse(b).ok_or_else(|| {
+            let names: Vec<&str> = crate::talk::By::NAMES.iter().map(|(_, n)| *n).collect();
+            format!("--by is one of {}, not {b:?}", names.join(", "))
+        })?,
+    };
+    let lines = crate::talk::render(ask(minutes), minutes, by, req.limit.unwrap_or(25) as usize);
+    let mut b = Vec::new();
+    for line in &lines {
+        b.clear();
+        b.extend_from_slice(b"{\"text\":\"");
+        json::escape_str(line, &mut b);
+        b.extend_from_slice(b"\"}\n");
+        out.write_all(&b).map_err(|e| e.to_string())?;
+    }
+    writeln!(out, "{{\"done\":true,\"count\":{}}}", lines.len()).map_err(|e| e.to_string())
 }
 
 /// Copies the store to `dest` while the relay serves (see `relay_store::backup`).
@@ -651,6 +711,7 @@ pub struct Client(UnixStream);
 
 enum Reply<'a> {
     Event(&'a str),
+    Text(String),
     /// Done so far, and of how much when the relay says.
     Progress(u64, Option<u64>),
     Done(u64),
@@ -740,6 +801,19 @@ impl Client {
     }
 
     /// What became of each event, in order.
+    pub fn top(self, req: &Request) -> io::Result<Vec<String>> {
+        let mut r = self.ask(req)?;
+        let mut line = String::new();
+        let mut lines = Vec::new();
+        loop {
+            match next_reply(&mut r, &mut line)? {
+                Reply::Text(t) => lines.push(t),
+                Reply::Done(n) if n == lines.len() as u64 => return Ok(lines),
+                _ => return Err(io::Error::other("the relay's reply was not what was asked for")),
+            }
+        }
+    }
+
     pub fn ingest(self, req: &Request) -> io::Result<Vec<Verdict>> {
         let mut r = self.ask(req)?;
         match next_reply(&mut r, &mut String::new())? {
@@ -767,7 +841,7 @@ fn parse_reply(line: &str) -> Result<Result<Reply<'_>, String>, String> {
     let (mut count, mut matched, mut deleted) = (None, None, None);
     let (mut backed_up, mut events, mut files, mut bytes, mut written) = (false, None, None, None, None);
     let mut sample = Vec::new();
-    let (mut items, mut verdicts) = (None, None);
+    let (mut items, mut verdicts, mut text) = (None, None, None);
     let mut s = Scanner::new(line);
     s.object(|s, key| -> Result<(), Bad> {
         match key.bytes {
@@ -788,6 +862,7 @@ fn parse_reply(line: &str) -> Result<Result<Reply<'_>, String>, String> {
                 verdicts = Some(v);
             }
             b"error" => error = Some(s.string()?.to_text()),
+            b"text" => text = Some(s.string()?.to_text()),
             b"done" => {
                 s.skip()?;
                 done = true;
@@ -817,6 +892,8 @@ fn parse_reply(line: &str) -> Result<Result<Reply<'_>, String>, String> {
     .map_err(|b| format!("unreadable reply from the relay: {}", b.0))?;
     Ok(if let Some(msg) = error {
         Err(msg)
+    } else if let Some(t) = text {
+        Ok(Reply::Text(t))
     } else if let Some(items) = items {
         Ok(Reply::Items(items))
     } else if let Some(v) = verdicts {
