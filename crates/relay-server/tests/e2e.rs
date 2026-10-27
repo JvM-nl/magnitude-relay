@@ -1674,6 +1674,10 @@ async fn an_address_past_its_connection_allowance_gets_429() {
 
     let s = stats(&relay).await;
     assert_eq!((s["connections_rate_limited"].as_u64(), s["events_refused_rate"].as_u64()), (Some(1), Some(1)), "{s}");
+    // The operator sees whom it turned away.
+    let out = run_ok(&dir, &["top", "--by", "refused"]);
+    let line = out.lines().find(|l| l.starts_with("203.0.113.5 ")).unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(line.split_whitespace().nth(8), Some("1"), "{out}");
     drop(ws);
     relay.stop();
     let _ = std::fs::remove_dir_all(dir);

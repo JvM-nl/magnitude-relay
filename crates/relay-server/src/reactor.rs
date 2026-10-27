@@ -811,6 +811,8 @@ async fn accept(s: Stream, peer: SocketAddr, tls: Option<TlsConfig>, st: &Rc<Ref
         }
         shared.allow_connection(ip).err().map(|wait| {
             metrics::inc(&shared.metrics.of(idx).connections_rate_limited);
+            let ua = req.headers.iter().find(|(n, _)| n == "user-agent").map_or_else(String::new, |(_, v)| String::from_utf8_lossy(&v[..v.len().min(96)]).into_owned());
+            st.borrow_mut().talk.limited(crate::ingest::now(), ip, &ua);
             Refusal { status: 429, retry_after: Some(wait), message: "rate-limited: too many new connections from your address" }
         })
     };

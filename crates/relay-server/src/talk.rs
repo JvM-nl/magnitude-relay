@@ -132,6 +132,8 @@ pub struct Agg {
     pub wraps: u64,
     pub silenced: u64,
     pub bytes_out: u64,
+    /// Connections refused at the per-address rate, before the upgrade.
+    pub limited: u64,
     /// The latest connection's user agent and REQ shape.
     pub ua: Box<str>,
     pub shape: Shape,
@@ -174,6 +176,7 @@ impl Agg {
         self.wraps += o.wraps;
         self.silenced += o.silenced;
         self.bytes_out += o.bytes_out;
+        self.limited += o.limited;
         if self.ua.is_empty() {
             self.ua = o.ua.clone();
         }
@@ -192,12 +195,25 @@ pub struct TalkLog {
 impl TalkLog {
     /// Adds a closed connection's counts to the slot for `now` (Unix seconds).
     pub fn fold(&mut self, now: u64, ip: IpAddr, ua: &str, t: &Talk, secs: u64) {
+        self.slot(now).entry(ip).or_default().add(t, ua, secs, false);
+    }
+
+    /// A connection refused at the per-address rate (it never opened).
+    pub fn limited(&mut self, now: u64, ip: IpAddr, ua: &str) {
+        let a = self.slot(now).entry(ip).or_default();
+        a.limited += 1;
+        if a.ua.is_empty() {
+            a.ua = ua.into();
+        }
+    }
+
+    fn slot(&mut self, now: u64) -> &mut FxMap<IpAddr, Agg> {
         let slot = now / SLOT_SECS;
         let at = &mut self.slots[(slot % SLOTS as u64) as usize];
         if at.0 != slot {
             *at = (slot, FxMap::default());
         }
-        at.1.entry(ip).or_default().add(t, ua, secs, false);
+        &mut at.1
     }
 
     /// Every address's totals in the slots from `from` (a slot number) on.
@@ -239,7 +255,7 @@ impl By {
             By::Conns => a.conns,
             By::Reqs => a.reqs + a.counts + a.negs,
             By::Events => a.events,
-            By::Refused => a.refused + a.wraps,
+            By::Refused => a.refused + a.wraps + a.limited,
         }
     }
 }
@@ -256,10 +272,11 @@ pub fn render(rows: FxMap<IpAddr, Agg>, minutes: u64, by: By, limit: usize) -> V
     let mb = |b: u64| format!("{:.1}", b as f64 / 1e6);
     let mut out = vec![
         format!(
-            "last {minutes} min: {} addresses, {} connections ({} open), {} REQs, {} EVENTs ({} refused, {} silenced), {} gift-wrap scrapes refused, {} MB out; by {}",
+            "last {minutes} min: {} addresses, {} connections ({} open, {} more refused 429), {} REQs, {} EVENTs ({} refused, {} silenced), {} gift-wrap scrapes refused, {} MB out; by {}",
             rows.len(),
             all.conns,
             all.live,
+            all.limited,
             all.reqs,
             all.events,
             all.refused,
@@ -268,13 +285,13 @@ pub fn render(rows: FxMap<IpAddr, Agg>, minutes: u64, by: By, limit: usize) -> V
             mb(all.bytes_out),
             by.name()
         ),
-        format!("{:<40} {:>7} {:>5} {:>7} {:>8} {:>7} {:>6} {:>6} {:>9}  {:<28} last request", "address", "conns", "open", "avg s", "reqs", "events", "refus", "scrape", "MB out", "app"),
+        format!("{:<40} {:>7} {:>5} {:>7} {:>8} {:>7} {:>6} {:>6} {:>6} {:>9}  {:<28} last request", "address", "conns", "open", "avg s", "reqs", "events", "refus", "scrape", "429s", "MB out", "app"),
     ];
     for (ip, a) in rows.into_iter().take(limit) {
         let avg = if a.conns > a.live { a.secs / (a.conns - a.live) } else { 0 };
         let ua: String = if a.ua.is_empty() { "-".into() } else { a.ua.chars().take(28).collect() };
         out.push(format!(
-            "{:<40} {:>7} {:>5} {:>7} {:>8} {:>7} {:>6} {:>6} {:>9}  {:<28} {}",
+            "{:<40} {:>7} {:>5} {:>7} {:>8} {:>7} {:>6} {:>6} {:>6} {:>9}  {:<28} {}",
             ip.to_string(),
             a.conns,
             a.live,
@@ -283,6 +300,7 @@ pub fn render(rows: FxMap<IpAddr, Agg>, minutes: u64, by: By, limit: usize) -> V
             a.events,
             a.refused + a.silenced,
             a.wraps,
+            a.limited,
             mb(a.bytes_out),
             ua,
             a.shape
@@ -328,6 +346,10 @@ mod tests {
         let mut m = FxMap::default();
         log.since(11, &mut m);
         assert_eq!(m[&ip].conns, 1);
+        log.limited(13 * SLOT_SECS + 1, ip, "bot/2");
+        let mut m = FxMap::default();
+        log.since(13, &mut m);
+        assert_eq!((m[&ip].conns, m[&ip].limited), (1, 1));
         // Six slots on, slot 10's place is reused.
         log.fold(16 * SLOT_SECS, ip, "bot/3", &t, 1);
         let mut m = FxMap::default();
@@ -343,7 +365,7 @@ mod tests {
         rows.insert(a, Agg { conns: 5, bytes_out: 10, ua: "small".into(), ..Agg::default() });
         rows.insert(b, Agg { conns: 2, live: 1, secs: 30, bytes_out: 9_000_000, ua: "big".into(), ..Agg::default() });
         let lines = render(rows, 60, By::Bytes, 10);
-        assert!(lines[0].starts_with("last 60 min: 2 addresses, 7 connections (1 open)"), "{}", lines[0]);
+        assert!(lines[0].starts_with("last 60 min: 2 addresses, 7 connections (1 open, 0 more refused 429)"), "{}", lines[0]);
         assert!(lines[2].starts_with("2001:db8::1"), "{lines:?}");
         assert!(lines[2].contains(" 30 ") && lines[2].contains("9.0"), "{lines:?}");
     }
