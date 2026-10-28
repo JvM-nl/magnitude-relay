@@ -203,7 +203,7 @@ Plus Vector's Concord protocol and push requests, and every ephemeral kind (2000
 
 ## How it's built
 
-Pure Rust on a small set of dependencies: `tokio` for the reactor, `libsecp256k1` for signatures, `rustls` and `ring` for HTTPS. The storage engine, WebSocket server, JSON handling and ACME client are written for this relay.
+Pure Rust on a small set of dependencies: `tokio` for the reactor, `libsecp256k1` for signatures, `rustls` and `ring` for HTTPS, and our own [nostr-parse](https://github.com/VectorPrivacy/nostr-parse) for reading events. The storage engine, WebSocket server, the rest of the JSON handling and the ACME client are written for this relay.
 
 | Crate | What it is |
 |---|---|

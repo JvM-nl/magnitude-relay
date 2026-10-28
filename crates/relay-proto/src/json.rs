@@ -106,23 +106,37 @@ impl<'a> RawStr<'a> {
 
 #[derive(Clone)]
 pub struct Scanner<'a> {
+    s: &'a str,
     b: &'a [u8],
     p: usize,
 }
 
 impl<'a> Scanner<'a> {
     pub fn new(s: &'a str) -> Self {
-        Scanner { b: s.as_bytes(), p: 0 }
+        Scanner { s, b: s.as_bytes(), p: 0 }
     }
 
     /// A scanner resuming at byte `pos` of `s` (a position this scanner reported).
     pub fn new_at(s: &'a str, pos: usize) -> Self {
-        Scanner { b: s.as_bytes(), p: pos.min(s.len()) }
+        Scanner { s, b: s.as_bytes(), p: pos.min(s.len()) }
     }
 
     #[inline]
     pub fn pos(&self) -> usize {
         self.p
+    }
+
+    /// The text from the next non-whitespace byte on, for another reader to
+    /// take over; [`Self::advance`] then moves past what it read.
+    #[inline]
+    pub(crate) fn rest(&mut self) -> Option<&'a str> {
+        self.ws();
+        self.s.get(self.p..)
+    }
+
+    #[inline]
+    pub(crate) fn advance(&mut self, n: usize) {
+        self.p += n;
     }
 
     #[inline]

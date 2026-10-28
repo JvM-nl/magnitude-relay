@@ -72,10 +72,24 @@ enum Form {
 /// Reusable scratch for parsing. One per thread; nothing allocates after warm-up.
 #[derive(Default)]
 pub struct EventParser {
+    spans: nostr_parse::Parser,
     content: Vec<u8>,
     tags: Vec<u8>,
     field: Vec<u8>,
     preimage: Vec<u8>,
+}
+
+/// An event's fixed-size fields and what the parse learned, for `write_record`.
+struct Head {
+    id: [u8; 32],
+    pubkey: [u8; 32],
+    sig: [u8; 64],
+    created_at: u64,
+    kind: u64,
+    tag_count: u32,
+    expiration: Option<u64>,
+    protected: bool,
+    any_escaped: bool,
 }
 
 impl EventParser {
@@ -126,6 +140,66 @@ impl EventParser {
     }
 
     fn parse(&mut self, s: &mut Scanner<'_>, out: &mut Vec<u8>, form: Form) -> Result<EventInfo, Reject> {
+        if let Some(info) = self.parse_spans(s, out, form) {
+            return Ok(info);
+        }
+        self.parse_scanned(s, out, form)
+    }
+
+    /// The common case, read by nostr-parse in place: the same record, the same
+    /// answer and the same end as [`Self::parse_scanned`], which takes whatever
+    /// this leaves (`None`). That is an event nostr-parse refuses, so the scanner
+    /// names the error exactly, or one the two could read differently: a key or
+    /// hex field spelled with escapes, a kind past 65535, an empty sig, a deeply
+    /// nested extra field.
+    fn parse_spans(&mut self, s: &mut Scanner<'_>, out: &mut Vec<u8>, form: Form) -> Option<EventInfo> {
+        let mut at = s.clone();
+        let text = at.rest()?;
+        let Self { spans, content, tags, field, .. } = self;
+        let ev = spans.parse_spans(text).ok()?;
+        if ev.unusual {
+            return None;
+        }
+        let sig = ev.sig?;
+
+        content.clear();
+        tags.clear();
+        let mut any_escaped = ev.content.escaped;
+        write_str(raw(ev.content), form, content);
+        let (mut expiration, mut protected) = (None, false);
+        let mut tag_count = 0u32;
+        for tag in ev.tags() {
+            tag_count += 1;
+            let count_at = tags.len();
+            tags.push(0);
+            for v in tag.iter() {
+                any_escaped |= v.escaped;
+                field.clear();
+                write_str(raw(v), form, field);
+                record::encode_field_str(field, tags);
+            }
+            patch_count(tags, count_at, tag.len() as u64);
+            note_tag(tag.get(0).map(raw), tag.get(1).map(raw), tag.len() as u64, &mut protected, &mut expiration);
+        }
+
+        let head = Head {
+            id: ev.id,
+            pubkey: ev.pubkey,
+            sig,
+            created_at: ev.created_at,
+            kind: u64::from(ev.kind),
+            tag_count,
+            expiration,
+            protected,
+            any_escaped,
+        };
+        at.advance(ev.end);
+        *s = at;
+        Some(write_record(out, &head, content, tags))
+    }
+
+    /// Any event JSON can spell, read by this crate's own scanner.
+    fn parse_scanned(&mut self, s: &mut Scanner<'_>, out: &mut Vec<u8>, form: Form) -> Result<EventInfo, Reject> {
         self.content.clear();
         self.tags.clear();
         let mut id: Option<[u8; 32]> = None;
@@ -191,13 +265,7 @@ impl EventParser {
                             Ok(())
                         })?;
                         patch_count(tags, count_at, fields);
-                        if let Some(name) = first {
-                            if fields == 1 && name.is(b"-") {
-                                protected = true;
-                            } else if expiration.is_none() && name.is(b"expiration") {
-                                expiration = second.and_then(parse_decimal);
-                            }
-                        }
+                        note_tag(first, second, fields, &mut protected, &mut expiration);
                         Ok(())
                     })?;
                     tag_count = Some(n);
@@ -217,38 +285,62 @@ impl EventParser {
         }
         let tag_count = tag_count.ok_or(Reject::MissingField("tags"))?;
 
-        out.clear();
-        out.reserve(HEADER_LEN + 8 + 20 + self.content.len() + self.tags.len());
-        out.extend_from_slice(&id);
-        out.extend_from_slice(&pubkey);
-        out.extend_from_slice(&sig);
-        out.extend_from_slice(&created_at.to_le_bytes());
-        out.extend_from_slice(&kind.to_le_bytes());
-        let mut flags = 0u8;
-        if expiration.is_some() {
-            flags |= FLAG_EXPIRATION;
-        }
-        if protected {
-            flags |= FLAG_PROTECTED;
-        }
-        out.push(flags);
-        if let Some(e) = expiration {
-            out.extend_from_slice(&e.to_le_bytes());
-        }
-        varint::put(out, self.content.len() as u64);
-        out.extend_from_slice(&self.content);
-        varint::put(out, u64::from(tag_count));
-        out.extend_from_slice(&self.tags);
+        let head = Head { id, pubkey, sig, created_at, kind, tag_count, expiration, protected, any_escaped };
+        Ok(write_record(out, &head, &self.content, &self.tags))
+    }
+}
 
-        Ok(EventInfo {
-            kind,
-            created_at,
-            tag_count,
-            content_len: self.content.len() as u32,
-            expiration,
-            protected,
-            any_escaped,
-        })
+/// The record for an event, in `out` (cleared first): the fixed fields, flags,
+/// the expiration, then content and tags as already encoded.
+fn write_record(out: &mut Vec<u8>, h: &Head, content: &[u8], tags: &[u8]) -> EventInfo {
+    out.clear();
+    out.reserve(HEADER_LEN + 8 + 20 + content.len() + tags.len());
+    out.extend_from_slice(&h.id);
+    out.extend_from_slice(&h.pubkey);
+    out.extend_from_slice(&h.sig);
+    out.extend_from_slice(&h.created_at.to_le_bytes());
+    out.extend_from_slice(&h.kind.to_le_bytes());
+    let mut flags = 0u8;
+    if h.expiration.is_some() {
+        flags |= FLAG_EXPIRATION;
+    }
+    if h.protected {
+        flags |= FLAG_PROTECTED;
+    }
+    out.push(flags);
+    if let Some(e) = h.expiration {
+        out.extend_from_slice(&e.to_le_bytes());
+    }
+    varint::put(out, content.len() as u64);
+    out.extend_from_slice(content);
+    varint::put(out, u64::from(h.tag_count));
+    out.extend_from_slice(tags);
+
+    EventInfo {
+        kind: h.kind,
+        created_at: h.created_at,
+        tag_count: h.tag_count,
+        content_len: content.len() as u32,
+        expiration: h.expiration,
+        protected: h.protected,
+        any_escaped: h.any_escaped,
+    }
+}
+
+/// nostr-parse's view of a string as written, as this crate's.
+fn raw(v: nostr_parse::RawStr<'_>) -> RawStr<'_> {
+    RawStr { bytes: v.bytes, escaped: v.escaped }
+}
+
+/// What one tag says about the event: `["-"]` protects it (NIP-70), and the
+/// first `expiration` tag's value, in plain decimal, is when it expires.
+fn note_tag(first: Option<RawStr<'_>>, second: Option<RawStr<'_>>, fields: u64, protected: &mut bool, expiration: &mut Option<u64>) {
+    if let Some(name) = first {
+        if fields == 1 && name.is(b"-") {
+            *protected = true;
+        } else if expiration.is_none() && name.is(b"expiration") {
+            *expiration = second.and_then(parse_decimal);
+        }
     }
 }
 
@@ -444,4 +536,164 @@ pub fn verify_sig(rec: Record<'_>) -> bool {
     };
     let sig = schnorr::Signature::from_byte_array(*rec.sig());
     schnorr::verify(&sig, rec.id(), &pk).is_ok()
+}
+
+/// nostr-parse's path must agree with the scanner's wherever it answers: the
+/// same record, the same answer and the same end, in both forms, for events
+/// alone and inside a message.
+#[cfg(test)]
+mod spans_agree {
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[(self.next() % items.len() as u64) as usize]
+        }
+    }
+
+    fn hex(r: &mut Rng, n: usize) -> String {
+        (0..n).map(|_| char::from(b"0123456789abcdef"[(r.next() % 16) as usize])).collect()
+    }
+
+    /// JSON string contents, as written.
+    fn text(r: &mut Rng) -> String {
+        const PIECES: &[&str] = &[
+            "plain", "é😀日本", r"\n", r#"\""#, r"\\", r"\/", r"\u0041", r"\u00e9", r"\ud83d\ude00", r"\ud83d",
+            r"\udc00", r"\u007f", "\u{7f}", r"\t\b\f\r", "", "-", "expiration", "1700000000", r"\u0031700", " ",
+        ];
+        (0..r.next() % 4).map(|_| r.pick(PIECES)).collect()
+    }
+
+    fn tag(r: &mut Rng) -> String {
+        match r.next() % 10 {
+            0 => r#"["-"]"#.into(),
+            1 => format!(r#"["expiration","{}"]"#, r.next() % 2_000_000_000),
+            2 => r#"["expiration","\u0031700000000"]"#.into(),
+            3 => format!(r#"["e","{}"]"#, hex(r, 64)),
+            4 => format!(r#"["p","{}","wss://r","mention"]"#, hex(r, 64)),
+            5 => "[]".into(),
+            6 => format!(r#"["{}","{}","{}"]"#, text(r), text(r), text(r)),
+            7 => format!(r#"[ "t" , "{}" ]"#, text(r)),
+            8 => r#"["-","x"]"#.into(),
+            _ => format!(r#"["{}"]"#, text(r)),
+        }
+    }
+
+    fn nested(depth: usize) -> String {
+        format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    fn event(r: &mut Rng) -> String {
+        let tags: Vec<String> = (0..r.next() % 6).map(|_| tag(r)).collect();
+        let kind = r.pick(&["1", "7", "30023", "65535", "65536", "70000", "0"]);
+        let sig = if r.next() % 20 == 0 { String::new() } else { hex(r, 128) };
+        let mut fields = vec![
+            format!(r#""id":"{}""#, hex(r, 64)),
+            format!(r#""pubkey":"{}""#, hex(r, 64)),
+            format!(r#""created_at":{}"#, r.next() % 2_000_000_000),
+            format!(r#""kind":{kind}"#),
+            format!(r#""tags":[{}]"#, tags.join(",")),
+            format!(r#""content":"{}""#, text(r)),
+            format!(r#""sig":"{sig}""#),
+        ];
+        match r.next() % 12 {
+            0 => fields.push(format!(r#""extra":{}"#, nested((r.next() % 70) as usize))),
+            1 => fields.push(r#""\u0069d":"x""#.into()),
+            2 => fields[0] = fields[0].replacen(r#""id":""#, r#""id":"\u0030"#, 1),
+            3 => fields.swap(2, 5),
+            4 => fields.reverse(),
+            _ => {}
+        }
+        let sep = r.pick(&[",", " , ", ",\n"]);
+        format!("{{{}}}", fields.join(sep))
+    }
+
+    fn mutate(r: &mut Rng, s: &str) -> String {
+        const ALPHABET: &[u8] = b"{}[]\",:\\ 0123456789abcdefxtnulre-.+/u";
+        let mut b = s.as_bytes().to_vec();
+        for _ in 0..(1 + r.next() % 3) {
+            let at = (r.next() % b.len() as u64) as usize;
+            let c = ALPHABET[(r.next() % ALPHABET.len() as u64) as usize];
+            match r.next() % 3 {
+                0 => b[at] = c,
+                1 => b.insert(at, c),
+                _ => {
+                    b.remove(at);
+                }
+            }
+        }
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    /// Compares the two paths on the event at byte `at` of `text`; returns
+    /// whether nostr-parse's answered.
+    fn agree(p: &mut EventParser, text: &str, at: usize) -> bool {
+        let mut taken = false;
+        for form in [Form::Canonical, Form::Raw] {
+            let (mut a, mut b) = (Scanner::new_at(text, at), Scanner::new_at(text, at));
+            let (mut ra, mut rb) = (Vec::new(), Vec::new());
+            let fast = p.parse_spans(&mut a, &mut ra, form);
+            let scanned = p.parse_scanned(&mut b, &mut rb, form);
+            if let Some(info) = fast {
+                assert_eq!(scanned, Ok(info), "{text}");
+                assert_eq!(ra, rb, "{text}");
+                assert_eq!(a.pos(), b.pos(), "{text}");
+                taken = true;
+            }
+        }
+        taken
+    }
+
+    fn agree_alone_and_inside(p: &mut EventParser, json: &str) -> bool {
+        let msg = format!(r#"["EVENT", {json} ]"#);
+        let alone = agree(p, json, 0);
+        assert_eq!(agree(p, &msg, 10), alone, "{msg}");
+        alone
+    }
+
+    #[test]
+    fn on_generated_events_and_mutations() {
+        let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut p = EventParser::new();
+        let (mut events, mut taken, mut mutants, mut mutants_taken) = (0, 0, 0, 0);
+        for _ in 0..20_000 {
+            let json = event(&mut r);
+            events += 1;
+            taken += usize::from(agree_alone_and_inside(&mut p, &json));
+            for _ in 0..15 {
+                mutants += 1;
+                mutants_taken += usize::from(agree_alone_and_inside(&mut p, &mutate(&mut r, &json)));
+            }
+        }
+        // Most generated events are plain; the rest are the cases left to the scanner.
+        assert!(taken > events / 2, "{taken} of {events} events took the fast path");
+        assert!(mutants_taken > 1000, "{mutants_taken} of {mutants} mutants took it");
+    }
+
+    /// Every event of a nostrJsonBench corpus (`NOSTR_CORPUS=<dir>`): every one
+    /// the scanner accepts must be read by nostr-parse, with the same record.
+    #[test]
+    #[ignore]
+    fn on_a_corpus() {
+        let dir = std::env::var("NOSTR_CORPUS").expect("NOSTR_CORPUS");
+        let text = std::fs::read_to_string(format!("{dir}/all.ndjson")).unwrap();
+        let mut p = EventParser::new();
+        let (mut accepted, mut taken) = (0, 0);
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            let fast = agree_alone_and_inside(&mut p, line);
+            let ok = p.parse_scanned(&mut Scanner::new(line), &mut Vec::new(), Form::Canonical).is_ok();
+            accepted += usize::from(ok);
+            taken += usize::from(fast);
+            assert!(fast || !ok, "the scanner reads it, nostr-parse left it: {line}");
+        }
+        println!("{accepted} events the scanner accepts, {taken} read by nostr-parse, all identical");
+    }
 }

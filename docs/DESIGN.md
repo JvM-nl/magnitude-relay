@@ -62,7 +62,11 @@ never reach a relay bare. Vector does not use MLS, kind 1 or kind 3.
 ## Design
 
 Runtime dependencies: `tokio` (reactor only), `secp256k1` (libsecp256k1), `sha2`,
-`libc`. TLS and cryptography are otherwise never written in-house. The two
+`libc`, and our own `nostr-parse` (VectorPrivacy/nostr-parse). Events are read with
+its spans mode, in place, and the record is written from the strings as they arrived;
+an event it refuses or flags as unusual (escaped keys or hex, a kind past 65535, deep
+nesting) is read by our scanner instead, so every verdict is the scanner's. TLS and
+cryptography are otherwise never written in-house. The two
 exceptions are speed-only and checked against those crates: batch Schnorr
 verification (our own field, group and multi-scalar arithmetic decides that a
 whole batch is valid; any doubt goes back to libsecp256k1 one signature at a
@@ -72,7 +76,7 @@ built-in HTTPS adds `rustls` (ring provider, no aws-lc), `tokio-rustls`, `ring` 
 Dev-only crates cross-check our implementations.
 
 ### Crates
-- `relay-proto`: allocation-free JSON scanner, canonical events, id + sig
+- `relay-proto`: allocation-free JSON scanner (events go through nostr-parse first), canonical events, id + sig
   verification, compact records, filters, client messages.
 - `relay-store`: the storage engine.
 - `relay-net`: HTTP/1.1 + RFC 6455 WebSocket (server and client).
