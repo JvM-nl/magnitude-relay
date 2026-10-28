@@ -511,6 +511,46 @@ async fn short_lived_events_cross_only_live() {
     }
 }
 
+/// A two-way trusted link (as Asia runs against jskitty): once a pass is over,
+/// what the live connection carries is not a pass. The peer used to be asked
+/// about gift wraps on that connection, a negentropy session, and from then on
+/// its side counted every live event as one pass that never ended.
+#[tokio::test]
+async fn a_two_way_live_link_is_not_counted_as_a_pass() {
+    let secret = "d".repeat(20) + &"8".repeat(20);
+    let (da, db) = (tmp("live-a"), tmp("live-b"));
+    let pa = free_port();
+    let mut a = Relay::configure(&da, pa, "", &format!("[[peer]]\nname = \"B relay\"\nsecret = \"{secret}\"\nips = [\"127.0.0.1\"]\n"));
+    let sync = format!("[[sync]]\nname = \"A relay\"\nurl = \"ws://127.0.0.1:{pa}/peer/{secret}\"\ndirection = \"both\"\ntrusted = true\nreconcile_seconds = 3600\n");
+    let mut b = Relay::configure(&db, free_port(), "", &sync);
+    a.start();
+    b.start();
+    let t = Instant::now();
+    while stats(&b).await["sync"][0]["reconciles"].as_u64().unwrap_or(0) < 1 {
+        assert!(t.elapsed() < Duration::from_secs(30), "B never finished a pass");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let moved = |st: &Value| st["links"][0]["moved"].as_u64();
+    let after_pass = moved(&stats(&a).await);
+
+    // New events on B reach A over the live connection only.
+    let s = Signer::new(93);
+    let live: Vec<Value> = (0..5).map(|i| s.event(now(), 1, json!([]), &format!("live {i}"))).collect();
+    publish(&b, &live).await;
+    let ids: Vec<Value> = live.iter().map(|e| e["id"].clone()).collect();
+    let filter = json!({"ids": ids}).to_string();
+    wait_for("the live link to carry them", || a.count(&filter) == live.len() as u64).await;
+
+    let sa = stats(&a).await;
+    assert_eq!(moved(&sa), after_pass, "live events were counted as a pass: {sa}");
+
+    a.stop();
+    b.stop();
+    for d in [da, db] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// Ephemeral events cross a sync both ways, as Asia's strfry router carried
 /// typing and voice presence: delivered live on the other relay, once each,
 /// never stored and never circling back, even when a client sends the same one

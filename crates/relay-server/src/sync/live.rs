@@ -240,6 +240,14 @@ impl Entry {
     fn broad(&self) -> bool {
         self.cfg.filters.iter().any(session::broad)
     }
+
+    /// Whether to ask the other relay if it hides gift wraps from broad
+    /// queries. A trusted one lists them to us (we are its `[[peer]]`), so it is
+    /// not asked: the probe is a negentropy session, and on the live connection
+    /// it would make that relay count the whole stream as one endless pass.
+    fn probes_wraps(&self) -> bool {
+        self.broad() && !self.cfg.trusted
+    }
 }
 
 /// Starts the sync thread for `entries` (nothing when there are none).
@@ -331,7 +339,7 @@ async fn reconciler(e: Rc<Entry>) {
 
 async fn reconcile_once(e: &Rc<Entry>, since: Option<u64>) -> Result<Report, String> {
     let mut remote = Remote::connect(&e.connector, &e.url).await?;
-    let hide_wraps = if e.broad() { remote.hides_wraps().await? } else { false };
+    let hide_wraps = if e.probes_wraps() { remote.hides_wraps().await? } else { false };
     let mut local = e.local();
     let opts = Opts { hide_wraps, trusted: e.cfg.trusted, ..Opts::new(e.cfg.direction) };
     let mut total = Report::default();
@@ -386,7 +394,7 @@ struct Outbox {
 async fn live_once(e: &Rc<Entry>, cursor: &mut u64, reconnected: bool) -> Result<(), String> {
     let dir = e.cfg.direction;
     let mut remote = Remote::connect(&e.connector, &e.url).await?;
-    let hide_wraps = if dir.up() && e.broad() { remote.hides_wraps().await? } else { false };
+    let hide_wraps = if dir.up() && e.probes_wraps() { remote.hides_wraps().await? } else { false };
     if dir.down() {
         let mut req = String::from("[\"REQ\",\"live\"");
         for f in &e.cfg.filters {
