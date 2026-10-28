@@ -126,7 +126,7 @@ Every setting is optional; `magnitude-relay init` documents them all. The highli
 |---|---|
 | `[relay]` | `bind` address, a Unix `unix_socket` for a web server in front, `urls` (the relay's public addresses), `real_ip_header` behind a proxy, `compression` (permessage-deflate) |
 | `[info]` | The NIP-11 identity: name, description, contact, icon, operator `pubkey`, and `privacy_addresses` for Tor and I2P twins |
-| `[policy]` | Which kinds it accepts: `"vector"` (default), `"all"`, or a list; plus `allow_kinds`, `deny_kinds`, event size and future-timestamp limits, and a `banlist` |
+| `[policy]` | Which kinds it accepts: `"vector"` (default), `"all"`, or a list; plus `allow_kinds`, `deny_kinds`, event size and future-timestamp limits, a `banlist` and an `allowlist` |
 | `[limits]` | Message size, subscriptions, filters, `limit` caps, per-IP connections and events per minute |
 | `[store]` | Data directory, durability, file size, memory for the newest index entries |
 | `[tls]` | Built-in HTTPS: Let's Encrypt for your domains, or your own certificate files |
@@ -150,6 +150,26 @@ banlist = "/etc/magnitude-relay/banlist.txt"   # one npub or hex key per line, #
 ```
 
 The relay reads the file again within seconds of a change, no restart needed. A banned key's events, and gift wraps addressed to it, are answered `OK` and dropped, and the key is left out of every filter, so its owner sees an ordinary, empty relay. Without AUTH that is as far as a ban reaches: gift wraps the key sends are signed by one-time keys, and Concord events by shared plane keys. `delete --filter '{"authors":["<hex>"]}'` removes what it stored before the ban.
+
+### Letting your own accounts publish anything
+
+```toml
+[policy]
+allowlist = "/etc/magnitude-relay/allowlist.txt"   # the banlist's format
+```
+
+A listed key may publish events of any kind, even ones `kinds` refuses: your official account's notes and articles can live on a relay that otherwise carries only Vector's traffic, and anyone can read them. Every other rule still applies, `deny_kinds` still refuses, and a key on both lists is banned.
+
+### Changing either list from the command line
+
+```sh
+magnitude-relay allowlist add npub1… --note "the official account"
+magnitude-relay banlist add npub1…
+magnitude-relay banlist remove npub1…
+magnitude-relay allowlist list
+```
+
+Each edit rewrites the file in one step, keeping its owner and mode, and the running relay applies it within about 15 seconds. The setting that names a file is read when the relay starts; the file's contents never need a restart.
 
 ### HTTPS
 

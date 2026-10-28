@@ -105,7 +105,7 @@ const KEYS: &[(&str, &[&str])] = &[
         "info",
         &["name", "description", "pubkey", "contact", "icon", "banner", "privacy_policy", "terms_of_service", "privacy_addresses"],
     ),
-    ("policy", &["kinds", "allow_kinds", "deny_kinds", "max_event_bytes", "max_future_seconds", "max_tags", "banlist"]),
+    ("policy", &["kinds", "allow_kinds", "deny_kinds", "max_event_bytes", "max_future_seconds", "max_tags", "banlist", "allowlist"]),
     (
         "limits",
         &[
@@ -255,8 +255,11 @@ pub struct PolicyCfg {
     /// old events verbatim.
     pub max_future_seconds: u64,
     pub max_tags: usize,
-    /// A file of banned public keys (see `bans`). Empty means none.
+    /// A file of banned public keys (see `lists`). Empty means none.
     pub banlist: String,
+    /// A file of public keys whose events may be of any kind (see `lists`).
+    /// Empty means none.
+    pub allowlist: String,
 }
 
 /// `[limits]`: per-connection and per-IP resource caps. Sized for what Vector
@@ -483,6 +486,7 @@ impl Default for PolicyCfg {
             max_future_seconds: 900,
             max_tags: 2000,
             banlist: String::new(),
+            allowlist: String::new(),
         }
     }
 }
@@ -1103,6 +1107,7 @@ fn apply_policy(c: &mut PolicyCfg, e: &Entry) -> Result<bool, String> {
         "max_future_seconds" => c.max_future_seconds = int(e, 0, 365 * 86_400)?,
         "max_tags" => c.max_tags = int(e, 1, 1_000_000)? as usize,
         "banlist" => c.banlist = path_setting(e)?,
+        "allowlist" => c.allowlist = path_setting(e)?,
         _ => return Ok(false),
     }
     Ok(true)
@@ -1511,8 +1516,17 @@ const TEMPLATE: &str = r##"# {name} settings
 # sees no such key. Without AUTH that is as far as a ban can reach: gift wraps
 # it sends are signed by one-time keys, and Concord by shared plane keys.
 # Removing what the key already stored is a separate step (`delete`).
+# `{slug} banlist add <npub>` (and `remove`, `list`) edits the file for you.
 # Empty means no banlist.
 # banlist = ""
+
+# A file of public keys that may publish events of any kind, in the banlist's
+# format and read again the same way: your own accounts, so their notes and
+# articles can live on a relay whose `kinds` would refuse them. Every other rule
+# still applies, deny_kinds still refuses, and a key on both lists is banned.
+# `{slug} allowlist add <npub>` (and `remove`, `list`) edits the file for you.
+# Empty means no allowlist.
+# allowlist = ""
 
 [limits]
 # Vector asks a lot of a relay: thousands of authors in one filter, history pages

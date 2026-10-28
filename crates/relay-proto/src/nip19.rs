@@ -1,4 +1,4 @@
-//! NIP-19: the `npub` form of a public key (bech32, BIP-173).
+//! NIP-19: the `npub` form of a public key (bech32, BIP-173), read and written.
 
 const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 const HRP: &[u8] = b"npub";
@@ -40,6 +40,31 @@ pub fn decode_npub(s: &str) -> Option<[u8; 32]> {
     (n == 32 && bits < 5 && acc & ((1 << bits) - 1) == 0).then_some(out)
 }
 
+/// The `npub1...` form of a key.
+pub fn encode_npub(key: &[u8; 32]) -> String {
+    // Bytes to 5-bit groups, the last padded with zeros.
+    let mut values = Vec::with_capacity(52 + 6);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &b in key {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            values.push(((acc >> bits) & 31) as u8);
+        }
+    }
+    if bits > 0 {
+        values.push(((acc << (5 - bits)) & 31) as u8);
+    }
+    let expanded = HRP.iter().map(|c| c >> 5).chain([0]).chain(HRP.iter().map(|c| c & 31));
+    let check = polymod(expanded.chain(values.iter().copied()).chain([0; 6])) ^ 1;
+    values.extend((0..6).map(|i| ((check >> (5 * (5 - i))) & 31) as u8));
+    let mut out = String::with_capacity(NPUB_LEN);
+    out.push_str("npub1");
+    out.extend(values.iter().map(|&v| char::from(CHARSET[usize::from(v)])));
+    out
+}
+
 fn polymod(values: impl Iterator<Item = u8>) -> u32 {
     const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
     let mut chk = 1u32;
@@ -68,6 +93,18 @@ mod tests {
     fn decodes_nip19s_example_in_either_case() {
         assert_eq!(decode_npub(NPUB).map(|k| hex::encode_string(&k)).as_deref(), Some(HEX));
         assert_eq!(decode_npub(&NPUB.to_ascii_uppercase()).map(|k| hex::encode_string(&k)).as_deref(), Some(HEX));
+    }
+
+    #[test]
+    fn encodes_nip19s_example_and_round_trips() {
+        let key = hex::decode_32(HEX.as_bytes()).unwrap();
+        assert_eq!(encode_npub(&key), NPUB);
+        for seed in 0..=255u8 {
+            let k = [seed; 32];
+            let k2: [u8; 32] = std::array::from_fn(|i| seed.wrapping_mul(31).wrapping_add(i as u8));
+            assert_eq!(decode_npub(&encode_npub(&k)), Some(k));
+            assert_eq!(decode_npub(&encode_npub(&k2)), Some(k2));
+        }
     }
 
     #[test]

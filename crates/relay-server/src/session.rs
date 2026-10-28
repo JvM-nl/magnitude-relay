@@ -2,7 +2,7 @@
 //! what goes back. No sockets here; replies are written into an [`Outbox`]
 //! (the WebSocket layer frames them in place), so all of it is testable alone.
 
-use crate::bans::Bans;
+use crate::lists::KeyList;
 use crate::ingest::{ReactorMsg, Reply, WriteReq};
 use crate::metrics::{self, Block};
 use crate::subs::{ConnId, SubIndex};
@@ -96,13 +96,19 @@ pub struct SessionCfg {
     /// connection, and a REQ's stored results stop at it.
     pub max_outbound: usize,
     pub kind_allowed: Box<dyn Fn(u64) -> bool + Send + Sync>,
-    pub bans: Option<Arc<Bans>>,
+    /// `deny_kinds`: refused even from an allowlisted author.
+    pub kind_denied: Box<dyn Fn(u64) -> bool + Send + Sync>,
+    pub bans: Option<Arc<KeyList>>,
+    /// Authors whose events may be of any kind but a denied one.
+    pub allowed: Option<Arc<KeyList>>,
 }
 
 impl SessionCfg {
     pub fn from_config(cfg: &crate::config::Config) -> Result<SessionCfg, String> {
         let kinds = cfg.policy.kind_policy();
-        let bans = Bans::from_config(cfg)?;
+        let denied = cfg.policy.deny_kinds.clone();
+        let bans = KeyList::banlist(cfg)?;
+        let allowed = KeyList::allowlist(cfg)?;
         Ok(SessionCfg {
             max_subscriptions: cfg.limits.max_subscriptions,
             max_filters: cfg.limits.max_filters,
@@ -114,8 +120,16 @@ impl SessionCfg {
             max_tags: cfg.policy.max_tags,
             max_outbound: cfg.limits.outbound_buffer_bytes,
             kind_allowed: Box::new(move |k| kinds.allows(k)),
+            kind_denied: Box::new(move |k| denied.contains(&k)),
             bans,
+            allowed,
         })
+    }
+
+    /// Whether an event of a kind the policy refuses is let in for its author.
+    #[inline]
+    fn lets_in(&self, author: &[u8; 32], kind: u64) -> bool {
+        self.allowed.as_ref().is_some_and(|l| l.with(|s| s.contains(author))) && !(self.kind_denied)(kind)
     }
 
     /// Whether a valid event is to be answered `OK` and dropped (see `bans`).
@@ -127,7 +141,7 @@ impl SessionCfg {
     /// Why an event is refused on policy alone, before anything is hashed:
     /// the same answer for a client's EVENT and for an event synced in.
     pub fn refusal(&self, info: &EventInfo, rec: Record<'_>, now: u64) -> Option<(Refused, String)> {
-        if !(self.kind_allowed)(info.kind) {
+        if !(self.kind_allowed)(info.kind) && !self.lets_in(rec.pubkey(), info.kind) {
             Some((Refused::Kind, format!("blocked: kind {} is not accepted by this relay", info.kind)))
         } else if info.tag_count as usize > self.max_tags {
             Some((Refused::Invalid, String::from("invalid: too many tags")))

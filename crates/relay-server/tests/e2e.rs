@@ -1528,6 +1528,101 @@ async fn a_banned_key_is_answered_ok_and_never_stored() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// An allowlisted key publishes kinds the policy refuses (not a denied one),
+/// anyone reads them, and both lists change from the command line while the
+/// relay runs: allowed, then banned (the ban wins), then off both again.
+#[tokio::test]
+async fn an_allowlisted_key_publishes_any_kind_and_both_lists_change_live() {
+    let dir = std::env::temp_dir().join(format!("relay-e2e-allow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (team, other) = (Signer::new(71), Signer::new(72));
+    let (allow, ban) = (dir.join("allowlist"), dir.join("banlist"));
+    std::fs::write(&allow, "# our own accounts\n").unwrap();
+    std::fs::write(&ban, "").unwrap();
+    let policy = format!("[policy]\nallowlist = \"{}\"\nbanlist = \"{}\"\ndeny_kinds = [9735]\n", allow.display(), ban.display());
+    let relay = Relay::start_with(dir.clone(), free_port(), &policy);
+    let host = relay.addr.to_string();
+    let mut c = client_connect(relay.addr, &host, "/").await.unwrap();
+    let refused = |kind: u64| (false, format!("blocked: kind {kind} is not accepted by this relay"));
+
+    // Not yet listed: a public note is refused like anyone's.
+    send(&mut c, json!(["EVENT", team.event(now(), 1, json!([]), "early")])).await;
+    assert_eq!(ok_of(&mut c).await, refused(1));
+
+    let out = run_ok(&dir, &["allowlist", "add", &team.pk(), "--note", "the official account"]);
+    assert!(out.contains("added to the allowlist"), "{out}");
+    assert!(run_ok(&dir, &["allowlist", "add", &team.pk()]).contains("already on the allowlist"));
+    assert!(run_ok(&dir, &["allowlist"]).contains("the official account"));
+
+    // Picked up while the relay runs.
+    let t = Instant::now();
+    let note = loop {
+        let ev = team.event(now(), 1, json!([]), &format!("hello {}", t.elapsed().as_millis()));
+        send(&mut c, json!(["EVENT", ev])).await;
+        if ok_of(&mut c).await.0 {
+            break ev;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "the allowlist was not picked up");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let article = team.event(now(), 30023, json!([["d", "launch"], ["title", "Vector"]]), "# An article");
+    send(&mut c, json!(["EVENT", article])).await;
+    assert_eq!(ok_of(&mut c).await, (true, String::new()));
+    // deny_kinds still refuses, and nobody else gets in.
+    send(&mut c, json!(["EVENT", team.event(now(), 9735, json!([]), "")])).await;
+    assert_eq!(ok_of(&mut c).await, refused(9735));
+    send(&mut c, json!(["EVENT", other.event(now(), 1, json!([]), "me too")])).await;
+    assert_eq!(ok_of(&mut c).await, refused(1));
+    // Anyone reads them.
+    let mut got = ids_over_req(&relay, json!({"authors": [team.pk()]})).await;
+    got.sort();
+    let mut want = vec![note["id"].as_str().unwrap().to_string(), article["id"].as_str().unwrap().to_string()];
+    want.sort();
+    assert_eq!(got, want);
+
+    // Banned too: the ban wins (answered OK, never stored).
+    assert!(run_ok(&dir, &["banlist", "add", &team.pk()]).contains("added to the banlist"));
+    assert!(run_ok(&dir, &["allowlist", "add", &team.pk()]).contains("already on the allowlist"));
+    let t = Instant::now();
+    loop {
+        let ev = team.event(now(), 1, json!([]), &format!("muted {}", t.elapsed().as_millis()));
+        send(&mut c, json!(["EVENT", ev])).await;
+        assert!(ok_of(&mut c).await.0);
+        if ids_over_req(&relay, json!({"ids": [ev["id"]]})).await.is_empty() {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "the ban was not picked up");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Off both lists: refused again, like anyone's note.
+    assert!(run_ok(&dir, &["banlist", "remove", &team.pk()]).contains("removed from the banlist"));
+    assert!(run_ok(&dir, &["allowlist", "remove", &team.pk()]).contains("removed from the allowlist"));
+    assert!(run_ok(&dir, &["allowlist", "remove", &team.pk()]).contains("is not on the allowlist"));
+    let t = Instant::now();
+    loop {
+        send(&mut c, json!(["EVENT", team.event(now(), 1, json!([]), &format!("bye {}", t.elapsed().as_millis()))])).await;
+        if ok_of(&mut c).await == refused(1) {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "the removal was not picked up");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    run_refused(&dir, &["allowlist", "add", "npub1nope"], "is not an npub");
+    run_refused(&dir, &["allowlist", "frob"], "takes list, add or remove");
+    drop(c);
+    relay.stop();
+
+    // A relay with no allowlist set says so.
+    let bare = dir.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(bare.join("relay.toml"), "").unwrap();
+    run_refused(&bare, &["allowlist", "add", &team.pk()], "no allowlist is set");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A relay behind a pretend web server: it takes each connection's address
 /// from X-Forwarded-For, so a test can speak from many addresses.
 fn start_forwarded(dir: PathBuf, port: u16, sections: &str) -> Relay {

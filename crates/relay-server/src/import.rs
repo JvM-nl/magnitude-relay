@@ -16,12 +16,16 @@ use std::time::Instant;
 /// keep every core busy to the end.
 const CHUNK_LINES: usize = 2048;
 
+/// Whether an event of this kind, by this author, is left out of an import.
+pub type SkipKind = Box<dyn Fn(u64, &[u8; 32]) -> bool + Send + Sync>;
+
 pub struct ImportOptions {
     pub verify: bool,
-    /// Events of these kinds are skipped (ephemeral kinds are always skipped).
-    pub skip_kind: Option<Box<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// Events this skips, by kind and author, are left out (ephemeral kinds
+    /// are always left out).
+    pub skip_kind: Option<SkipKind>,
     /// Events a client could not store here are left out as well (see `bans`).
-    pub bans: Option<std::sync::Arc<crate::bans::Bans>>,
+    pub bans: Option<std::sync::Arc<crate::lists::KeyList>>,
     pub threads: usize,
 }
 
@@ -131,7 +135,7 @@ pub fn run(input: impl Read + Send, w: &mut Writer, opts: ImportOptions, mut pro
                     out.lines = lines.len() as u64;
                     let take = |r: &Result<EventInfo, Reject>, rec: &[u8], out: &mut Parsed| match r {
                         Ok(info) if kind::is_ephemeral(info.kind) => out.ephemeral += 1,
-                        Ok(info) if skip_kind.as_ref().is_some_and(|f| f(info.kind)) => out.skipped_kind += 1,
+                        Ok(info) if skip_kind.as_ref().is_some_and(|f| f(info.kind, relay_proto::Record(rec).pubkey())) => out.skipped_kind += 1,
                         Ok(_) if bans.as_ref().is_some_and(|b| b.with(|s| s.silences(relay_proto::Record(rec)))) => out.skipped_banned += 1,
                         Ok(_) => {
                             out.data.extend_from_slice(rec);

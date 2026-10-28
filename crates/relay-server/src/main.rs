@@ -1,7 +1,7 @@
 //! The relay binary.
 
 mod admin;
-mod bans;
+mod lists;
 mod brand;
 mod config;
 mod ephemeral;
@@ -77,6 +77,12 @@ commands:
                        that lists this one as a [[peer]] (see `trusted` under
                        [[sync]]). For a lasting sync, see [[sync]] in the
                        settings file
+  banlist [list | add <key> [--note TEXT] | remove <key>]
+  allowlist [list | add <key> [--note TEXT] | remove <key>]
+                       show or change the file [policy] banlist or allowlist
+                       names (a key is an npub or 64 hex digits). A running
+                       relay reads it again within about 15 seconds: no
+                       restart. The file is replaced whole, owner and mode kept
 
   --filter takes one NIP-01 filter or a JSON array of them (their union); a
   limit inside a filter is refused (query has --limit). While the relay runs,
@@ -177,11 +183,17 @@ fn run() -> Result<(), String> {
             let opts = Options { sync: cfg.store.sync && !relaxed, ..store_options(&cfg) };
             let (_store, mut w) = Store::open(&cfg.store.data, opts).map_err(|e| e.to_string())?;
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-            // Kinds the relay refuses from apps are left out, as sync leaves them out.
+            // Kinds the relay refuses from apps are left out, as sync leaves them
+            // out, except an allowlisted author's (not a denied kind).
             let policy = cfg.policy.kind_policy();
-            let skip_kind: Option<Box<dyn Fn(u64) -> bool + Send + Sync>> =
-                cfg.policy.restricts_writes().then(|| Box::new(move |k| !policy.allows(k)) as _);
-            let bans = bans::Bans::from_config(&cfg)?;
+            let denied = cfg.policy.deny_kinds.clone();
+            let allowed = lists::KeyList::allowlist(&cfg)?;
+            let skip_kind: Option<import::SkipKind> = cfg.policy.restricts_writes().then(|| {
+                Box::new(move |k: u64, author: &[u8; 32]| {
+                    !policy.allows(k) && (denied.contains(&k) || !allowed.as_ref().is_some_and(|l| l.with(|s| s.contains(author))))
+                }) as _
+            });
+            let bans = lists::KeyList::banlist(&cfg)?;
             let opts = import::ImportOptions { verify, skip_kind, bans, threads };
             let t = Instant::now();
             let report = |s: &import::ImportStats| {
@@ -302,6 +314,69 @@ fn run() -> Result<(), String> {
             let url = args.remove(0);
             no_more(&args)?;
             sync::run_command(&load()?, &url, fs, dir, dry_run, trusted)
+        }
+        "banlist" | "allowlist" => {
+            let cfg = load()?;
+            let file = if cmd == "banlist" { &cfg.policy.banlist } else { &cfg.policy.allowlist };
+            if file.is_empty() {
+                return Err(format!("no {cmd} is set: name its file under [policy], like {cmd} = \"/etc/{}/{cmd}.txt\" (read when the relay starts)", brand::SLUG));
+            }
+            let path = PathBuf::from(file);
+            let op = if args.is_empty() { String::from("list") } else { args.remove(0) };
+            let key = |args: &mut Vec<String>| -> Result<[u8; 32], String> {
+                let k = if args.is_empty() { return Err(format!("{cmd} {op} needs a key: an npub or 64 hex digits")) } else { args.remove(0) };
+                lists::parse_key(&k).ok_or(format!("{k:?} is not an npub or a 64-character hex public key"))
+            };
+            let applies = "the running relay applies it within about 15 seconds";
+            match op.as_str() {
+                "list" => {
+                    no_more(&args)?;
+                    let entries = lists::entries(&path)?;
+                    for (npub, note) in &entries {
+                        if note.is_empty() {
+                            println!("{npub}");
+                        } else {
+                            println!("{npub}  # {note}");
+                        }
+                    }
+                    eprintln!("{} keys in {}", entries.len(), path.display());
+                    Ok(())
+                }
+                "add" => {
+                    let k = key(&mut args)?;
+                    let note = text(&mut args, "--note")?;
+                    no_more(&args)?;
+                    let day = relay_tls::time::format(relay_tls::time::now());
+                    let note = match note {
+                        Some(n) => format!("added {}: {n}", &day[..10]),
+                        None => format!("added {}", &day[..10]),
+                    };
+                    let npub = relay_proto::nip19::encode_npub(&k);
+                    if lists::add(&path, k, &note)? == lists::Edit::AlreadyThere {
+                        println!("{npub} is already on the {cmd}");
+                        return Ok(());
+                    }
+                    println!("{npub} added to the {cmd} ({}); {applies}", path.display());
+                    if cmd == "banlist" {
+                        let hex = relay_proto::hex::encode_string(&k);
+                        println!("what it already stored stays until deleted: {} delete --filter '{{\"authors\":[\"{hex}\"]}}' --dry-run", brand::SLUG);
+                    } else if !cfg.policy.banlist.is_empty() && lists::entries(Path::new(&cfg.policy.banlist)).is_ok_and(|e| e.iter().any(|(n, _)| *n == npub)) {
+                        println!("note: it is also on the banlist, which wins");
+                    }
+                    Ok(())
+                }
+                "remove" => {
+                    let k = key(&mut args)?;
+                    no_more(&args)?;
+                    let npub = relay_proto::nip19::encode_npub(&k);
+                    match lists::remove(&path, k)? {
+                        lists::Edit::Removed(n) => println!("{npub} removed from the {cmd} ({n} line{}); {applies}", if n == 1 { "" } else { "s" }),
+                        _ => println!("{npub} is not on the {cmd}"),
+                    }
+                    Ok(())
+                }
+                _ => Err(format!("{cmd} takes list, add or remove, not {op:?}")),
+            }
         }
         "help" | "--help" | "-h" => {
             print!("{} {}\n\n{}", brand::NAME, brand::VERSION, USAGE.replace("{bin}", brand::SLUG));

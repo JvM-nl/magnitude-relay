@@ -35,9 +35,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let http_bind = cfg.tls.http_bind.filter(|_| cfg.tls.enabled);
 
     let scfg = Arc::new(SessionCfg::from_config(&cfg)?);
-    if let Some(bans) = &scfg.bans {
-        eprintln!("banlist: {} keys from {}", bans.len(), bans.path().display());
-        bans.watch();
+    for (label, list) in [("banlist", &scfg.bans), ("allowlist", &scfg.allowed)] {
+        if let Some(list) = list {
+            eprintln!("{label}: {} keys from {}", list.len(), list.path().display());
+            list.watch();
+        }
     }
     let syncs = cfg.sync.clone();
 

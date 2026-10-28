@@ -380,7 +380,9 @@ mod tests {
             max_tags: 100,
             max_outbound: 1 << 20,
             kind_allowed: Box::new(|k| k == 1),
+            kind_denied: Box::new(|_| false),
             bans: None,
+            allowed: None,
         };
         let refs: Vec<(&str, usize, bool)> = texts.iter().map(|t| (t.as_str(), 0, false)).collect();
         let mut parser = EventParser::new();
@@ -433,7 +435,9 @@ mod tests {
             max_tags: 100,
             max_outbound: 1 << 20,
             kind_allowed: Box::new(|k| k == 1 || kind::is_ephemeral(k)),
+            kind_denied: Box::new(|_| false),
             bans: None,
+            allowed: None,
         };
         let good = event(21059);
         let rec = check_ephemeral(&good, 0, &cfg, now).expect("a valid ephemeral event");
